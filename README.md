@@ -241,8 +241,16 @@ still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; 
 | 0028 | the PLE embedding accepts Intel's AutoRound (INC) quantization config | ungated, acts only then |
 | 0029, 0029b | prompt logprobs in 128-row chunks (no VRAM spill into host RAM) | on; `B70_PROMPT_LOGPROBS_CHUNK` |
 | 0031 | CPU→GPU KV loads straight from the pinned pool (for kernels without B70-K1) | `B70_OFFLOAD_H2D_DIRECT=1` |
+| 0040 | routed experts split between VRAM (hot) and pinned host RAM (cold), read through UVA; for 2-card hosts | `B70_MOE_HOTCOLD=1` |
 
 Every switch: [docs/switches.md](docs/switches.md).
+
+## Two cards (2× B70, ~64 GB RAM)
+
+`engines/run-tp2.sh` serves the albucino FP8-PLE checkpoint (Intel AutoRound target) at TP 2 + EP 2 with MTP k=3 and the
+full 262,144-token context: the 112 most-routed experts per layer and rank in VRAM, the rest pinned in host RAM
+(patch 0040), INT8 PLE from NVMe. Measured: 52–56 tok/s decode at one stream, ~2,350 tok/s prefill, 489K KV tokens per
+card. Not yet quality-benchmarked or endurance-tested. Setup and numbers: [docs/two-cards.md](docs/two-cards.md).
 
 ## Work in progress (not in the series)
 

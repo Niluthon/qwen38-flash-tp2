@@ -69,6 +69,17 @@ is then looked up with that effort.
 Candidate default for the offload fix ("0014jb"): `B70_OFFLOAD_TRACE=1 B70_OFFLOAD_JUNCTION=1
 B70_OFFLOAD_GDN_BACKSTEP=1 B70_OFFLOAD_EMPTY_ADVANCE_GUARD=0 B70_OFFLOAD_GROUP_EVICT=0`.
 
+## Hot/cold routed experts (0040)
+
+For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed expert (docs/two-cards.md).
+
+| variable | default | patch | effect |
+|---|---|---|---|
+| `B70_MOE_HOTCOLD` | unset (off) | 0040 | `1`: keep the `B70_MOE_HOT_EXPERTS` most-routed local experts per layer in VRAM and the rest pinned in host RAM, read by the same kernel through UVA. Exact (hot + cold = all in VRAM, bit for bit). MTP layers are never split. |
+| `B70_MOE_HOT_EXPERTS` | all local experts (= off) | 0040 | hot experts per layer **per rank**. Each one costs 48 × 2.42 MiB = 116 MiB of VRAM per rank on Qwen3.8-Flash-Next and frees the same in host RAM. We run `112` on 2× B70 (EP 2: 256 local experts). |
+| `B70_MOE_HOTCOLD_RANKINGS` | unset (experts by id) | 0040 | JSON `{"<layer>": [global expert ids, hottest first]}`; experts it does not list follow by id. The albucino checkpoint ships `runtime/static_hot_cache_rankings.json`. |
+| `B70_MOE_HOTCOLD_MEMLOG` | unset (off) | 0040 | `1`: log torch allocated / reserved and device free memory after every layer's split (otherwise every 12th layer). |
+
 ## Ungated parts (active even with every switch unset)
 
 1. 0009: `reasoning_effort` also accepts `"ultra"` (API widening only).

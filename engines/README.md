@@ -10,6 +10,7 @@ KV size to your host.
 | `awq-s16-kv128-chunked` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | what we served on b70.1, without MTP |
 | `r8g-kv64` | devan W4A16 @ `40b8f18d` | 8 | INT8, pinned in RAM | 64 GiB | off | behind the numbers in `docs/measurements/` |
 | `r8g-kv64-0014jb` | devan W4A16 | 8 | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`, `GDN_BACKSTEP=1`) | same |
+| `tp2-hotcold` (`run-tp2.sh`) | albucino FP8-PLE (Intel AutoRound target) @ `ef554143` | 4 | INT8 from FP8, from NVMe | none | off | **2× B70, ~64 GB RAM**: TP 2 + EP 2, 112 hot experts/layer in VRAM, rest pinned in RAM (0040), MTP k=3, 262K context ([docs/two-cards.md](../docs/two-cards.md)) |
 | `nvme2-kv96-0014jb` | devan W4A16 | 8 | INT8, from NVMe | 96 GiB | on | NVMe frees ~39 GiB; 96 GiB KV spends most of it |
 
 Files: `common.env` (shared environment), `<engine>.env` (the differences, plus the keys `run-example.sh` reads:

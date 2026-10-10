@@ -1,0 +1,20 @@
+# b70-flash-next:tp2 — runtime image for engines/run-tp2.sh (2x B70, TP 2 + EP 2, hot/cold experts).
+#
+# = the official vLLM v0.30.0 XPU image (pinned by digest)
+# + vllm-xpu-kernels 0.1.14.1+b70.3 (the wheel attached to the 0.30.0-b70.2 release; sha256 asserted)
+#
+# The vLLM code is NOT baked in: run-tp2.sh puts the source tree (fork tag v0.30.0-b70.2 + branch b70/tp2-hotcold)
+# first on PYTHONPATH from the work volume, and LD_PRELOADs wu1ff's residency shim from there.
+#
+#   docker build -f image/Dockerfile.tp2 -t b70-flash-next:tp2 <dir holding the kernel wheel>
+
+ARG BASE_IMAGE=docker.io/vllm/vllm-openai-xpu:v0.30.0@sha256:fc0e112afb64e3a06fe8daff34652435822a629412f38efce8f0f67a46636b8d
+FROM ${BASE_IMAGE}
+
+ARG WHEEL=vllm_xpu_kernels-0.1.14.1+b70.3-cp38-abi3-manylinux_2_28_x86_64.whl
+ARG WHEEL_SHA256=f104a3e5f61480681284ec3632e1a6692358b72a1fbdbda7406db0d7b7d1d589
+RUN --mount=type=bind,source=.,target=/tmp/ctx \
+    set -eu; \
+    echo "${WHEEL_SHA256}  /tmp/ctx/${WHEEL}" | sha256sum -c -; \
+    /opt/venv/bin/pip install --no-deps --force-reinstall "/tmp/ctx/${WHEEL}"; \
+    /opt/venv/bin/python -c "import importlib.metadata as m; v = m.version('vllm-xpu-kernels'); assert v == '0.1.14.1+b70.3', v"

@@ -2,6 +2,17 @@
 
 Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series changes.
 
+## Unreleased — two cards
+
+- **0040**: routed experts split between VRAM (hot) and pinned host RAM (cold) for XPU W4A16 MoE, gated by
+  `B70_MOE_HOTCOLD` (off by default; docs/switches.md). Exact against all experts in VRAM. CPU tests
+  (`tests/model_executor/test_b70_hotcold.py`) and an XPU equivalence test (`tests/kernels/moe/test_b70_hotcold_xpu.py`).
+  Exported from the local branch `b70/tp2-hotcold` (= tag `v0.30.0-b70.2` + this commit); it is not on the fork yet.
+- The `tp2-hotcold` engine for 2× B70 and ~64 GB RAM: `engines/tp2-hotcold.env`, `engines/serve-tp2.args`,
+  `engines/run-tp2.sh`, `image/Dockerfile.tp2` (docs/two-cards.md).
+- Tools for the albucino FP8-PLE checkpoint: `tools/build_int8_ple_from_fp8.py` (the INT8 PLE table from FP8 shards)
+  and `tools/fp8ple_snapshot.py` (serve snapshots of the target and of its MTP draft).
+
 ## 0.30.0-b70.2 — 2026-10-07: the stable set
 
 AWQ serving fully validated; Intel verification in progress. The configuration we serve since 2026-10-04: the AWQ W4A16
