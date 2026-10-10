@@ -47,3 +47,4 @@ B70-0029                                             0029-b70-prompt-logprobs-ro
 B70-0029b                                            0029b-b70-prompt-logprobs-row-chunks-v2.patch                -
 B70-0031                                             0031-b70-offload-h2d-direct-from-pinned.patch                -
 B70-0032                                             0032-b70-index64-fallback-warn-once.patch                    -
+B70-0040                                             0040-b70-moe-hotcold-experts.patch                       0040-b70-moe-hotcold-tests.patch
