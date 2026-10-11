@@ -17,12 +17,15 @@ TURNS = ["Read this file and implement a small improvement: add input validation
          "One test fails with a TypeError on None input. Find the cause and fix it; show the corrected code.",
          "Refactor the longest function into smaller helpers without changing behavior. Show the new code.",
          "Write a concise commit message and a short explanation of the changes for a reviewer."]
-lock = threading.Lock(); stats = []
+lock = threading.Lock(); stats = []; dumps = []
 def post(msgs, n):
     q = {"model": "qwen38-flash-next", "messages": msgs, "max_tokens": n, "temperature": float(os.environ.get("AGENT_TEMP", "0.7")), "chat_template_kwargs": {"enable_thinking": False}}
     t = time.time(); r = json.load(urllib.request.urlopen(urllib.request.Request(BASE + "/v1/chat/completions",
         json.dumps(q).encode(), {"Content-Type": "application/json"}), timeout=1800))
-    return r["choices"][0]["message"]["content"] or "", r["usage"], time.time() - t
+    c = r["choices"][0]
+    if os.environ.get("AGENT_DUMP"):
+        with lock: dumps.append({"finish": c.get("finish_reason"), "text": c["message"]["content"] or ""})
+    return c["message"]["content"] or "", r["usage"], time.time() - t
 def session(i):
     f = rnd.choice(files); code = open(f, errors="replace").read()
     msgs = [{"role": "system", "content": SYSTEM},
@@ -42,3 +45,5 @@ t0 = time.time(); th = [threading.Thread(target=worker) for _ in range(PAR)]; [x
 pt = sum(s[0] for s in stats); ct = sum(s[1] for s in stats); gt = sum(s[2] for s in stats)
 print(f"agent load: {len(stats)} requests, prompt {pt} tok ({ct} cached = {ct/max(pt,1):.0%}), generated {gt} tok, "
       f"{time.time()-t0:.0f} s, gen {gt/(time.time()-t0):.1f} tok/s overall")
+if os.environ.get("AGENT_DUMP"):
+    json.dump(dumps, open(os.environ["AGENT_DUMP"], "w"), ensure_ascii=False)

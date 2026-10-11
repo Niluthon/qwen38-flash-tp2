@@ -155,6 +155,16 @@ besides its new text (≤ 0.4 s at ~3,950 tok/s).
 | MTP draft experts on hot/cold | ~0.66 GiB per card back, but each of the 3 draft passes would then read cold experts (~0.5 ms each); estimated net ~0 | deferred |
 | FP8 KV at a constant 174K tokens + ~10 more hot experts | +~5 % from hot experts against −5–8 % decode (acceptance) and −15 % long prefill; estimated wash | deferred |
 
+**8-bit dense layers (0045, opt-in).** `B70_DENSE_FP8` quantizes the 16-bit GDN projections (in_proj_qkv,
+in_proj_z, out_proj) and attention q/k/v/o at load time to FP8 W8A16. Measured: weights −0.9 GiB per card, KV
+193,621 → 251,771 tokens; perplexity on fixed texts (`tools/bench_tp2/ppl.py`) code 2.032–2.037 → 2.048, docs
+7.58–7.61 → 7.638, Russian 1.539 → 1.546 (+0.4–0.7 %; run-to-run noise ~0.3 %); needles 6/6; general prompts after
+chat 52.6 → 56.2 tok/s at 1 stream, 76.0 → 80.5 at 4 (one run each); the same 12 agent sessions at temperature 0
+(`agent_judge.py`): answers 1,182 → 1,422 characters, responses at the 500-token cap 48 → 58 %, no loops. In isolation
+`fp8_gemm_w8a16` beats BF16 at 1–4 rows (21 vs 37 µs) and loses at 512 (211 vs 132 µs), yet prefill stayed ~3,950
+tok/s. Verdict: a KV increase with a small speed gain and a measurable behaviour shift; off until a real quality
+benchmark (MMLU, the coding set) passes. Shared experts and the INT4 W4A16 path (`int4_gemm_w4a16`) are untested.
+
 Where the non-cold ~20–28 ms of a decode step goes (estimates from the measurements above): lm_head ×4 ~4.3 ms,
 hot experts ~5 ms, all-reduce ~3 ms, graph replay ~2–4 ms, and the dense attention / GDN projections, which are
 BF16 (~3.2 GiB per card read every forward, ~5.4 ms). Next candidates: 8-bit dense weights (XPU has W8A16 FP8 and
@@ -199,6 +209,8 @@ python3 tools/bench_tp2/stress_mixed.py         # 3 long prefills during 2 decod
 AGENT_TEMP=0 python3 tools/bench_tp2/agent_load.py 3 12 2   # agentic coding: 12 sessions x 5 turns, 2 at a time
 python3 tools/bench_tp2/burst_check.py 30       # known issue 6: 30 bursts of 4 requests, degenerate outputs
 python3 tools/bench_tp2/sim_swap.py "<dir>/r0-*.json"   # offline replay of hot-set policies (route snapshots)
+python3 tools/bench_tp2/ppl.py <tag>            # perplexity on fixed texts (code, docs, Russian) via prompt logprobs
+AGENT_DUMP=a.json AGENT_TEMP=0 python3 tools/bench_tp2/agent_load.py 3 12 2; python3 tools/bench_tp2/agent_judge.py a.json
 torchrun --nproc-per-node 2 tools/bench_tp2/ar_bench.py   # 2-card all-reduce latency (engine stopped; tp2 image + env)
 ```
 

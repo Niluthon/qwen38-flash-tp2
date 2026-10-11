@@ -96,6 +96,12 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 |---|---|---|---|
 | `B70_EMBED_UVA` | unset (off) | 0044 | `1` (XPU): after loading, the target's `embed_tokens` moves into pinned host RAM behind a UVA view (0.59 GiB per card at TP 2); lookups read a few KB per token over PCIe. lm_head and the MTP draft are untouched. Spend the freed VRAM on `B70_MOE_HOT_EXPERTS`. |
 
+## FP8 dense layers (0045, opt-in)
+
+| variable | default | patch | effect |
+|---|---|---|---|
+| `B70_DENSE_FP8` | unset (off) | 0045 | a regex: 16-bit linear layers of an INC checkpoint whose names match are quantized at load time to FP8 E4M3 (one scale per output channel) and run by the XPU weight-only kernel `fp8_gemm_w8a16`; lm_head never. Tested pattern: `(linear_attn\.(in_proj_qkv\|in_proj_z\|in_proj_qkvz\|out_proj)\|self_attn\.(qkv_proj\|q_proj\|k_proj\|v_proj\|o_proj))$` (docs/two-cards.md, round 3). Trade-offs: +58K KV tokens on 2× B70, perplexity +0.4–0.7 %, decode ~5–7 % faster, agentic answers ~20 % longer at temperature 0. |
+
 ## Ungated parts (active even with every switch unset)
 
 1. 0009: `reasoning_effort` also accepts `"ultra"` (API widening only).

@@ -81,6 +81,8 @@ e5014b3e6f2808aa0aca6478e0c650000a0233d16b5abc9cfdf82533b1b749dc  B70-0022      
 ab17fa440e054fe1414956d80f08b67fa733171020ebe1a67c8a6bdaab29f9d1  B70-0029b     vllm/v1/worker/gpu/sample/prompt_logprob.py
 1d0efd34a9f9e410f94d126d78404b5bed03e7fb0b9038257dd6414fb05b49c4  B70-0044      vllm/model_executor/layers/fused_moe/b70_hotcold.py
 0f8910c7785eb36c4d366c8ad7bf4f0bac5ae5dabbb69aa972f1eba2889755a5  B70-0044      vllm/model_executor/model_loader/base_loader.py
+37d5958f41c7ff7ea4fbf5395ddf24f3c830fb3a612530d1ab0fadb426572038  B70-0045      vllm/model_executor/layers/quantization/inc/inc.py
+d9f4550fd55b7b1dd29f176b9d0a0ad3d1ed2600a9a4bab66f946d6465665dbc  B70-0045      vllm/model_executor/layers/quantization/online/fp8.py
 60df173586a9bdf8d868f69d6a329fa90f0c5f355daee3533b0baa0f13fab543  B70-0043      vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
 cf9c4df3ed6d142adc80ff03e3cf078403e10dd1b554ee28702f651db88f27fd  B70-0040      vllm/model_executor/layers/fused_moe/routed_experts.py
 97262abaff15d83785b23199561667e8c0fccce3a18ddf78c3e39a219a884fbc  B70-0040      vllm/model_executor/layers/quantization/auto_gptq.py

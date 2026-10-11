@@ -52,3 +52,4 @@ B70-0041                                             0041-b70-moe-hotcold-route-
 B70-0042                                             0042-b70-moe-hotcold-cold-prefetch.patch                  -
 B70-0043                                             0043-b70-moe-hotcold-expert-swap.patch                   -
 B70-0044                                             0044-b70-embed-uva-and-swap-defaults.patch               -
+B70-0045                                             0045-b70-dense-fp8-w8a16.patch                           -
