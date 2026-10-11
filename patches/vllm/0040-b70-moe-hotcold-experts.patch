@@ -1,4 +1,4 @@
-From ba74ae33f53bbf073f5b3629234c9844359a248d Mon Sep 17 00:00:00 2001
+From 9fcc1648fb2b6672f9d5fd480df7d554054a0a53 Mon Sep 17 00:00:00 2001
 From: "Claude Opus 5.5" <noreply@anthropic.com>
 Date: Sat, 10 Oct 2026 15:36:30 +0000
 Subject: [PATCH] B70-0040: routed experts split between VRAM (hot) and pinned
@@ -21,19 +21,19 @@ B70_MOE_HOTCOLD_MEMLOG=1 logs device memory after every layer's split.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../layers/fused_moe/b70_hotcold.py           | 281 ++++++++++++++++++
+ .../layers/fused_moe/b70_hotcold.py           | 291 ++++++++++++++++++
  .../layers/fused_moe/experts/xpu_moe.py       |  28 ++
- .../layers/fused_moe/routed_experts.py        |  17 ++
+ .../layers/fused_moe/routed_experts.py        |  17 +
  .../layers/quantization/auto_gptq.py          |   3 +
- 4 files changed, 329 insertions(+)
+ 4 files changed, 339 insertions(+)
  create mode 100644 vllm/model_executor/layers/fused_moe/b70_hotcold.py
 
 diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
 new file mode 100644
-index 0000000..afebc03
+index 0000000..fd7fee5
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,291 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""B70 0040: routed experts split between VRAM (hot) and pinned host RAM (cold).
@@ -53,7 +53,9 @@ index 0000000..afebc03
 +  * the weight loader writes a cold expert into a pageable CPU twin of the
 +    same param (GPTQ layout);
 +  * after loading, each twin is repacked into the kernel layout (transpose,
-+    unsigned -> signed int4), copied into pinned memory and dropped.
++    unsigned -> signed int4) on the device, 16 experts at a time, copied into
++    pinned memory and dropped (the host only copies: an all-core CPU repack on
++    both ranks at once was the heaviest burst of the whole boot).
 +
 +Switches: B70_MOE_HOTCOLD=1, B70_MOE_HOT_EXPERTS=<per layer per rank>,
 +B70_MOE_HOTCOLD_RANKINGS=<json: layer -> global expert ids, hottest first>.
@@ -135,14 +137,22 @@ index 0000000..afebc03
 +    return pinned
 +
 +
-+def _signed_int4_pinned(packed: torch.Tensor) -> torch.Tensor:
-+    """vllm_xpu_kernels.implement_zp into a pinned tensor, a few experts at a time."""
++def _repack_int4_pinned(qweight: torch.Tensor, device: torch.device) -> torch.Tensor:
++    """GPTQ int32 [E, in/8, out] (CPU) -> signed-int4 bytes [E, out, in/2] in pinned memory.
++
++    The transforms of int_wna16._process_weights_xpu (transpose, int32 -> uint8 view)
++    and vllm_xpu_kernels.implement_zp, run on ``device`` a few experts at a time: the
++    host only copies, and the device temporaries stay at a few hundred MB.
++    """
 +    from vllm_xpu_kernels.fused_moe_interface import implement_zp
 +
-+    out = _ARENA.empty(packed.shape, torch.uint8)
-+    step = 16  # bounds implement_zp's temporaries to a few hundred MB
-+    for i in range(0, packed.shape[0], step):
-+        out[i : i + step] = implement_zp(packed[i : i + step])
++    e, k8, n = qweight.shape
++    out = _ARENA.empty((e, n, k8 * 4), torch.uint8)
++    step = 16
++    for i in range(0, e, step):
++        chunk = qweight[i : i + step].to(device)
++        packed = chunk.transpose(1, 2).contiguous().view(torch.uint8)
++        out[i : i + step].copy_(implement_zp(packed))
 +    return out
 +
 +
@@ -223,9 +233,9 @@ index 0000000..afebc03
 +        twins, self.twins, self._param_names = self.twins, {}, {}
 +        # Same transforms as int_wna16._process_weights_xpu, then implement_zp.
 +        for key in ("w13", "w2"):
-+            packed = twins.pop(f"{key}_qweight").data.transpose(1, 2).contiguous()
-+            self.cold[key] = _signed_int4_pinned(packed.view(torch.uint8))
-+            del packed
++            self.cold[key] = _repack_int4_pinned(
++                twins.pop(f"{key}_qweight").data, layer.w13_qweight.device
++            )
 +            scales = twins.pop(f"{key}_scales").data.transpose(1, 2).contiguous()
 +            self.cold[f"{key}_scales"] = _pin(scales.to(getattr(layer, f"{key}_scales").dtype))
 +            del scales

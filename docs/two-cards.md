@@ -37,7 +37,7 @@ quantization group (128), so each rank owns 256 whole experts instead.
    experts live: hot + cold equals all-in-VRAM bit for bit (tests/kernels/moe/test_b70_hotcold_xpu.py).
 3. **Loading.** `create_weights` gets the hot count; the weight loader writes cold experts into CPU twins of the same
    parameters; after loading, each layer's twins are repacked into the kernel layout (transpose, unsigned to signed
-   int4) and copied into pinned memory carved from 1 GiB chunks. torch's pinned allocator rounds every block up to a
+   int4) on the device, 16 experts at a time, and copied into pinned memory carved from 1 GiB chunks. torch's pinned allocator rounds every block up to a
    power of two (a 197 MB cold w13 would take 256 MB); exact 1 GiB chunks are not rounded.
 4. **MTP layers are never split**; the draft stays in VRAM.
 
@@ -53,8 +53,9 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 ## The engine (`engines/tp2-hotcold.env`, `engines/serve-tp2.args`, `engines/run-tp2.sh`)
 
 Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + kernels 0.1.14.1+b70.3); the source tree
-and wu1ff's residency shim come from the work volume. Settings: TP 2 + EP 2, 112 hot experts per layer and rank, MTP
-k=3 with the checkpoint's draft, `--gpu-memory-utilization 0.95`, 262,144-token context, `--language-model-only`,
+and wu1ff's residency shim come from the work volume. Settings (the stable starting point, 2026-10-11): TP 2 + EP 2,
+136 hot experts per layer and rank, MTP k=3 with the checkpoint's draft, `--gpu-memory-utilization 0.92`, 65,536-token
+context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
 
 ```bash
@@ -64,17 +65,20 @@ MODELS=~/models WORK=~/b70-work engines/run-tp2.sh
 
 Launcher notes: `-w /opt/venv` (the image's `/workspace/vllm` checkout would shadow `PYTHONPATH` for `python -m`
 subprocesses), `-v /dev/dri/by-path:/dev/dri/by-path:ro` (oneCCL opens it; `--device /dev/dri` does not create it).
-0.95 passes vLLM's startup check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 28.8 GiB).
+`run-tp2.sh` sends one short warm-up request once `/health` answers (known issues item 13: with MTP, a first request
+longer than one prefill chunk stops the engine). Variant measured on 2026-10-10: 112 hot experts, 0.95, 262,144-token
+context and `--language-model-only` gave 489,214 KV tokens per card and 52–56 tok/s decode; 0.95 passes vLLM's startup
+check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 28.8 GiB).
 
-## Measured (2× B70, 61 GiB RAM, compute-runtime as installed, 2026-10-10; single runs, ±10 % noise)
+## Measured (2× B70, 61 GiB RAM, compute-runtime as installed, 2026-10-10/11; single runs, ±10 % noise)
 
 | | |
 |---|---|
-| VRAM per card | weights 19.9 GiB (112 hot experts × 48 layers, dense, MTP draft); **489,214 KV tokens** (1.87 × a 262,144-token request) |
-| host RAM | cold experts 17 GiB pinned per rank; PLE row cache 1 GiB per rank; ~47 GiB used in all, ~13 GiB available |
-| decode, 1 stream | 52–56 tok/s with MTP (26–36 without MTP at 136 hot) |
+| VRAM per card | weights ~22.6 GiB (136 hot experts × 48 layers, dense, MTP draft); **144,945 KV tokens** (2.2 × a 65,536-token request) |
+| host RAM | cold experts 15 GiB pinned per rank; PLE row cache 1 GiB per rank; ~45 GiB used in all, ~16 GiB available |
+| decode, 1 stream | 57–58 tok/s with MTP (26–36 without MTP) |
 | decode, 4 streams | 24 tok/s each, 97 total |
-| prefill | ~2,350 tok/s at 3K–12K tokens; 146K-token needle found in 82 s (~1,780 tok/s) |
+| prefill | ~2,600 tok/s at 3K–12K tokens; long first requests (17K with thinking, 24K) pass after the warm-up; on the 262K variant a 146K-token needle was found in 82 s |
 | MTP acceptance | 2.48 tokens per step on a real chat answer (0.82 / 0.69 / 0.43 per position on synthetic text) |
 | boot | ~4–5 min |
 
@@ -102,7 +106,7 @@ Not done yet, and worth doing before relying on it:
 - **Quality** against the 4-card engine on the same items (MMLU, TruthfulQA, the agentic coding set, 64K document
   questions). The target tensors are Intel's, but the PLE table is RadixArk's FP8 re-quantised to INT8, not devan's
   BF16-derived table, and the MTP draft is a different (INT4-g32) one.
-- **Endurance**: a multi-day run under real load, watching host MemAvailable (13 GiB headroom) and preemptions.
+- **Endurance**: a multi-day run under real load, watching host MemAvailable (13–16 GiB headroom) and preemptions.
 - **Concurrency**: more than 4 slots, and the breakpoint where 4,096-token chunks of long prompts slow decode down.
 
 ## What to improve

@@ -162,3 +162,20 @@ flag-file directory: **Intel verification is in progress**.
 
 Also not measured: AWQ at 48K prompts on b70.3; token-level identity of the direct copy against staging on AWQ; the
 snapshot `tools/awq_snapshot.py` writes was compared with ours by index only (same 222,579 tensors), not by a boot.
+
+## 13. Two cards with MTP: a first request longer than one prefill chunk stops the engine (tp2-hotcold)
+
+- **Symptoms.** On the `tp2-hotcold` engine (2× B70, TP 2 + EP 2, MTP k=3), the first request after start whose
+  prompt needs more than one prefill chunk (more than `--max-num-batched-tokens` = 4,096 tokens; an agent's first
+  request with a long system prompt and tool list is one) stops the engine on its first chunk:
+  `RuntimeError: Cannot prepare for replay during capturing stage ... xpuStreamCaptureStatus: Recording`, raised in the
+  MTP draft's FULL-graph replay (`speculator._fused_multi_step_decode` → `run_fullgraph`).
+- **What is known.** The target model's forward of that chunk leaves the current stream reporting "capturing" although
+  no graph capture begins after boot (every boot-time capture begins and ends on its own stream). It happens with
+  thinking on or off, greedy or sampled, with `FULL_AND_PIECEWISE` or `FULL_DECODE_ONLY`; with `--enforce-eager` the
+  stream never reports capturing and the request succeeds. Any short request first prevents it: after one, long first
+  chunks run normally.
+- **Workaround.** `engines/run-tp2.sh` sends one short chat request as soon as `/health` answers (`WARMUP=1`, the
+  default). Clients that connect in the few seconds before it finishes can still hit the bug.
+- **Not done.** The root cause (which compiled-path component flips the stream's capture state) is not identified;
+  the next step is a compiled run without graphs (`cudagraph_mode: NONE`) with the capture-state probes.

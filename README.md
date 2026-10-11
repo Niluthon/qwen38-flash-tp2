@@ -247,10 +247,10 @@ Every switch: [docs/switches.md](docs/switches.md).
 
 ## Two cards (2× B70, ~64 GB RAM)
 
-`engines/run-tp2.sh` serves the albucino FP8-PLE checkpoint (Intel AutoRound target) at TP 2 + EP 2 with MTP k=3 and the
-full 262,144-token context: the 112 most-routed experts per layer and rank in VRAM, the rest pinned in host RAM
-(patch 0040), INT8 PLE from NVMe. Measured: 52–56 tok/s decode at one stream, ~2,350 tok/s prefill, 489K KV tokens per
-card. Not yet quality-benchmarked or endurance-tested. Setup and numbers: [docs/two-cards.md](docs/two-cards.md).
+`engines/run-tp2.sh` serves the albucino FP8-PLE checkpoint (Intel AutoRound target) at TP 2 + EP 2 with MTP k=3 and a
+65,536-token context: the 136 most-routed experts per layer and rank in VRAM, the rest pinned in host RAM (patch 0040),
+INT8 PLE from NVMe, a warm-up request at start (known issues item 13). Measured: 57–58 tok/s decode at one stream,
+~2,600 tok/s prefill, 145K KV tokens per card (a 262K-context variant: 489K). Not yet quality-benchmarked or endurance-tested. Setup and numbers: [docs/two-cards.md](docs/two-cards.md).
 
 ## Work in progress (not in the series)
 
