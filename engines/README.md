@@ -10,7 +10,7 @@ KV size to your host.
 | `awq-s16-kv128-chunked` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | what we served on b70.1, without MTP |
 | `r8g-kv64` | devan W4A16 @ `40b8f18d` | 8 | INT8, pinned in RAM | 64 GiB | off | behind the numbers in `docs/measurements/` |
 | `r8g-kv64-0014jb` | devan W4A16 | 8 | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`, `GDN_BACKSTEP=1`) | same |
-| `tp2-hotcold` (`run-tp2.sh`) | albucino FP8-PLE (Intel AutoRound target) @ `ef554143` | 4 | INT8 from FP8, from NVMe | none | off | **2× B70, ~64 GB RAM**: TP 2 + EP 2, 136 hot experts/layer in VRAM, rest pinned in RAM (0040), MTP k=3, 64K context, warm-up at start ([docs/two-cards.md](../docs/two-cards.md)) |
+| `tp2-hotcold` (`docker compose up -d`, or `run-tp2.sh`) | albucino FP8-PLE (Intel AutoRound target) @ `ef554143` | 4 | INT8 from FP8, from NVMe | none | off | **2× B70, ~64 GB RAM**: TP 2 + EP 2, 144 hot experts/layer in VRAM following the traffic, rest pinned in RAM (0040–0044), MTP k=3, 128K context, warm-up at start ([docs/two-cards.md](../docs/two-cards.md)) |
 | `nvme2-kv96-0014jb` | devan W4A16 | 8 | INT8, from NVMe | 96 GiB | on | NVMe frees ~39 GiB; 96 GiB KV spends most of it |
 
 Files: `common.env` (shared environment), `<engine>.env` (the differences, plus the keys `run-example.sh` reads:
@@ -106,3 +106,13 @@ RAM when the host has the room. Details: [docs/ple-nvme.md](../docs/ple-nvme.md)
    The image does not change the driver.
 5. **GPU hangs.** If a card keeps timing out driver jobs after a GT reset, see
    [docs/known-issues.md](../docs/known-issues.md) (rebind the card, not an FLR).
+
+## Compose (the two-card engine)
+
+`compose.yaml` at the repository root runs `tp2-hotcold`: `docker compose up -d` starts it detached, a one-shot
+`warmup` service sends the short first request once `/health` answers, `docker compose logs -f engine` follows the log
+(also in `$WORK/engine.log`), `docker compose down` stops it. Defaults come from `tp2-hotcold.env` and `serve-tp2.args`
+(shared with `run-tp2.sh`); put local changes in `tp2-local.env` (git-ignored; template `tp2-local.env.example`):
+environment switches override the defaults, and `EXTRA_ARGS` appends `vllm serve` flags (the last value of a flag wins).
+Host paths (`MODELS`, `WORK`) and the image go in a root `.env` (template `.env.example`). `compose-serve.sh` is the
+services' entrypoint (`serve`, `health`, `warmup`).

@@ -247,10 +247,14 @@ Every switch: [docs/switches.md](docs/switches.md).
 
 ## Two cards (2× B70, ~64 GB RAM)
 
-`engines/run-tp2.sh` serves the albucino FP8-PLE checkpoint (Intel AutoRound target) at TP 2 + EP 2 with MTP k=3 and a
-65,536-token context: the 136 most-routed experts per layer and rank in VRAM, the rest pinned in host RAM (patch 0040),
-INT8 PLE from NVMe, a warm-up request at start (known issues item 13). Measured: 57–58 tok/s decode at one stream,
-~2,600 tok/s prefill, 145K KV tokens per card (a 262K-context variant: 489K). Not yet quality-benchmarked or endurance-tested. Setup and numbers: [docs/two-cards.md](docs/two-cards.md).
+`docker compose up -d` (compose.yaml; or `engines/run-tp2.sh`) serves the albucino FP8-PLE checkpoint (Intel AutoRound
+target) at TP 2 + EP 2 with MTP k=3 and a 131,072-token context: 144 hot experts per layer and rank in VRAM that follow
+the traffic (0040, 0043), the rest pinned in host RAM, cold experts prefetched into VRAM for prefill (0042), the input
+embedding in host RAM (0044), INT8 PLE from NVMe, a warm-up request at start (known issues item 13). Measured: ~55 tok/s
+decode at one stream on general prompts, ~71–81 tok/s generation on agentic coding sessions, ~3,950 tok/s prefill,
+~193,500 KV tokens. Tuning without editing tracked files: `engines/tp2-local.env` (from
+`engines/tp2-local.env.example`). Not yet quality-benchmarked or endurance-tested. Setup, experiments and numbers:
+[docs/two-cards.md](docs/two-cards.md).
 
 ## Work in progress (not in the series)
 

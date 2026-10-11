@@ -1,0 +1,71 @@
+# The tp2-hotcold engine (2x Arc Pro B70, ~64 GB RAM) with Docker Compose.
+#
+#   docker compose up -d            # start (detached); the warm-up service runs once the engine is healthy
+#   docker compose logs -f engine   # follow the log (also written to $WORK/engine.log)
+#   docker compose down             # stop
+#
+# Tuning, without editing tracked files:
+#   * environment (B70_* switches, hot experts, PLE cache, ...): copy engines/tp2-local.env.example to
+#     engines/tp2-local.env and set what you want to change; it overrides engines/tp2-hotcold.env (the defaults).
+#     `docker compose up -d` again to apply (the engine restarts).
+#   * vllm serve flags: EXTRA_ARGS in engines/tp2-local.env (appended to engines/serve-tp2.args; the last value of a
+#     flag wins), e.g. EXTRA_ARGS=--max-model-len 65536 --gpu-memory-utilization 0.92
+#   * host paths and image: MODELS, WORK, IMAGE in a .env file next to this one (see .env.example).
+#
+# Image: image/Dockerfile.tp2 (official vLLM v0.30.0 XPU + our kernels); the patched vLLM source tree is read from
+# $WORK/vllm-b70 (PYTHONPATH in tp2-hotcold.env). docs/two-cards.md has the details and the measurements.
+
+name: b70-flash-next
+
+x-engine-base: &engine-base
+  image: ${IMAGE:-b70-flash-next:tp2}
+  network_mode: host
+  working_dir: /opt/venv
+  volumes:
+    - ./engines:/b70-engines:ro
+    - ${WORK:-${HOME}/b70-work}:/work
+
+services:
+  engine:
+    <<: *engine-base
+    container_name: b70-tp2
+    devices:
+      - /dev/dri:/dev/dri
+    group_add: [render, video]
+    ipc: host
+    shm_size: 16g
+    ulimits:
+      memlock: -1
+    env_file:
+      - path: engines/tp2-hotcold.env
+      - path: engines/tp2-local.env
+        required: false
+    volumes:
+      - ./engines:/b70-engines:ro
+      - ${WORK:-${HOME}/b70-work}:/work
+      - ${MODELS:-${HOME}/models}:/models:ro
+      - /dev/dri/by-path:/dev/dri/by-path:ro   # oneCCL opens it; --device /dev/dri does not create it
+    entrypoint: ["/bin/bash", "/b70-engines/compose-serve.sh", "serve"]
+    healthcheck:
+      test: ["CMD", "/bin/bash", "/b70-engines/compose-serve.sh", "health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 15m   # weight loading + graph capture take ~4-5 min
+    stop_grace_period: 90s
+    restart: "no"         # every boot carries some host risk (docs/two-cards.md); restart by hand
+
+  # Known issue 13: with MTP, the first request after start must be short. This runs one, then exits.
+  warmup:
+    <<: *engine-base
+    env_file:
+      - path: engines/tp2-hotcold.env
+      - path: engines/tp2-local.env
+        required: false
+    environment:
+      LD_PRELOAD: ""   # the residency shim needs the GPUs; this container only sends an HTTP request
+    entrypoint: ["/bin/bash", "/b70-engines/compose-serve.sh", "warmup"]
+    depends_on:
+      engine:
+        condition: service_healthy
+    restart: "no"

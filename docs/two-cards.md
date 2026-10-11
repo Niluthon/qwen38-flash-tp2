@@ -60,7 +60,8 @@ and wu1ff's residency shim come from the work volume. Settings (2026-10-11, afte
 
 ```bash
 docker build -f image/Dockerfile.tp2 -t b70-flash-next:tp2 <dir holding the kernel wheel>
-MODELS=~/models WORK=~/b70-work engines/run-tp2.sh
+docker compose up -d                  # compose.yaml: engine + one-shot warm-up; or: MODELS=~/models WORK=~/b70-work engines/run-tp2.sh
+cp engines/tp2-local.env.example engines/tp2-local.env   # optional: local overrides (B70_* switches, EXTRA_ARGS)
 ```
 
 Launcher notes: `-w /opt/venv` (the image's `/workspace/vllm` checkout would shadow `PYTHONPATH` for `python -m`

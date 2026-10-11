@@ -22,6 +22,8 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
   budget 8).
 - `tp2-hotcold` defaults now: 144 hot experts, 0042 + 0043 + 0044 on, util 0.95, 131,072-token context; KV ~193,500
   tokens. Experiments and the not-worth-it list in docs/two-cards.md; known issues item 14 (torch profiler on XPU).
+- `compose.yaml` + `engines/compose-serve.sh`: `docker compose up -d` runs the two-card engine with a warm-up service;
+  local overrides in `engines/tp2-local.env` (template `.example`), host paths in `.env` (template `.env.example`).
 - `tools/bench_tp2`: `bench_det.py`, `quality.py`, `prefix_test.py`, `stress_mixed.py`, `ar_bench.py`,
   `agent_load.py`, `burst_check.py`, `par_moe.py`, `sim_swap.py`.
 
