@@ -9,7 +9,8 @@ P = ["Write a Python class for a bank account with deposit, withdraw and tests."
 def bad(t):
     if not t or len(t) < 40: return "short"
     if "�" in t: return "replacement-char"
-    if re.search(r"(.{1,8})\1{15,}", t, re.S): return "repeat"
+    # a unit with a letter or digit repeated 16+ times (whitespace/rules in ASCII diagrams are fine)
+    if any(re.search(r"\w", m.group(1)) for m in re.finditer(r"(.{1,8})\1{15,}", t, re.S)): return "repeat"
     if len(set(t)) < 12: return "low-diversity"
     return None
 res = []
@@ -19,7 +20,8 @@ def go(p, k):
     try:
         r = json.load(urllib.request.urlopen(urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(q).encode(),
                       {"Content-Type": "application/json"}), timeout=600))
-        t = r["choices"][0]["message"]["content"] or ""; res.append((k, bad(t), t[:80]))
+        t = r["choices"][0]["message"]["content"] or ""; b = bad(t); res.append((k, b, t[:80]))
+        if b: open(f"flagged-{k[0]}-{k[1]}.txt", "w").write(t)
     except Exception as e:
         res.append((k, f"error {e}", ""))
 for b in range(N):

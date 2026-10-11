@@ -76,7 +76,7 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | variable | default | patch | effect |
 |---|---|---|---|
 | `B70_MOE_HOTCOLD` | unset (off) | 0040 | `1`: keep the `B70_MOE_HOT_EXPERTS` most-routed local experts per layer in VRAM and the rest pinned in host RAM, read by the same kernel through UVA. Exact (hot + cold = all in VRAM, bit for bit). MTP layers are never split. |
-| `B70_MOE_HOT_EXPERTS` | all local experts (= off) | 0040 | hot experts per layer **per rank**. Each one costs 48 × 2.42 MiB = 116 MiB of VRAM per rank on Qwen3.8-Flash-Next and frees the same in host RAM. We run `136` on 2× B70 (EP 2: 256 local experts). |
+| `B70_MOE_HOT_EXPERTS` | all local experts (= off) | 0040 | hot experts per layer **per rank**. Each one costs 48 × 2.42 MiB = 116 MiB of VRAM per rank on Qwen3.8-Flash-Next and frees the same in host RAM. We run `144` on 2× B70 (EP 2: 256 local experts) with `B70_EMBED_UVA=1`. |
 | `B70_MOE_HOTCOLD_RANKINGS` | unset (experts by id) | 0040 | JSON `{"<layer>": [global expert ids, hottest first]}`; experts it does not list follow by id. The albucino checkpoint ships `runtime/static_hot_cache_rankings.json`. |
 | `B70_MOE_HOTCOLD_MEMLOG` | unset (off) | 0040 | `1`: log torch allocated / reserved and device free memory after every layer's split (otherwise every 12th layer). |
 | `B70_MOE_COLD_PREFETCH` | unset (off) | 0042 | `1`: batches with at least `B70_MOE_COLD_PREFETCH_MIN_TOKENS` tokens (prefill) run the cold experts from two VRAM slots instead of UVA reads; layer L+1's cold experts are DMA'd on a copy stream while layer L computes. Same kernel and bytes (outputs unchanged). Costs two layers' cold experts of VRAM (0.53 GiB per card at 136–144 hot). On 2× B70: prefill ~2,600 → ~3,950 tok/s. |
@@ -87,7 +87,14 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_HOTCOLD_SWAP` | unset (off) | 0043 | `1`: the hot set follows the traffic. Every period each rank scores its local experts from the prefill route counts (implies `B70_MOE_ROUTE_COUNT=prefill`) and swaps experts between VRAM and pinned RAM in place (weights, scales and expert maps; no graph recapture). Exact: outputs do not depend on placement. We run it on 2× B70. |
 | `B70_MOE_HOTCOLD_SWAP_S` | `5` | 0043 | period, seconds (one round costs 7–16 ms on 2× B70). |
 | `B70_MOE_HOTCOLD_SWAP_DECAY` | `0.95` | 0043 | per-period decay of the scores (half-life ~70 s at 5 s). |
-| `B70_MOE_HOTCOLD_SWAP_BUDGET` | `4` | 0043 | most swaps per layer and period; a swap needs the cold score to beat the hot one by 10 %. |
+| `B70_MOE_HOTCOLD_SWAP_PRIOR` | `0.01` | 0044 | weight of the rankings-file order in the score (0.05 before 0044; an offline replay of agentic-coding traces preferred 0.005–0.01). |
+| `B70_MOE_HOTCOLD_SWAP_BUDGET` | `8` (`4` in 0043) | 0043, 0044 | most swaps per layer and period; a swap needs the cold score to beat the hot one by 10 %. |
+
+## Input embedding in host RAM (0044)
+
+| variable | default | patch | effect |
+|---|---|---|---|
+| `B70_EMBED_UVA` | unset (off) | 0044 | `1` (XPU): after loading, the target's `embed_tokens` moves into pinned host RAM behind a UVA view (0.59 GiB per card at TP 2); lookups read a few KB per token over PCIe. lm_head and the MTP draft are untouched. Spend the freed VRAM on `B70_MOE_HOT_EXPERTS`. |
 
 ## Ungated parts (active even with every switch unset)
 

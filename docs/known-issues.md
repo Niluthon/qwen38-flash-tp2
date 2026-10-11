@@ -1,6 +1,6 @@
 # Known issues
 
-Each item: symptoms → cause → workaround. Status as of 2026-10-07 (0.30.0-b70.2).
+Each item: symptoms → cause → workaround. Status as of 2026-10-07 (0.30.0-b70.2); item 14 added 2026-10-11.
 
 ## 1. A card keeps timing out driver jobs after a GT reset
 
@@ -179,3 +179,12 @@ snapshot `tools/awq_snapshot.py` writes was compared with ours by index only (sa
   default). Clients that connect in the few seconds before it finishes can still hit the bug.
 - **Not done.** The root cause (which compiled-path component flips the stream's capture state) is not identified;
   the next step is a compiled run without graphs (`cudagraph_mode: NONE`) with the capture-state probes.
+
+## 14. The torch profiler stops the engine on XPU
+
+- **Symptoms.** With `--profiler-config '{"profiler":"torch",...}'`, the request after `/start_profile` fails and the
+  engine dies: `Kineto Profiler on XPU got error from function clearActivities ... PTI_ERROR_NOT_IMPLEMENTED`, then
+  `RPC call to sample_tokens timed out`.
+- **Cause.** The PTI build in the image does not implement an activity call Kineto's XPU backend makes.
+- **Workaround.** Do not use the torch profiler on this image. Measure kernels in isolation instead
+  (`tools/bench_tp2/par_moe.py` and similar micro-benchmarks), or with Level Zero tracing tools outside vLLM.

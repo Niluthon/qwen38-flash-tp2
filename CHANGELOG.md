@@ -12,6 +12,18 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
   `engines/run-tp2.sh`, `image/Dockerfile.tp2` (docs/two-cards.md).
 - Tools for the albucino FP8-PLE checkpoint: `tools/build_int8_ple_from_fp8.py` (the INT8 PLE table from FP8 shards)
   and `tools/fp8ple_snapshot.py` (serve snapshots of the target and of its MTP draft).
+- **0041**: route counter per (layer, expert) on the device, `B70_MOE_ROUTE_COUNT` (`prefill` adds nothing to the
+  decode graphs; `1` also counts decode).
+- **0042**: cold-expert prefetch for prefill, `B70_MOE_COLD_PREFETCH`: two VRAM slots, layer L+1 DMA'd while layer L
+  computes. Prefill ~2,600 → ~3,950 tok/s, outputs unchanged.
+- **0043**: expert swapping by traffic, `B70_MOE_HOTCOLD_SWAP`: the hot set follows the prefill route counts every
+  5 s (in place, no graph recapture, exact). Agentic coding 57–59 → 66–76 tok/s.
+- **0044**: input embedding in pinned host RAM, `B70_EMBED_UVA` (0.59 GiB per card back); swap defaults (prior 0.01,
+  budget 8).
+- `tp2-hotcold` defaults now: 144 hot experts, 0042 + 0043 + 0044 on, util 0.95, 131,072-token context; KV ~193,500
+  tokens. Experiments and the not-worth-it list in docs/two-cards.md; known issues item 14 (torch profiler on XPU).
+- `tools/bench_tp2`: `bench_det.py`, `quality.py`, `prefix_test.py`, `stress_mixed.py`, `ar_bench.py`,
+  `agent_load.py`, `burst_check.py`, `par_moe.py`, `sim_swap.py`.
 
 ## 0.30.0-b70.2 — 2026-10-07: the stable set
 

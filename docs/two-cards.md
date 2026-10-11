@@ -54,7 +54,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + kernels 0.1.14.1+b70.3); the source tree
 and wu1ff's residency shim come from the work volume. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
-136 hot experts per layer and rank swapped as traffic changes (0043), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
+144 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
 `--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
 
@@ -74,7 +74,7 @@ check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 2
 
 | | |
 |---|---|
-| VRAM per card | weights ~22.6 GiB (136 hot experts × 48 layers, dense, MTP draft); prefetch slots 0.53 GiB; **173,610 KV tokens** at util 0.95 and a 131,072-token context (1.32 × a full request); 144,945 at 0.92 / 65,536 without prefetch |
+| VRAM per card | weights ~22.6 GiB (136 hot experts × 48 layers, dense, MTP draft); 144 hot experts, embedding in host RAM, prefetch slots 0.53 GiB; **193,412–193,621 KV tokens** at util 0.95 and a 131,072-token context (1.48 × a full request); 173,610 with 136 hot and the embedding in VRAM; 144,945 at 0.92 / 65,536 without prefetch |
 | host RAM | cold experts 15 GiB pinned per rank; PLE row cache 1 GiB per rank; ~45 GiB used in all, ~16 GiB available |
 | decode, 1 stream | 57–58 tok/s with MTP (26–36 without MTP) |
 | decode, 4 streams | 24 tok/s each, 97 total |
@@ -142,6 +142,25 @@ Prefix reuse in agent sessions was 27–38 % of prompt tokens: with Mamba 'align
 1,600-token boundaries, and an MTP step often jumps over a boundary, so each turn recomputes up to ~1,600 tokens
 besides its new text (≤ 0.4 s at ~3,950 tok/s).
 
+## Experiments, round 3 (2026-10-11): free VRAM without touching KV
+
+| item | result | verdict |
+|---|---|---|
+| **input embedding in pinned host RAM (0044)** | frees 0.59 GiB per card; 142 hot: KV 199,174, agentic coding 70.6 / 81.2 tok/s (136 hot: 66.4 / 76.3); 144 hot: KV 193,412, 73.8 / 79.3; needles 6/6, bursts clean | **default (144 hot)** |
+| swap policy from an offline replay (0044 defaults) | prior weight 0.05 → 0.01, budget 4 → 8: decode cold share 14.3 → 12.2 % and 17.2 → 15.3 % on two traces (offline); live within noise | default |
+| drop the MTP draft's own lm_head / embed_tokens | byte-identical to the target's, but vLLM already shares them and frees the copies: KV and weights unchanged | nothing to gain |
+| fine-grained Mamba prefix cache | needs an identified draft KV group (log: none found) and excludes multi-module MTP; a custom version would save ≤ 0.4 s per agent turn | not applicable |
+| decode profile | the torch profiler crashes the engine on XPU (known issues item 14); measured instead: lm_head 1.06 ms per call (4 per step), graph replay 1.3 µs per kernel, all-reduce 22 µs | see below |
+| MTP draft experts on hot/cold | ~0.66 GiB per card back, but each of the 3 draft passes would then read cold experts (~0.5 ms each); estimated net ~0 | deferred |
+| FP8 KV at a constant 174K tokens + ~10 more hot experts | +~5 % from hot experts against −5–8 % decode (acceptance) and −15 % long prefill; estimated wash | deferred |
+
+Where the non-cold ~20–28 ms of a decode step goes (estimates from the measurements above): lm_head ×4 ~4.3 ms,
+hot experts ~5 ms, all-reduce ~3 ms, graph replay ~2–4 ms, and the dense attention / GDN projections, which are
+BF16 (~3.2 GiB per card read every forward, ~5.4 ms). Next candidates: 8-bit dense weights (XPU has W8A16 FP8 and
+INC wNa16 linear kernels; would halve those reads and free ~1.6 GiB per card for ~14 more hot experts; needs offline
+quantization and a quality comparison) and a 32K-vocabulary lm_head for the draft passes only (~2.3 ms per step,
+outputs unchanged since the target verifies every token).
+
 ## Excluded or not worth it (as of 2026-10-11)
 
 | item | why |
@@ -154,8 +173,10 @@ besides its new text (≤ 0.4 s at ~3,950 tok/s).
 | FP8 KV | +57 % KV but decode −5–8 %, prefill at 30K −15 %; only when KV-bound |
 | rankings rebuilt once from a small sample | overfit (cold share 24 → 33 % on other prompts); 0043 adapts instead |
 | two queues for hot/cold at decode | PCIe-bound, nothing to overlap |
-| async scheduling | KV −27K, no gain, a suspect output |
+| async scheduling | KV −27K, no gain |
 | a better MTP draft | none available without VRAM (KV) |
+| deduplicating the draft's lm_head / embed | already shared by vLLM |
+| fine-grained Mamba prefix cache | not applicable to multi-module MTP |
 | all-reduce tuning | 22 µs per call, ~2–3 ms per step |
 | CPU compute for cold experts | a host round trip per layer breaks the decode graphs; low priority |
 
@@ -174,6 +195,9 @@ python3 tools/bench_tp2/bench_det.py                                           #
 python3 tools/bench_tp2/quality.py <tag>        # needles 32K-97K + short answers -> /work/quality-<tag>.json (diff two)
 python3 tools/bench_tp2/prefix_test.py 6000     # prefix cache: TTFT and cached tokens for a repeated 18K prompt
 python3 tools/bench_tp2/stress_mixed.py         # 3 long prefills during 2 decodes; all must be ok
+AGENT_TEMP=0 python3 tools/bench_tp2/agent_load.py 3 12 2   # agentic coding: 12 sessions x 5 turns, 2 at a time
+python3 tools/bench_tp2/burst_check.py 30       # known issue 6: 30 bursts of 4 requests, degenerate outputs
+python3 tools/bench_tp2/sim_swap.py "<dir>/r0-*.json"   # offline replay of hot-set policies (route snapshots)
 torchrun --nproc-per-node 2 tools/bench_tp2/ar_bench.py   # 2-card all-reduce latency (engine stopped; tp2 image + env)
 ```
 
