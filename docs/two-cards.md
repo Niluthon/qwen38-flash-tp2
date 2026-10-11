@@ -84,6 +84,25 @@ check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 2
 
 Not yet measured: quality benchmarks against the 4-card engine, a multi-day stability run, more than 4 slots.
 
+## How to reproduce the measurements
+
+Engine: `engines/restart-tp2.sh` (detached start; wait for `[run-tp2] warm-up request OK` in `$WORK/engine.log`).
+Client scripts in `tools/bench_tp2/`, run in any container on the host network (e.g. the dev container, with this
+repository mounted):
+
+```bash
+python3 tools/bench_tp2/bench2.py 1:20:512 2:20:256 4:20:256 4:20:512          # decode, 1/2/4 streams
+python3 tools/bench_tp2/bench2.py 1:2800:64 1:11000:64 1:28000:64 1:55000:64 1:28000:256   # prefill, long-context decode
+python3 tools/bench_tp2/bench_mtp.py                                           # real prompts, MTP acceptance
+python3 tools/bench_tp2/repro.py 1050 1 600                                    # known issue 13 (must print OK)
+```
+
+`bench2.py` starts each cell only when the engine is idle and flags cells that other clients overlapped (it reads
+the engine log named by `B70_ENGINE_LOG`); `bench.py` is the same without the gate. Measured on 2026-10-11, idle-gated:
+decode 64.6 tok/s at 1 stream (512 tokens), 87.5 total at 2, 114.3 total at 4; prefill 2,648 / 2,679 / 2,596 / 2,443
+tok/s at 3K / 12K / 30K / 59K tokens, decode after them 63 / 62 / 44-50 / 31 tok/s; real prompts 41-56 tok/s with MTP
+acceptance 2.62 tokens per step (0.74 / 0.51 / 0.37 per draft position).
+
 ## How to test it
 
 All commands run in a container from `b70-flash-next:tp2` (or the dev container) with the source tree on `PYTHONPATH`.
