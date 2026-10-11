@@ -53,9 +53,9 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 ## The engine (`engines/tp2-hotcold.env`, `engines/serve-tp2.args`, `engines/run-tp2.sh`)
 
 Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + kernels 0.1.14.1+b70.3); the source tree
-and wu1ff's residency shim come from the work volume. Settings (the stable starting point, 2026-10-11): TP 2 + EP 2,
-136 hot experts per layer and rank, MTP k=3 with the checkpoint's draft, `--gpu-memory-utilization 0.92`, 65,536-token
-context, image input off (`--limit-mm-per-prompt` 0),
+and wu1ff's residency shim come from the work volume. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
+136 hot experts per layer and rank, cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
+`--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
 
 ```bash
@@ -74,15 +74,49 @@ check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 2
 
 | | |
 |---|---|
-| VRAM per card | weights ~22.6 GiB (136 hot experts × 48 layers, dense, MTP draft); **144,945 KV tokens** (2.2 × a 65,536-token request) |
+| VRAM per card | weights ~22.6 GiB (136 hot experts × 48 layers, dense, MTP draft); prefetch slots 0.53 GiB; **173,610 KV tokens** at util 0.95 and a 131,072-token context (1.32 × a full request); 144,945 at 0.92 / 65,536 without prefetch |
 | host RAM | cold experts 15 GiB pinned per rank; PLE row cache 1 GiB per rank; ~45 GiB used in all, ~16 GiB available |
 | decode, 1 stream | 57–58 tok/s with MTP (26–36 without MTP) |
 | decode, 4 streams | 24 tok/s each, 97 total |
-| prefill | ~2,600 tok/s at 3K–12K tokens; long first requests (17K with thinking, 24K) pass after the warm-up; on the 262K variant a 146K-token needle was found in 82 s |
+| prefill | ~3,950 tok/s at 3K–30K tokens with 0042 (~2,600 without); long first requests (17K with thinking, 24K) pass after the warm-up; on the 262K variant a 146K-token needle was found in 82 s |
 | MTP acceptance | 2.48 tokens per step on a real chat answer (0.82 / 0.69 / 0.43 per position on synthetic text) |
 | boot | ~4–5 min |
 
 Not yet measured: quality benchmarks against the 4-card engine, a multi-day stability run, more than 4 slots.
+
+## Experiments, 2026-10-11 (one boot each; `tools/bench_tp2/bench_det.py`, 1 stream = mean of 4 prompts)
+
+`bench_det.py` uses fixed real prompts at temperature 0, so MTP acceptance is the same between runs and the
+engine's ms per step can be compared directly (repeatable within ~3 %). The word-salad cells of `bench2.py` swing
+±30 % between identical runs at 1 stream (acceptance depends on the random text); do not compare configs with them.
+
+| configuration | KV tokens | 1 stream | 4 streams | prefill 3K / 12K / 30K | verdict |
+|---|---|---|---|---|---|
+| baseline: 136 hot, util 0.92, 64K | 144,854 | 54.8 tok/s (45–61 ms/step) | 80.8 | 2,599 / 2,608 / 2,575 | reference |
+| 128K context (else baseline) | 166,171 | real prompts 45.5 (= 64K) | — | 2,544 / 2,592 / 2,560 | no decode cost |
+| PLE row cache 6 GiB + lookahead | 144,854 | 54.2 | 74–78 | 2,479 / 2,577 / 2,547 | no gain (cache already 99 % hits when warm) |
+| MTP k=2 | 152,724 | 51.4 (40–54 ms/step, acceptance −15–24 %) | 74 | 2,432 / 2,544 / 2,522 | worse; keep k=3 |
+| 8,192-token batches | 76,671 | ~same | 73.5 | 2,497 / 2,774 / 2,952 | +8–16 % prefill for half the KV; no |
+| rankings from 40 local requests | 143,029 | 46.0 (cold share 24 → 33 %) | 61 | — | overfit; keep the checkpoint's |
+| `--kv-cache-dtype fp8` | 227,086 | 50.5 (acceptance −3–12 %) | 74 | 2,522 / 2,527 / 2,188 | +57 % KV, −5–8 % decode; only when KV-bound |
+| 144 hot, util 0.95 | 154,438 | 55.3 (−3–4 % ms/step) | 84.7 | 2,613 / 2,690 / 2,652 | better everywhere |
+| 144 hot, util 0.95, prefetch (0042) | 110,808 | 55.5 | 86.6 | 4,026 / 4,030 / 3,866 | prefill +50 %, answers identical |
+| **136 hot, util 0.95, prefetch, 128K (the default now)** | **173,610** | **55.0** | **84–86** | **3,886 / 3,949 / 3,811** | needles 6/6 to 97K, mixed load OK |
+
+Other findings:
+
+- **Decode is bound by the cold experts.** With the checkpoint's rankings 24 % of decode routes (6–39 % by layer) hit
+  cold experts on the benchmark prompts and 39 % on a Russian/code/JSON mix; ms/step follows that share (24 → 33 %
+  cold: +6–14 ms/step). More hot experts help most: cold share on the benchmark prompts at 112 / 136 / 144 / 152 / 168
+  hot = 33 / 24 / 22 / 19 / 15 %. A blend of the checkpoint ranking with local counts (`B70_MOE_ROUTE_COUNT`, λ 0.5–1)
+  cut the mix's cold share 39 → 27–31 % without hurting the benchmark prompts (offline); it needs days of real traffic.
+- **Not the bottleneck:** all-reduce between the two cards is 22 µs for decode-sized tensors (~2–3 ms per step);
+  the PLE NVMe reads are 0.1 ms on the 980 PRO (O_DIRECT, idle or under decode), the per-step PLE bubble 0.1 ms p50
+  with a warm cache (an occasional ~9 ms step, 1 %).
+- **The prefix cache works** (it reuses 16,000 of 18,375 tokens: TTFT 7.9 → 1.15 s, 0.74 s with prefetch); a 0 %
+  hit rate in the engine log only means the traffic did not repeat a ≥ 1,600-token prefix (Mamba 'align' blocks).
+- VRAM budget per card at 0.92: weights 22.55 GiB, non-torch 1.84, peak activation 1.06, graphs 0.45, KV 2.42; vLLM's
+  own suggestion is ~0.8 GiB more KV, which util 0.95 takes. Each card has PCIe 5.0 x8 (the board splits x16).
 
 ## How to reproduce the measurements
 
@@ -95,6 +129,11 @@ python3 tools/bench_tp2/bench2.py 1:20:512 2:20:256 4:20:256 4:20:512          #
 python3 tools/bench_tp2/bench2.py 1:2800:64 1:11000:64 1:28000:64 1:55000:64 1:28000:256   # prefill, long-context decode
 python3 tools/bench_tp2/bench_mtp.py                                           # real prompts, MTP acceptance
 python3 tools/bench_tp2/repro.py 1050 1 600                                    # known issue 13 (must print OK)
+python3 tools/bench_tp2/bench_det.py                                           # decode: fixed prompts, temp 0, ms/step
+python3 tools/bench_tp2/quality.py <tag>        # needles 32K-97K + short answers -> /work/quality-<tag>.json (diff two)
+python3 tools/bench_tp2/prefix_test.py 6000     # prefix cache: TTFT and cached tokens for a repeated 18K prompt
+python3 tools/bench_tp2/stress_mixed.py         # 3 long prefills during 2 decodes; all must be ok
+torchrun --nproc-per-node 2 tools/bench_tp2/ar_bench.py   # 2-card all-reduce latency (engine stopped; tp2 image + env)
 ```
 
 `bench2.py` starts each cell only when the engine is idle and flags cells that other clients overlapped (it reads
@@ -133,10 +172,9 @@ Not done yet, and worth doing before relying on it:
 1. **Measure, then set the hot set from this host's traffic.** The rankings come from the checkpoint author's runs.
    Counting routes per (layer, expert) at run time and re-ranking would raise the share of routes served from VRAM.
    A route counter would also show how much time decode spends on the cold path.
-2. **Bigger prefill chunks.** Cold experts cost the same PCIe read per chunk whatever its size, so 8,192-token chunks
-   should prefill faster (the CUDA 2× 3090 runtime saw that); it costs activation memory and KV.
-3. **Overlap the cold path.** Hot and cold run one after the other on one queue; issuing the cold GEMM on a second
-   queue would hide part of the PCIe time behind the hot one.
+2. ~~Bigger prefill chunks~~ and ~~overlap the cold path in prefill~~: done as 0042 (prefetch into VRAM slots).
+3. **Overlap the cold path at decode.** Hot and cold run one after the other on one queue inside the decode graph;
+   issuing the cold GEMM on a second queue would hide part of the PCIe time behind the hot one.
 4. **CPU compute for cold experts at decode** (ktransformers style): host DRAM reads at ~60 GB/s against ~19 GB/s
    over PCIe, so a CPU int4 kernel could beat UVA reads at small batch sizes.
 5. **Read the FP8 PLE shards in place** instead of a 52.5 GB INT8 copy: the 0013 reader would need multi-file row

@@ -76,9 +76,14 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | variable | default | patch | effect |
 |---|---|---|---|
 | `B70_MOE_HOTCOLD` | unset (off) | 0040 | `1`: keep the `B70_MOE_HOT_EXPERTS` most-routed local experts per layer in VRAM and the rest pinned in host RAM, read by the same kernel through UVA. Exact (hot + cold = all in VRAM, bit for bit). MTP layers are never split. |
-| `B70_MOE_HOT_EXPERTS` | all local experts (= off) | 0040 | hot experts per layer **per rank**. Each one costs 48 × 2.42 MiB = 116 MiB of VRAM per rank on Qwen3.8-Flash-Next and frees the same in host RAM. We run `112` on 2× B70 (EP 2: 256 local experts). |
+| `B70_MOE_HOT_EXPERTS` | all local experts (= off) | 0040 | hot experts per layer **per rank**. Each one costs 48 × 2.42 MiB = 116 MiB of VRAM per rank on Qwen3.8-Flash-Next and frees the same in host RAM. We run `136` on 2× B70 (EP 2: 256 local experts). |
 | `B70_MOE_HOTCOLD_RANKINGS` | unset (experts by id) | 0040 | JSON `{"<layer>": [global expert ids, hottest first]}`; experts it does not list follow by id. The albucino checkpoint ships `runtime/static_hot_cache_rankings.json`. |
 | `B70_MOE_HOTCOLD_MEMLOG` | unset (off) | 0040 | `1`: log torch allocated / reserved and device free memory after every layer's split (otherwise every 12th layer). |
+| `B70_MOE_COLD_PREFETCH` | unset (off) | 0042 | `1`: batches with at least `B70_MOE_COLD_PREFETCH_MIN_TOKENS` tokens (prefill) run the cold experts from two VRAM slots instead of UVA reads; layer L+1's cold experts are DMA'd on a copy stream while layer L computes. Same kernel and bytes (outputs unchanged). Costs two layers' cold experts of VRAM (0.53 GiB per card at 136–144 hot). On 2× B70: prefill ~2,600 → ~3,950 tok/s. |
+| `B70_MOE_COLD_PREFETCH_MIN_TOKENS` | `512` | 0042 | smallest batch that uses the slots (min 64); smaller batches, and every decode graph (capture sizes ≤ 16), keep the UVA path. |
+| `B70_MOE_ROUTE_COUNT` | unset (off) | 0041 | `1`: count routes per (layer, global expert) on the device (also inside graph replays) and log the share of this rank's routes served by cold experts. |
+| `B70_MOE_ROUTE_COUNT_S` | `60` | 0041 | period of the log line / dump, seconds (read on the host after the per-step sync of the NVMe PLE path, so it needs `B70_PLE_INT8_NVME=1`). |
+| `B70_MOE_ROUTE_COUNT_PATH` | unset | 0041 | write cumulative counts to `<path>-rank<r>.json` (`{"<layer>": [count per global expert]}`), the input for re-ranking. |
 
 ## Ungated parts (active even with every switch unset)
 

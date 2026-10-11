@@ -5,7 +5,7 @@
 --tensor-parallel-size 2
 --enable-expert-parallel
 --trust-remote-code
---gpu-memory-utilization 0.92
+--gpu-memory-utilization 0.95
 --max-model-len 131072
 --max-num-batched-tokens 4096
 --max-num-seqs 4
