@@ -54,7 +54,7 @@ d5ef338178e824f0d2fb9447cdebda1e8f4e7ec9cd7791994083007ff1ad77c8  vllm/v1/worker
 # of 0001–0005. sha256  tag  relative-path-under-vllm/   (both roots)
 B70_FILES='
 c56577011b058f386ddc44b1b713e34a2e4086a68b2c2a6e971f82fdf0dcd1fc  B70-0028      vllm/models/qwen4_exp/nvidia/ngram_embedding.py
-9bb1916147d7c1b145a20d63eeb09f9b9b299bb48cb02f6d0845b86c012536c3  B70-0041      vllm/models/qwen4_exp/nvidia/model_state.py
+04f0d01e1d88b42bac1ddc0daf5a20adb24cc1e0f35e381bc7c171bda48add34  B70-0043      vllm/models/qwen4_exp/nvidia/model_state.py
 6e3b952277dfb4beefd34491dfe19664b0d030d1cc98016b63b28859dd4fb7db  B70-0013b     vllm/models/qwen4_exp/nvidia/ple_nvme.py
 0b02bdb26b340d57869861c0570815bc68d36812a87c1b78a16960f3b20f842a  B70-0023c     vllm/v1/worker/gpu/model_runner.py
 98b50a3b6e780ecdb7deb96a1e9ca3663cc7aba9e4ffe051f97c1b14d3df0fe8  B70-0031      vllm/v1/kv_offload/cpu/gpu_worker.py
@@ -79,8 +79,8 @@ e2b41b0b066d1d9e18ca0ce4f135df46ebf0ba0084888441dba4d171d1342021  B70-0022      
 e5014b3e6f2808aa0aca6478e0c650000a0233d16b5abc9cfdf82533b1b749dc  B70-0022      vllm/v1/worker/mamba_utils.py
 6e79d4687c38aad5c26cb2eeeada4909ae60008c266993105d4e4c5ed31326ad  B70-0029      vllm/v1/worker/gpu_model_runner.py
 ab17fa440e054fe1414956d80f08b67fa733171020ebe1a67c8a6bdaab29f9d1  B70-0029b     vllm/v1/worker/gpu/sample/prompt_logprob.py
-0d6433acaa3b7b3eaf3a456ad36488935cbaef99daf69fa755c1b08a5d36ae15  B70-0042      vllm/model_executor/layers/fused_moe/b70_hotcold.py
-79a17be0ba73d0549b172728bd6f52ba1bc5925c5acd745442d3019cadf42835  B70-0042      vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+e9edf4a2f57280e6fb99f5fd44fc20c4c0370f82b9abf944b3ac3ccae56c4cfa  B70-0043      vllm/model_executor/layers/fused_moe/b70_hotcold.py
+60df173586a9bdf8d868f69d6a329fa90f0c5f355daee3533b0baa0f13fab543  B70-0043      vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
 cf9c4df3ed6d142adc80ff03e3cf078403e10dd1b554ee28702f651db88f27fd  B70-0040      vllm/model_executor/layers/fused_moe/routed_experts.py
 97262abaff15d83785b23199561667e8c0fccce3a18ddf78c3e39a219a884fbc  B70-0040      vllm/model_executor/layers/quantization/auto_gptq.py
 '

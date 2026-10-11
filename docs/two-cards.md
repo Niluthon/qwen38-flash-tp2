@@ -54,7 +54,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + kernels 0.1.14.1+b70.3); the source tree
 and wu1ff's residency shim come from the work volume. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
-136 hot experts per layer and rank, cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
+136 hot experts per layer and rank swapped as traffic changes (0043), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
 `--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
 
@@ -118,6 +118,47 @@ Other findings:
 - VRAM budget per card at 0.92: weights 22.55 GiB, non-torch 1.84, peak activation 1.06, graphs 0.45, KV 2.42; vLLM's
   own suggestion is ~0.8 GiB more KV, which util 0.95 takes. Each card has PCIe 5.0 x8 (the board splits x16).
 
+## Experiments, round 2 (2026-10-11): agentic coding, KV never reduced
+
+Rule for this round: no change may cost KV (173,610 tokens at 128K). Workload: `tools/bench_tp2/agent_load.py`,
+coding-agent sessions (tool-use system prompt, a real source file from the vLLM tree, 5 turns: implement, test, fix,
+refactor, explain), 12 sessions, 2 at a time, temperature 0 for A/B runs.
+
+| item | result | verdict |
+|---|---|---|
+| **expert swapping (0043)** | agentic coding 57.2 / 58.9 → **66.4 / 76.3 tok/s** (+16 / +30 %, two runs; wall 245 / 286 → 175 / 204 s); decode cold share 30 % → 18–21 %; general prompts re-adapt within minutes (4 streams 88.5 vs 86); KV unchanged | **default** |
+| hot and cold MoE on two queues at decode | captures and stays bit-identical, but no overlap: 53.9 vs 53.4 ms (4 rows, 48 layers), 198.3 vs 197.8 (16 rows) | not worth it |
+| async scheduling (`--async-scheduling`) | KV 173,610 → 146,788; decode no faster (1 stream ~52 vs ~55, 4 streams 83 vs 84–86); 1 repeat-pattern output in 120 burst requests | not worth it |
+| a more precise MTP draft | the draft is RTN INT4-g32 from RadixArk's NVFP4 (already 4-bit); no higher-precision MTP here; INT8 experts would cost ~1.9 GB VRAM per card | not available without KV loss |
+
+What bounds decode, measured with the real kernels (`tools/bench_tp2/par_moe.py`, one B70, 136 hot / 120 cold, random
+routing): 48 layers of hot experts take 4.9 ms at 4 rows, cold experts 48.4 ms; at 16 rows 11.0 vs 186.7 ms. The
+cold reads run at ~21–23 GB/s, the PCIe 5.0 x8 limit, and keep the GPU busy meanwhile, so decode time is the cold
+bytes divided by the link speed. The only lever is fewer cold bytes: swapping. An offline replay of 5 s route
+snapshots (`tools/bench_tp2/sim_swap.py`) predicted the result: hot set by prefill counts 14 % decode cold share, by
+decode counts 11.7 % (costs ~4 % decode to count), oracle per window 2 %.
+
+Prefix reuse in agent sessions was 27–38 % of prompt tokens: with Mamba 'align' caching a GDN state is kept only at
+1,600-token boundaries, and an MTP step often jumps over a boundary, so each turn recomputes up to ~1,600 tokens
+besides its new text (≤ 0.4 s at ~3,950 tok/s).
+
+## Excluded or not worth it (as of 2026-10-11)
+
+| item | why |
+|---|---|
+| more hot experts at the same util (144, 152), 64K context with 152 hot | cost KV (excluded: agentic coding needs the KV) |
+| 8,192-token prefill batches | +8–16 % prefill for half the KV; 0042 gives +50 % for none |
+| GPU power cap changes | excluded (host stability) |
+| PLE row cache 6 GiB, PLE lookahead | no gain: 99 % hits when warm, 0.1 ms bubble |
+| MTP k=2 | acceptance −15–24 % beats the shorter step: −6 % |
+| FP8 KV | +57 % KV but decode −5–8 %, prefill at 30K −15 %; only when KV-bound |
+| rankings rebuilt once from a small sample | overfit (cold share 24 → 33 % on other prompts); 0043 adapts instead |
+| two queues for hot/cold at decode | PCIe-bound, nothing to overlap |
+| async scheduling | KV −27K, no gain, a suspect output |
+| a better MTP draft | none available without VRAM (KV) |
+| all-reduce tuning | 22 µs per call, ~2–3 ms per step |
+| CPU compute for cold experts | a host round trip per layer breaks the decode graphs; low priority |
+
 ## How to reproduce the measurements
 
 Engine: `engines/restart-tp2.sh` (detached start; wait for `[run-tp2] warm-up request OK` in `$WORK/engine.log`).
@@ -169,9 +210,7 @@ Not done yet, and worth doing before relying on it:
 
 ## What to improve
 
-1. **Measure, then set the hot set from this host's traffic.** The rankings come from the checkpoint author's runs.
-   Counting routes per (layer, expert) at run time and re-ranking would raise the share of routes served from VRAM.
-   A route counter would also show how much time decode spends on the cold path.
+1. ~~Measure, then set the hot set from this host's traffic~~: 0041 counts routes, 0043 swaps experts as traffic changes.
 2. ~~Bigger prefill chunks~~ and ~~overlap the cold path in prefill~~: done as 0042 (prefetch into VRAM slots).
 3. **Overlap the cold path at decode.** Hot and cold run one after the other on one queue inside the decode graph;
    issuing the cold GEMM on a second queue would hide part of the PCIe time behind the hot one.

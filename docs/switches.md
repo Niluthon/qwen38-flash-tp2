@@ -81,9 +81,13 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_HOTCOLD_MEMLOG` | unset (off) | 0040 | `1`: log torch allocated / reserved and device free memory after every layer's split (otherwise every 12th layer). |
 | `B70_MOE_COLD_PREFETCH` | unset (off) | 0042 | `1`: batches with at least `B70_MOE_COLD_PREFETCH_MIN_TOKENS` tokens (prefill) run the cold experts from two VRAM slots instead of UVA reads; layer L+1's cold experts are DMA'd on a copy stream while layer L computes. Same kernel and bytes (outputs unchanged). Costs two layers' cold experts of VRAM (0.53 GiB per card at 136–144 hot). On 2× B70: prefill ~2,600 → ~3,950 tok/s. |
 | `B70_MOE_COLD_PREFETCH_MIN_TOKENS` | `512` | 0042 | smallest batch that uses the slots (min 64); smaller batches, and every decode graph (capture sizes ≤ 16), keep the UVA path. |
-| `B70_MOE_ROUTE_COUNT` | unset (off) | 0041 | `1`: count routes per (layer, global expert) on the device (also inside graph replays) and log the share of this rank's routes served by cold experts. |
+| `B70_MOE_ROUTE_COUNT` | unset (off) | 0041, 0043 | `prefill`: count routes per (layer, global expert) in eager batches (prefill, mixed) only, nothing added to the decode graphs; `1`: also inside the decode graphs (~4 % decode cost; for measurements). Log line per period: the share of this rank's prefill and decode routes served by cold experts. Eager counting starts with the first real batch (the profiling run, and so the KV size, is unchanged). |
 | `B70_MOE_ROUTE_COUNT_S` | `60` | 0041 | period of the log line / dump, seconds (read on the host after the per-step sync of the NVMe PLE path, so it needs `B70_PLE_INT8_NVME=1`). |
 | `B70_MOE_ROUTE_COUNT_PATH` | unset | 0041 | write cumulative counts to `<path>-rank<r>.json` (`{"<layer>": [count per global expert]}`), the input for re-ranking. |
+| `B70_MOE_HOTCOLD_SWAP` | unset (off) | 0043 | `1`: the hot set follows the traffic. Every period each rank scores its local experts from the prefill route counts (implies `B70_MOE_ROUTE_COUNT=prefill`) and swaps experts between VRAM and pinned RAM in place (weights, scales and expert maps; no graph recapture). Exact: outputs do not depend on placement. We run it on 2× B70. |
+| `B70_MOE_HOTCOLD_SWAP_S` | `5` | 0043 | period, seconds (one round costs 7–16 ms on 2× B70). |
+| `B70_MOE_HOTCOLD_SWAP_DECAY` | `0.95` | 0043 | per-period decay of the scores (half-life ~70 s at 5 s). |
+| `B70_MOE_HOTCOLD_SWAP_BUDGET` | `4` | 0043 | most swaps per layer and period; a swap needs the cold score to beat the hot one by 10 %. |
 
 ## Ungated parts (active even with every switch unset)
 

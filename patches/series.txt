@@ -50,3 +50,4 @@ B70-0032                                             0032-b70-index64-fallback-w
 B70-0040                                             0040-b70-moe-hotcold-experts.patch                       0040-b70-moe-hotcold-tests.patch
 B70-0041                                             0041-b70-moe-hotcold-route-counter.patch                 -
 B70-0042                                             0042-b70-moe-hotcold-cold-prefetch.patch                  -
+B70-0043                                             0043-b70-moe-hotcold-expert-swap.patch                   -
