@@ -248,12 +248,12 @@ Every switch: [docs/switches.md](docs/switches.md).
 ## Two cards (2× B70, ~64 GB RAM)
 
 `docker compose up -d` (compose.yaml; or `engines/run-tp2.sh`) serves the albucino FP8-PLE checkpoint (Intel AutoRound
-target) at TP 2 + EP 2 with MTP k=3 and a 131,072-token context: 144 hot experts per layer and rank in VRAM that follow
+target) at TP 2 + EP 2 with MTP k=3 and a 131,072-token context: 150 hot experts per layer and rank in VRAM that follow
 the traffic (0040, 0043), the rest pinned in host RAM, cold experts prefetched into VRAM for prefill (0042), the input
-embedding in host RAM (0044), INT8 PLE from NVMe, a warm-up request at start (known issues item 13). Measured: ~55 tok/s
-decode at one stream on general prompts, ~71–81 tok/s generation on agentic coding sessions, ~3,950 tok/s prefill,
-~193,500 KV tokens. Tuning without editing tracked files: `engines/tp2-local.env` (from
-`engines/tp2-local.env.example`). Not yet quality-benchmarked or endurance-tested. Setup, experiments and numbers:
+embedding in host RAM (0044), FP8 W8A16 dense projections (0045), INT8 PLE from NVMe, a warm-up request at start (known issues item 13). Measured: ~55 tok/s
+decode at one stream on general prompts (~57 with 0045), ~90–99 tok/s generation on agentic coding sessions, ~3,950 tok/s
+prefill, 201,794 KV tokens; MMLU 87.2 %, HumanEval 158 / 164. Tuning without editing tracked files: `engines/tp2-local.env` (from
+`engines/tp2-local.env.example`). Quality-checked against BF16 dense (MMLU, HumanEval); not yet endurance-tested. Setup, experiments and numbers:
 [docs/two-cards.md](docs/two-cards.md).
 
 ## Work in progress (not in the series)

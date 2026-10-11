@@ -54,7 +54,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + kernels 0.1.14.1+b70.3); the source tree
 and wu1ff's residency shim come from the work volume. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
-144 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
+150 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
 `--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
 
@@ -75,7 +75,7 @@ check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 2
 
 | | |
 |---|---|
-| VRAM per card | weights ~22.6 GiB (136 hot experts × 48 layers, dense, MTP draft); 144 hot experts, embedding in host RAM, prefetch slots 0.53 GiB; **193,412–193,621 KV tokens** at util 0.95 and a 131,072-token context (1.48 × a full request); 173,610 with 136 hot and the embedding in VRAM; 144,945 at 0.92 / 65,536 without prefetch |
+| VRAM per card | weights ~22.6 GiB (136 hot experts × 48 layers, dense, MTP draft); 150 hot experts, embedding in host RAM, FP8 dense projections, prefetch slots 0.53 GiB; **201,794 KV tokens** at util 0.95 and a 131,072-token context (1.54 × a full request); 193,621 with 144 hot and BF16 dense; 173,610 with 136 hot and the embedding in VRAM; 144,945 at 0.92 / 65,536 without prefetch |
 | host RAM | cold experts 15 GiB pinned per rank; PLE row cache 1 GiB per rank; ~45 GiB used in all, ~16 GiB available |
 | decode, 1 stream | 57–58 tok/s with MTP (26–36 without MTP) |
 | decode, 4 streams | 24 tok/s each, 97 total |
@@ -155,7 +155,7 @@ besides its new text (≤ 0.4 s at ~3,950 tok/s).
 | MTP draft experts on hot/cold | ~0.66 GiB per card back, but each of the 3 draft passes would then read cold experts (~0.5 ms each); estimated net ~0 | deferred |
 | FP8 KV at a constant 174K tokens + ~10 more hot experts | +~5 % from hot experts against −5–8 % decode (acceptance) and −15 % long prefill; estimated wash | deferred |
 
-**8-bit dense layers (0045, opt-in).** `B70_DENSE_FP8` quantizes the 16-bit GDN projections (in_proj_qkv,
+**8-bit dense layers (0045; opt-in in round 3, the default since round 4).** `B70_DENSE_FP8` quantizes the 16-bit GDN projections (in_proj_qkv,
 in_proj_z, out_proj) and attention q/k/v/o at load time to FP8 W8A16. Measured: weights −0.9 GiB per card, KV
 193,621 → 251,771 tokens; perplexity on fixed texts (`tools/bench_tp2/ppl.py`) code 2.032–2.037 → 2.048, docs
 7.58–7.61 → 7.638, Russian 1.539 → 1.546 (+0.4–0.7 %; run-to-run noise ~0.3 %); needles 6/6; general prompts after
@@ -163,7 +163,8 @@ chat 52.6 → 56.2 tok/s at 1 stream, 76.0 → 80.5 at 4 (one run each); the sam
 (`agent_judge.py`): answers 1,182 → 1,422 characters, responses at the 500-token cap 48 → 58 %, no loops. In isolation
 `fp8_gemm_w8a16` beats BF16 at 1–4 rows (21 vs 37 µs) and loses at 512 (211 vs 132 µs), yet prefill stayed ~3,950
 tok/s. Verdict: a KV increase with a small speed gain and a measurable behaviour shift; off until a real quality
-benchmark (MMLU, the coding set) passes. Shared experts and the INT4 W4A16 path (`int4_gemm_w4a16`) are untested.
+benchmark (MMLU, the coding set) passes — it did in round 4. The agent-session comparison in this paragraph used the
+unfrozen corpus and is superseded by round 4. Shared experts and the INT4 W4A16 path (`int4_gemm_w4a16`) are untested.
 
 Where the non-cold ~20–28 ms of a decode step goes (estimates from the measurements above): lm_head ×4 ~4.3 ms,
 hot experts ~5 ms, all-reduce ~3 ms, graph replay ~2–4 ms, and the dense attention / GDN projections, which are
@@ -171,6 +172,20 @@ BF16 (~3.2 GiB per card read every forward, ~5.4 ms). Next candidates: 8-bit den
 INC wNa16 linear kernels; would halve those reads and free ~1.6 GiB per card for ~14 more hot experts; needs offline
 quantization and a quality comparison) and a 32K-vocabulary lm_head for the draft passes only (~2.3 ms per step,
 outputs unchanged since the target verifies every token).
+
+## Experiments, round 4 (2026-10-11): parallel agents, draft head, quality gate for FP8 dense
+
+From here on the agent load reads a frozen copy of its source files (`AGENT_CORPUS`, default `/work/agent-corpus`).
+Before that it picked files from the live vLLM tree by size, so every patch that changed a file's size changed the
+sessions: the round-3 FP8 agent comparison (prompt totals 207K vs 229K) was confounded and is superseded here.
+
+| item | result | verdict |
+|---|---|---|
+| **FP8 dense layers (0045) + 150 hot experts** | quality: MMLU 87.33 → 87.23 % on 3,000 paired questions (29 vs 26 discordant, exact McNemar p = 0.79), HumanEval pass@1 157 → 158 / 164 (`run_eval.py`, `he_exec.py`, `compare.py`); KV 193,621 → 201,794; agentic coding 84.5 / 87.5 → 90.5 / 98.7 tok/s (frozen corpus, same prompts); general prompts 53.5 → 57.1 tok/s at 1 stream (steps ~3.5 ms shorter); prefill unchanged; 0 / 120 bad burst outputs | **default** |
+| 8 slots (`--max-num-seqs 8`, capture sizes to 32) | KV 193,621 → 178,324; 4 concurrent agents 105.8 → 106.4 tok/s, 8 concurrent 118.6 → 127.7 (+8 %, wall −13 %); prefix reuse at 8 concurrent 30 → 14 % (KV pressure); one unexplained short answer in 400 eight-wide burst requests | opt-in (tp2-local.env.example) |
+| draft-only reduced vocabulary (0046, not committed) | step −2…4 ms, but 5–20 % of real output tokens were outside a 51K-token vocabulary (code-heavy corpus) and acceptance fell 3–11 %: net −3 % (1 stream), −7 % (4 streams); <0.2 % misses needs ~98K of the 124K rows per card (~0.7 ms/step for ~0.5 GiB) | not worth it |
+| adaptive draft length | vLLM's adaptive verification supports only DSpark, excludes local-argmax drafting, and variable-length verify batches are the padded-graph case of known issue 6 | not applicable |
+| cold-expert prefetch at decode | a UVA-reading kernel does not overlap with compute (two-queue test), and the decode graphs cannot express copies whose source experts are chosen on the GPU each step | blocked |
 
 ## Excluded or not worth it (as of 2026-10-11)
 
@@ -186,6 +201,9 @@ outputs unchanged since the target verifies every token).
 | two queues for hot/cold at decode | PCIe-bound, nothing to overlap |
 | async scheduling | KV −27K, no gain |
 | a better MTP draft | none available without VRAM (KV) |
+| draft-only reduced vocabulary | real output uses too much of the vocabulary; acceptance loss beats the saved reads |
+| adaptive draft length | DSpark-only in vLLM; conflicts with local-argmax drafting |
+| cold-expert prefetch at decode | needs data-dependent copies inside the decode graphs |
 | deduplicating the draft's lm_head / embed | already shared by vLLM |
 | fine-grained Mamba prefix cache | not applicable to multi-module MTP |
 | all-reduce tuning | 22 µs per call, ~2–3 ms per step |
@@ -210,6 +228,9 @@ AGENT_TEMP=0 python3 tools/bench_tp2/agent_load.py 3 12 2   # agentic coding: 12
 python3 tools/bench_tp2/burst_check.py 30       # known issue 6: 30 bursts of 4 requests, degenerate outputs
 python3 tools/bench_tp2/sim_swap.py "<dir>/r0-*.json"   # offline replay of hot-set policies (route snapshots)
 python3 tools/bench_tp2/ppl.py <tag>            # perplexity on fixed texts (code, docs, Russian) via prompt logprobs
+python3 tools/bench_tp2/run_eval.py <tag> 3000  # MMLU (3,000 sampled) + HumanEval completions -> /work/eval/<tag>-*.json
+docker run --rm --network none -v $WORK/eval:/eval --entrypoint /opt/venv/bin/python b70-flash-next:tp2 /eval/he_exec.py /eval/<tag>-humaneval.json
+python3 tools/bench_tp2/compare.py <tagA> <tagB>   # paired MMLU (McNemar) and HumanEval differences
 AGENT_DUMP=a.json AGENT_TEMP=0 python3 tools/bench_tp2/agent_load.py 3 12 2; python3 tools/bench_tp2/agent_judge.py a.json
 torchrun --nproc-per-node 2 tools/bench_tp2/ar_bench.py   # 2-card all-reduce latency (engine stopped; tp2 image + env)
 ```

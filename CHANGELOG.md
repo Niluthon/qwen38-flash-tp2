@@ -20,14 +20,15 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
   5 s (in place, no graph recapture, exact). Agentic coding 57–59 → 66–76 tok/s.
 - **0044**: input embedding in pinned host RAM, `B70_EMBED_UVA` (0.59 GiB per card back); swap defaults (prior 0.01,
   budget 8).
-- **0045** (opt-in): FP8 W8A16 for 16-bit dense layers of INC checkpoints, `B70_DENSE_FP8=<regex>`. +58K KV
-  tokens, perplexity +0.4–0.7 %, small decode gain, longer answers; off by default.
-- `tp2-hotcold` defaults now: 144 hot experts, 0042 + 0043 + 0044 on, util 0.95, 131,072-token context; KV ~193,500
-  tokens. Experiments and the not-worth-it list in docs/two-cards.md; known issues item 14 (torch profiler on XPU).
+- **0045**: FP8 W8A16 for 16-bit dense layers of INC checkpoints, `B70_DENSE_FP8=<regex>` (off unless set). Passed a
+  paired quality gate (MMLU 87.33 → 87.23 %, p = 0.79; HumanEval 157 → 158 / 164); on in `tp2-hotcold`.
+- `tp2-hotcold` defaults now: 150 hot experts, 0042 + 0043 + 0044 + 0045 on, util 0.95, 131,072-token context; KV
+  201,794 tokens; agentic coding ~90–99 tok/s. Experiments and the not-worth-it list in docs/two-cards.md; known issues item 14 (torch profiler on XPU).
 - `compose.yaml` + `engines/compose-serve.sh`: `docker compose up -d` runs the two-card engine with a warm-up service;
   local overrides in `engines/tp2-local.env` (template `.example`), host paths in `.env` (template `.env.example`).
 - `tools/bench_tp2`: `bench_det.py`, `quality.py`, `prefix_test.py`, `stress_mixed.py`, `ar_bench.py`,
-  `agent_load.py` (`AGENT_DUMP`), `agent_judge.py`, `burst_check.py`, `par_moe.py`, `sim_swap.py`, `ppl.py`, `dense_gemm.py`.
+  `agent_load.py` (`AGENT_DUMP`), `agent_judge.py`, `burst_check.py`, `par_moe.py`, `sim_swap.py`, `ppl.py`, `dense_gemm.py`, `run_eval.py`, `he_exec.py`, `compare.py`; `agent_load.py` reads a
+  frozen corpus (`AGENT_CORPUS`).
 
 ## 0.30.0-b70.2 — 2026-10-07: the stable set
 

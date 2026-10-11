@@ -76,7 +76,7 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | variable | default | patch | effect |
 |---|---|---|---|
 | `B70_MOE_HOTCOLD` | unset (off) | 0040 | `1`: keep the `B70_MOE_HOT_EXPERTS` most-routed local experts per layer in VRAM and the rest pinned in host RAM, read by the same kernel through UVA. Exact (hot + cold = all in VRAM, bit for bit). MTP layers are never split. |
-| `B70_MOE_HOT_EXPERTS` | all local experts (= off) | 0040 | hot experts per layer **per rank**. Each one costs 48 × 2.42 MiB = 116 MiB of VRAM per rank on Qwen3.8-Flash-Next and frees the same in host RAM. We run `144` on 2× B70 (EP 2: 256 local experts) with `B70_EMBED_UVA=1`. |
+| `B70_MOE_HOT_EXPERTS` | all local experts (= off) | 0040 | hot experts per layer **per rank**. Each one costs 48 × 2.42 MiB = 116 MiB of VRAM per rank on Qwen3.8-Flash-Next and frees the same in host RAM. We run `150` on 2× B70 (EP 2: 256 local experts) with `B70_EMBED_UVA=1` and `B70_DENSE_FP8`. |
 | `B70_MOE_HOTCOLD_RANKINGS` | unset (experts by id) | 0040 | JSON `{"<layer>": [global expert ids, hottest first]}`; experts it does not list follow by id. The albucino checkpoint ships `runtime/static_hot_cache_rankings.json`. |
 | `B70_MOE_HOTCOLD_MEMLOG` | unset (off) | 0040 | `1`: log torch allocated / reserved and device free memory after every layer's split (otherwise every 12th layer). |
 | `B70_MOE_COLD_PREFETCH` | unset (off) | 0042 | `1`: batches with at least `B70_MOE_COLD_PREFETCH_MIN_TOKENS` tokens (prefill) run the cold experts from two VRAM slots instead of UVA reads; layer L+1's cold experts are DMA'd on a copy stream while layer L computes. Same kernel and bytes (outputs unchanged). Costs two layers' cold experts of VRAM (0.53 GiB per card at 136–144 hot). On 2× B70: prefill ~2,600 → ~3,950 tok/s. |
@@ -96,11 +96,11 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 |---|---|---|---|
 | `B70_EMBED_UVA` | unset (off) | 0044 | `1` (XPU): after loading, the target's `embed_tokens` moves into pinned host RAM behind a UVA view (0.59 GiB per card at TP 2); lookups read a few KB per token over PCIe. lm_head and the MTP draft are untouched. Spend the freed VRAM on `B70_MOE_HOT_EXPERTS`. |
 
-## FP8 dense layers (0045, opt-in)
+## FP8 dense layers (0045; on in tp2-hotcold since round 4)
 
 | variable | default | patch | effect |
 |---|---|---|---|
-| `B70_DENSE_FP8` | unset (off) | 0045 | a regex: 16-bit linear layers of an INC checkpoint whose names match are quantized at load time to FP8 E4M3 (one scale per output channel) and run by the XPU weight-only kernel `fp8_gemm_w8a16`; lm_head never. Tested pattern: `(linear_attn\.(in_proj_qkv\|in_proj_z\|in_proj_qkvz\|out_proj)\|self_attn\.(qkv_proj\|q_proj\|k_proj\|v_proj\|o_proj))$` (docs/two-cards.md, round 3). Trade-offs: +58K KV tokens on 2× B70, perplexity +0.4–0.7 %, decode ~5–7 % faster, agentic answers ~20 % longer at temperature 0. |
+| `B70_DENSE_FP8` | unset (off) | 0045 | a regex: 16-bit linear layers of an INC checkpoint whose names match are quantized at load time to FP8 E4M3 (one scale per output channel) and run by the XPU weight-only kernel `fp8_gemm_w8a16`; lm_head never. Tested pattern: `(linear_attn\.(in_proj_qkv\|in_proj_z\|in_proj_qkvz\|out_proj)\|self_attn\.(qkv_proj\|q_proj\|k_proj\|v_proj\|o_proj))$` (docs/two-cards.md, round 3). On 2× B70: MMLU 87.33 → 87.23 % (3,000 paired questions, p = 0.79), HumanEval 157 → 158 / 164, perplexity +0.4–0.7 %; −0.9 GiB per card (spent on hot experts). |
 
 ## Ungated parts (active even with every switch unset)
 

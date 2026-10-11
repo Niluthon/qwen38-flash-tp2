@@ -3,10 +3,10 @@ context and 5 follow-up turns (implement, test, fix, refactor, explain). Model o
 import json, os, random, sys, threading, time, urllib.request
 BASE = "http://localhost:8000"; rnd = random.Random(int(sys.argv[1]) if len(sys.argv) > 1 else 1)
 SESSIONS = int(sys.argv[2]) if len(sys.argv) > 2 else 6; PAR = int(sys.argv[3]) if len(sys.argv) > 3 else 2
-SRC = "/work/vllm-b70"
+SRC = os.environ.get("AGENT_CORPUS", "/work/agent-corpus")  # a frozen copy: edits to the live tree must not change the sessions
 files = [os.path.join(d, f) for d, _, fs in os.walk(SRC + "/vllm") for f in fs if f.endswith(".py")]
 files += [os.path.join(d, f) for d, _, fs in os.walk(SRC + "/csrc") for f in fs if f.endswith((".cpp", ".cu", ".h"))]
-files = [f for f in files if 3000 < os.path.getsize(f) < 20000]
+files = sorted(f for f in files if 3000 < os.path.getsize(f) < 20000)
 SYSTEM = ("You are an autonomous coding agent working in a git repository. You can call tools: read_file(path), "
           "write_file(path, content), run(cmd), search(pattern). Think about the change, then answer with the code "
           "edits and the commands to run. Keep answers focused and complete.\n" + "\n".join(
