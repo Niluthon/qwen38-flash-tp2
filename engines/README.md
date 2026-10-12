@@ -12,10 +12,10 @@ engines/
     env/             tp2-hotcold.env (defaults), tp2-local.env.example (template for your git-ignored tp2-local.env)
     args/            serve-tp2.args (vllm serve flags; your optional serve-tp2.local.args goes here too)
     scripts/         compose-serve.sh (compose entrypoint), run-tp2.sh / restart-tp2.sh (without compose)
-  four-cards/      4× B70, ~256 GB RAM: the release engines below
-    env/             common.env (shared) + one <engine>.env per engine
+  four-cards/      4× B70: the release engines below (~256 GB RAM), and tp4 for Docker Compose (settings not tested)
+    env/             common.env (shared) + one <engine>.env per engine; tp4.env, tp4-local.env.example (compose)
     models/          awq.env, intel-autoround.env (one checkpoint each, chosen with MODEL=)
-    args/            serve.args, serve-s16.args, serve-s16-mtp3.args
+    args/            serve.args, serve-s16.args, serve-s16-mtp3.args; serve-tp4.args (compose)
     scripts/         run-example.sh (docker; the b70.1 image)
 ```
 
