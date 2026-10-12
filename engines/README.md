@@ -5,7 +5,7 @@ Engine configurations: environment files, `vllm serve` flag files and launch scr
 ```
 engines/
   serve-configs/   the snapshots' config.json (serve-config-awq.json, serve-config-intel-autoround.json); both setups
-  one-card/        1× B70, 96 GB RAM: tp1-hotcold, not yet booted (one-card/README.md; select it in the root .env)
+  one-card/        1× B70, 96 GB RAM: tp1-hotcold, settings not tested (one-card/README.md; select it in the root .env)
     env/             tp1-hotcold.env, tp1-local.env.example
     args/            serve-tp1.args
   two-cards/       2× B70, ~64 GB RAM: the tp2-hotcold engine (compose.yaml's default)

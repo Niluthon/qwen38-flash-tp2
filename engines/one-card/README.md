@@ -1,8 +1,10 @@
-# One card: 1× Arc Pro B70 + 96 GB RAM (not yet booted)
+# One card: 1× Arc Pro B70 + 96 GB RAM
+
+> **These settings are not tested.** They have never run on a card; the numbers are estimates.
 
 The two-card engine (`engines/two-cards/`) cut down to one card: tensor parallel 1, no expert parallel, the same
-image, weights and patches. **Not tested on hardware yet**: the numbers below are estimates from the two-card engine's
-boot log. Tune with the boot log (below).
+image, weights and patches. The numbers below are estimated from the two-card engine's boot log; tune them with the
+boot log (below).
 
 | file | what |
 |---|---|
