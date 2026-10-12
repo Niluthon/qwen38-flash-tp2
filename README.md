@@ -272,9 +272,16 @@ Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 | 0028 | the PLE embedding accepts Intel's AutoRound (INC) quantization config | ungated, acts only then |
 | 0029, 0029b | prompt logprobs in 128-row chunks (no VRAM spill into host RAM) | on; `B70_PROMPT_LOGPROBS_CHUNK` |
 | 0031 | CPU→GPU KV loads straight from the pinned pool (for kernels without B70-K1) | `B70_OFFLOAD_H2D_DIRECT=1` |
-| 0040 | routed experts split between VRAM (hot) and pinned host RAM (cold), read through UVA; for 2-card hosts | `B70_MOE_HOTCOLD=1` |
+| 0040 | routed experts split between VRAM (hot) and pinned host RAM (cold), read through UVA; for 2-card hosts | `B70_MOE_HOTCOLD=1`, `B70_MOE_HOT_EXPERTS` (hot experts per layer and rank; two cards: `150`), `B70_MOE_HOTCOLD_RANKINGS` (which experts start hot) |
+| 0041 | route counter: the share of prefill / decode routes served by cold experts, per period; optional dump for re-ranking | `B70_MOE_ROUTE_COUNT=prefill` (or `1`, also in decode graphs), `B70_MOE_ROUTE_COUNT_S`, `B70_MOE_ROUTE_COUNT_PATH` |
+| 0042 | prefill runs the cold experts from two VRAM slots, the next layer's copied while this one computes (prefill ~2,600 → ~3,950 tok/s on two cards) | `B70_MOE_COLD_PREFETCH=1`, `B70_MOE_COLD_PREFETCH_MIN_TOKENS` (default `512`) |
+| 0043 | the hot set follows the traffic: experts swap between VRAM and host RAM by prefill route counts | `B70_MOE_HOTCOLD_SWAP=1`, `B70_MOE_HOTCOLD_SWAP_S` (`5`), `_DECAY` (`0.95`), `_BUDGET` (`8`), `_PRIOR` (`0.01`) |
+| 0044 | the input embedding table in pinned host RAM (0.59 GiB VRAM per card freed for hot experts); new swap defaults | `B70_EMBED_UVA=1` |
+| 0045 | 16-bit dense projections of INC checkpoints as FP8 W8A16 (−0.9 GiB per card; quality-checked on MMLU, HumanEval) | `B70_DENSE_FP8=<regex>` (two cards: the GDN and attention projections) |
+| 0046 | debug: per-step decode route trace for expert-cache studies | `B70_MOE_ROUTE_TRACE=<path>` (with `B70_MOE_ROUTE_COUNT=1`) |
 
-Every switch: [docs/switches.md](docs/switches.md).
+Two cards run 0040, 0042, 0043, 0044 and 0045 on (`engines/tp2-hotcold.env`). Every switch with its default and
+measurements: [docs/switches.md](docs/switches.md).
 
 ## Where to find what
 
