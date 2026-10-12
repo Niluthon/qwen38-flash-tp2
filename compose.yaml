@@ -1,8 +1,10 @@
-# The tp2-hotcold engine (2x Arc Pro B70, ~64 GB RAM) with Docker Compose.
+# The tp2-hotcold engine (2x Arc Pro B70, ~64 GB RAM) with Docker Compose. Step-by-step guide: HOW-TO-RUN.md.
 #
-#   docker compose up -d            # start (detached); the warm-up service runs once the engine is healthy
-#   docker compose logs -f engine   # follow the log (also written to $WORK/engine.log)
-#   docker compose down             # stop
+#   docker compose build                # build the image (downloads the base image, kernels and shim; ~20 GB)
+#   docker compose run --rm prepare     # once: download and prepare the weights (~185 GB on $MODELS)
+#   docker compose up -d                # start; the warm-up service sends one short request once the engine is healthy
+#   docker compose logs -f engine       # follow the log (also written to $WORK/engine.log)
+#   docker compose down                 # stop
 #
 # Tuning, without editing tracked files:
 #   * environment (B70_* switches, hot experts, PLE cache, ...): copy engines/tp2-local.env.example to
@@ -12,13 +14,16 @@
 #     flag wins), e.g. EXTRA_ARGS=--max-model-len 65536 --gpu-memory-utilization 0.92
 #   * host paths and image: MODELS, WORK, IMAGE in a .env file next to this one (see .env.example).
 #
-# Image: image/Dockerfile.tp2 (official vLLM v0.30.0 XPU + our kernels); the patched vLLM source tree is read from
-# $WORK/vllm-b70 (PYTHONPATH in tp2-hotcold.env). docs/two-cards.md has the details and the measurements.
+# Image: image/Dockerfile.tp2 (official vLLM v0.30.0 XPU + the patch series + our kernels + the residency shim).
+# docs/two-cards.md has the details and the measurements.
 
 name: b70-flash-next
 
 x-engine-base: &engine-base
   image: ${IMAGE:-b70-flash-next:tp2}
+  build:
+    context: .
+    dockerfile: image/Dockerfile.tp2
   network_mode: host
   working_dir: /opt/venv
   volumes:
@@ -68,4 +73,22 @@ services:
     depends_on:
       engine:
         condition: service_healthy
+    restart: "no"
+
+  # One-time setup, not started by `up`: `docker compose run --rm prepare` downloads the checkpoint and builds the
+  # INT8 PLE table and the serve snapshots on $MODELS (scripts/prepare-models-tp2.sh; skips what is already there).
+  prepare:
+    <<: *engine-base
+    profiles: [setup]
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      REVISION: ${REVISION:-}
+      SKIP_DOWNLOAD: ${SKIP_DOWNLOAD:-0}
+    volumes:
+      - ./engines:/b70-engines:ro
+      - ./tools:/b70-tools:ro
+      - ./scripts:/b70-scripts:ro
+      - ${WORK:-${HOME}/b70-work}:/work
+      - ${MODELS:-${HOME}/models}:/models
+    entrypoint: ["/bin/bash", "/b70-scripts/prepare-models-tp2.sh"]
     restart: "no"

@@ -8,7 +8,8 @@ RAM next to everything else either. `tp2-hotcold` splits them.
 
 `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` @ `ef554143`: Intel's AutoRound target tensors (the quantization block
 equals `engines/serve-config-intel-autoround.json`) plus RadixArk's FP8 PLE table (`model-plefp8-*`, 128 shards, one
-global scale) plus an INT4-g32 MTP draft (`runtime/mtp-int4-g32`, compressed-tensors). Three one-time steps:
+global scale) plus an INT4-g32 MTP draft (`runtime/mtp-int4-g32`, compressed-tensors). This host runs revision
+`c6af9fee`. Three one-time steps (`docker compose run --rm prepare` downloads the checkpoint and runs all three):
 
 ```bash
 # INT8 PLE table for 0008/0013, built from the FP8 shards (~3.5 min, 52.5 GB on NVMe)
@@ -52,14 +53,15 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 ## The engine (`engines/tp2-hotcold.env`, `engines/serve-tp2.args`, `engines/run-tp2.sh`)
 
-Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + kernels 0.1.14.1+b70.3); the source tree
-and wu1ff's residency shim come from the work volume. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
+Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + kernels 0.1.14.1+b70.3 + the patch series
++ wu1ff's residency shim; everything fetched and hash-checked at build time). Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
 150 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
 `--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
 
 ```bash
-docker build -f image/Dockerfile.tp2 -t b70-flash-next:tp2 <dir holding the kernel wheel>
+docker compose build                  # the image (image/Dockerfile.tp2)
+docker compose run --rm prepare       # once: the weights steps above (scripts/prepare-models-tp2.sh)
 docker compose up -d                  # compose.yaml: engine + one-shot warm-up; or: MODELS=~/models WORK=~/b70-work engines/run-tp2.sh
 cp engines/tp2-local.env.example engines/tp2-local.env   # optional: local overrides (B70_* switches, EXTRA_ARGS)
 ```

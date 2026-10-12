@@ -1,20 +1,71 @@
-# b70-flash-next:tp2 — runtime image for engines/run-tp2.sh (2x B70, TP 2 + EP 2, hot/cold experts).
+# b70-flash-next:tp2 — the image of the two-card engine (2x B70, TP 2 + EP 2, hot/cold experts; compose.yaml).
+#
+# Self-contained: everything is fetched and checked at build time, nothing has to be prepared on the host.
+#
+#   docker compose build            # or, from the REPOSITORY ROOT:
+#   docker build -f image/Dockerfile.tp2 -t b70-flash-next:tp2 .
 #
 # = the official vLLM v0.30.0 XPU image (pinned by digest)
-# + vllm-xpu-kernels 0.1.14.1+b70.3 (the wheel attached to the 0.30.0-b70.2 release; sha256 asserted)
+# + vllm-xpu-kernels 0.1.14.1+b70.3, downloaded from the 0.30.0-b70.2 release (sha256 asserted)
+# + the whole patch series patches/vllm/ (wu1ff's 0001–0005, then the b70 series incl. the two-card patches
+#   0040–0046) applied to the installed vLLM and to /workspace/vllm; every touched file sha256-asserted against
+#   image/verify-overlay.sh ("final" set), every touched .py compiled
+# + wu1ff's Level Zero peer-residency shim (no public source), copied from wu1ff's public image BY DIGEST and
+#   sha256-asserted; engines/tp2-hotcold.env LD_PRELOADs it
 #
-# The vLLM code is NOT baked in: run-tp2.sh puts the source tree (fork tag v0.30.0-b70.2 + branch b70/tp2-hotcold)
-# first on PYTHONPATH from the work volume, and LD_PRELOADs wu1ff's residency shim from there.
-#
-#   docker build -f image/Dockerfile.tp2 -t b70-flash-next:tp2 <dir holding the kernel wheel>
+# wu1ff's libgdn_index64.so is NOT installed: with kernels b70.3 the stock GDN op is 64-bit (patches 0027, 0032).
+# To run a vLLM source tree instead of the baked-in code (development), set PYTHONPATH=/work/<tree> in
+# engines/tp2-local.env.
 
 ARG BASE_IMAGE=docker.io/vllm/vllm-openai-xpu:v0.30.0@sha256:fc0e112afb64e3a06fe8daff34652435822a629412f38efce8f0f67a46636b8d
+ARG WU1FF_IMAGE=ghcr.io/wu1ff/qwen38-flashnext-b70:1.0.0@sha256:85512b52c09fa660a2e7fe441417129e7c47fac727fd85f66ccea6b65e0a9122
+
+FROM ${WU1FF_IMAGE} AS wu1ff
+
 FROM ${BASE_IMAGE}
 
+# vllm-xpu-kernels 0.1.14.1+b70.3 (source: Lumnus/vllm-xpu-kernels tag v0.1.14.1+b70.3; docs/kernels.md)
 ARG WHEEL=vllm_xpu_kernels-0.1.14.1+b70.3-cp38-abi3-manylinux_2_28_x86_64.whl
+ARG WHEEL_URL=https://github.com/Lumnus/b70-flash-next/releases/download/v0.30.0-b70.2/vllm_xpu_kernels-0.1.14.1%2Bb70.3-cp38-abi3-manylinux_2_28_x86_64.whl
 ARG WHEEL_SHA256=f104a3e5f61480681284ec3632e1a6692358b72a1fbdbda7406db0d7b7d1d589
-RUN --mount=type=bind,source=.,target=/tmp/ctx \
-    set -eu; \
-    echo "${WHEEL_SHA256}  /tmp/ctx/${WHEEL}" | sha256sum -c -; \
-    /opt/venv/bin/pip install --no-deps --force-reinstall "/tmp/ctx/${WHEEL}"; \
+RUN set -eu; \
+    d=$(mktemp -d); \
+    /opt/venv/bin/python -I -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+      "${WHEEL_URL}" "$d/${WHEEL}"; \
+    echo "${WHEEL_SHA256}  $d/${WHEEL}" | sha256sum -c -; \
+    /opt/venv/bin/pip install --no-cache-dir --no-deps --force-reinstall "$d/${WHEEL}"; \
+    rm -rf "$d"; \
     /opt/venv/bin/python -c "import importlib.metadata as m; v = m.version('vllm-xpu-kernels'); assert v == '0.1.14.1+b70.3', v"
+
+# The series, in filename order (LC_ALL=C): wu1ff's 0001–0005 first, then the b70 patches. --dry-run first so a
+# failing patch never half-applies; --fuzz=0 so a moved base fails loudly. Patches are bind-mounted, not copied.
+RUN --mount=type=bind,source=patches/vllm,target=/tmp/b70-patches \
+    --mount=type=bind,source=image,target=/tmp/b70-image \
+    set -eu; export LC_ALL=C; \
+    command -v patch >/dev/null; \
+    for root in /opt/venv/lib/python3.12/site-packages /workspace/vllm; do \
+      for p in $(ls /tmp/b70-patches/*.patch | grep -v -- '-b70-') $(ls /tmp/b70-patches/*-b70-*.patch); do \
+        patch -d "$root" -p1 --fuzz=0 --forward --no-backup-if-mismatch --dry-run -s < "$p" >/dev/null; \
+        patch -d "$root" -p1 --fuzz=0 --forward --no-backup-if-mismatch -s < "$p"; \
+      done; \
+      echo "applied $(ls /tmp/b70-patches/*.patch | wc -l) patches -> $root"; \
+    done; \
+    if find /opt/venv/lib/python3.12/site-packages/vllm /workspace/vllm/vllm \( -name '*.orig' -o -name '*.rej' \) | grep -q .; then \
+      echo "patch left .orig/.rej files" >&2; exit 1; \
+    fi; \
+    /opt/venv/bin/python -I /tmp/b70-image/verify-tree.py /opt/venv/lib/python3.12/site-packages /workspace/vllm; \
+    cd /opt/venv/lib/python3.12/site-packages; \
+    PYTHONDONTWRITEBYTECODE=1 /opt/venv/bin/python -c 'import sys; [compile(open(f, "rb").read(), f, "exec") for f in sys.argv[1:]]; print("compiled", len(sys.argv) - 1, "files")' \
+      $(for p in /tmp/b70-patches/*.patch; do sed -n 's#^+++ b/\(vllm/[^[:space:]]*\.py\).*#\1#p' "$p"; done | sort -u)
+
+# P7 — Level Zero peer-residency shim (without it Level Zero mirrors device memory into host RAM). wu1ff layer
+# sha256:512b136c0deacc7459daf8226f7ce8143a14a782070f4fa6312c0e7185e60401.
+COPY --from=wu1ff --chmod=0644 /opt/b70-residency-shim/libl0_peer_residency_shim.so /opt/b70-residency-shim/libl0_peer_residency_shim.so
+RUN echo "ae2c82f549d97393268cbd7b90dba7cf38fd00dbccae54f090b1a545e5613b3c  /opt/b70-residency-shim/libl0_peer_residency_shim.so" | sha256sum -c -
+
+LABEL org.opencontainers.image.title="b70-flash-next:tp2" \
+      org.opencontainers.image.description="vLLM v0.30.0 XPU + the b70 series + kernels 0.1.14.1+b70.3 for 2x Arc Pro B70 (hot/cold experts)" \
+      org.opencontainers.image.source="https://github.com/Lumnus/b70-flash-next" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT"
+
+WORKDIR /opt/venv

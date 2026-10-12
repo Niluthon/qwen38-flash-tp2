@@ -1,8 +1,57 @@
 # b70-flash-next
 
-vLLM for **Qwen3.8-Flash-Next on 4× Intel Arc Pro B70**: vLLM v0.30.0 for XPU, wu1ff's B70 patch set rebuilt from
-source patches, a series of patches for host memory, long-context reuse, MTP speculative decoding and agent clients,
-and a vllm-xpu-kernels build with the fixes this model needs.
+Run **Qwen3.8-Flash-Next** (W4A16) with vLLM on **Intel Arc Pro B70** cards. This repository holds the vLLM patch
+series, the kernel build, the engine settings and the measurements; the patched vLLM itself is built from them.
+
+## Start here: which setup?
+
+| your machine | what to use | effort |
+|---|---|---|
+| **2× B70** (32 GB each), ~64 GB RAM, NVMe | [**Two cards: Docker Compose**](#two-cards-docker-compose) — one image, one prepare step, `docker compose up -d`; guide: [HOW-TO-RUN.md](HOW-TO-RUN.md) | builds everything itself, also on a fresh PC |
+| **4× B70**, 256 GB RAM | [Four cards: the release recipe](#four-cards-the-release-recipe) — source tree + kernel wheel, AWQ weights | manual; how the release is served |
+
+Both serve an OpenAI-compatible API (`/v1/chat/completions`, tool calls, reasoning) on port 8000.
+
+## Two cards: Docker Compose
+
+Serves `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` (Intel AutoRound target + FP8 PLE table) at tensor parallel 2 +
+expert parallel 2 with MTP speculative decoding and a 131,072-token context. Experts that do not fit in VRAM live in
+host RAM, the PLE table is read from NVMe. Measured on our host: ~55–57 tok/s at one stream on general prompts,
+~90–99 tok/s on agentic coding sessions, ~3,950 tok/s prefill, 201,794 KV tokens; MMLU 87.2 %, HumanEval 158 / 164
+([details](#what-the-two-card-engine-runs)).
+
+**→ Full guide: [HOW-TO-RUN.md](HOW-TO-RUN.md)** — machine check, first start, using the API, daily commands,
+settings, reusing weights you already downloaded, bringing your own model, troubleshooting.
+
+In short, on a machine with 2× B70, ~64 GB RAM, ~185 GB free on NVMe and Docker Compose v2.24+:
+
+```bash
+git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
+cp .env.example .env               # optional: MODELS=/path/on/nvme (default ~/models)
+docker compose build               # the image: vLLM v0.30.0 XPU + patches + kernels + shim, all sha256-checked
+docker compose run --rm prepare    # once: download (~129 GB) and prepare the weights
+docker compose up -d               # serving on port 8000 after ~5 min; model name qwen38-flash-next
+```
+
+Already have the weights, or want another quant? [HOW-TO-RUN.md §6](HOW-TO-RUN.md#6-weights-you-already-have) and
+[§7](HOW-TO-RUN.md#7-your-own-model).
+
+### What the two-card engine runs
+
+The settings (all in `engines/tp2-hotcold.env` and `engines/serve-tp2.args`): 150 hot experts per layer and rank in
+VRAM that follow the traffic (patches 0040, 0043), the rest pinned in host RAM, cold experts prefetched into VRAM for
+prefill (0042), the input embedding in host RAM (0044), FP8 W8A16 dense projections (0045), the INT8 PLE table from
+NVMe (0013), MTP k=3 with the checkpoint's INT4 draft, 4 sequences, a warm-up request at start (known issues item 13).
+Quality-checked against BF16 dense (MMLU, HumanEval); not yet endurance-tested. Without Compose:
+`engines/run-tp2.sh` / `engines/restart-tp2.sh`. Setup, experiments and numbers:
+[docs/two-cards.md](docs/two-cards.md).
+
+## Four cards: the release recipe
+
+vLLM v0.30.0 for XPU, wu1ff's B70 patch set rebuilt from source patches, a series of patches for host memory,
+long-context reuse, MTP speculative decoding and agent clients, and a vllm-xpu-kernels build with the fixes this model
+needs. This is how the release is served. The sections after this one (validation, endurance, models, the host-RAM
+KV tier) describe this setup.
 
 | | |
 |---|---|
@@ -18,6 +67,39 @@ and a vllm-xpu-kernels build with the fixes this model needs.
 AWQ serving fully validated; Intel verification in progress. One code branch, the model is a serving parameter. It runs
 from source trees; the vllm-xpu-kernels wheel is attached to the release, and no container image is built for b70.2
 ([CHANGELOG](CHANGELOG.md)).
+
+### Quick start (source tree, how we run it)
+
+```bash
+git clone https://github.com/Lumnus/b70-flash-next && cd b70-flash-next
+scripts/check-series.sh                          # patches/ == the fork branch (clones it into ./vllm-src)
+scripts/make-tree.sh 0.30.0-b70.2 /srv/vllm-b70  # the source tree, hash-checked
+```
+
+1. **Environment.** The vLLM v0.30.0 XPU environment (torch 2.13.0+xpu; the `vllm/vllm-openai-xpu:v0.30.0` image's
+   `/opt/venv` is one), with vllm-xpu-kernels **0.1.14.1+b70.3** built from
+   [`Lumnus/vllm-xpu-kernels` tag `v0.1.14.1+b70.3`](https://github.com/Lumnus/vllm-xpu-kernels/tree/v0.1.14.1%2Bb70.3)
+   ([docs/kernels.md](docs/kernels.md)); the wheel is attached to the
+   [release](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2) (sha256 `f104a3e5…d589`). Put the
+   tree first on `PYTHONPATH`. We run compute-runtime 26.35.39758.10.
+2. **Weights (recommended: AWQ).** `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125`, plus devan's
+   `ple_table_qwen4exp.pt`; then
+   `tools/awq_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>`. Build the INT8 PLE table once
+   with `tools/build_int8_ple.py build` ([docs/ple-int8.md](docs/ple-int8.md)).
+   *Alternative (Intel):* Intel @ `4c67bf68` (all files except `model-00016-of-00017.safetensors`), then
+   `tools/intel_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>`.
+3. **Serve.** The model is a parameter: `common.env` + `engines/s16-kv128-mtp3.env` + one model file,
+   `engines/models/awq.env` (recommended) or `engines/models/intel-autoround.env`; `vllm serve <snapshot>` with the flags
+   in `engines/serve-s16-mtp3.args`, `--kv-offloading-size 128`, and the model file's serve config
+   (`engines/serve-config-awq.json` or `engines/serve-config-intel-autoround.json`) as the snapshot's `config.json`
+   ([engines/README.md](engines/README.md)). Same code and flags for both.
+4. **Serving prompt.** The chat template and the default serving prompt are yours to choose. We keep the checkpoint's
+   template and put the serving context (what the model runs on, nothing personal) in a short default system prompt;
+   we may move to an empty engine default and let a gateway add the preamble. None of that is in this repository.
+
+The image path (`image/Dockerfile`, `engines/run-example.sh`) is the b70.1 recipe: it pulls only public images by
+digest and fails unless every patched file carries its recorded sha256 (`image/verify-overlay.sh`). For b70.2 it
+still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; see the CHANGELOG.
 
 ## Validation status
 
@@ -167,57 +249,6 @@ Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 | **stable `0.30.0-b70.N`** | stock vLLM v0.30.0 + this series (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`; b70.1 was [`b70/v0.30.0`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0)), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 | **recommended**; what we serve |
 | edge `main-YYYYMMDD-b70.N` | vLLM main + the series (fork branch [`b70/main`](https://github.com/Lumnus/vllm/tree/b70/main)), torch 2.14, our 0.1.15.4 kernel build | **not recommended**: a progressive decode corruption under concurrency ([known issues](docs/known-issues.md) item 5) |
 
-## Quick start (source tree, how we run it)
-
-```bash
-git clone https://github.com/Lumnus/b70-flash-next && cd b70-flash-next
-scripts/check-series.sh                          # patches/ == the fork branch (clones it into ./vllm-src)
-scripts/make-tree.sh 0.30.0-b70.2 /srv/vllm-b70  # the source tree, hash-checked
-```
-
-1. **Environment.** The vLLM v0.30.0 XPU environment (torch 2.13.0+xpu; the `vllm/vllm-openai-xpu:v0.30.0` image's
-   `/opt/venv` is one), with vllm-xpu-kernels **0.1.14.1+b70.3** built from
-   [`Lumnus/vllm-xpu-kernels` tag `v0.1.14.1+b70.3`](https://github.com/Lumnus/vllm-xpu-kernels/tree/v0.1.14.1%2Bb70.3)
-   ([docs/kernels.md](docs/kernels.md)); the wheel is attached to the
-   [release](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2) (sha256 `f104a3e5…d589`). Put the
-   tree first on `PYTHONPATH`. We run compute-runtime 26.35.39758.10.
-2. **Weights (recommended: AWQ).** `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125`, plus devan's
-   `ple_table_qwen4exp.pt`; then
-   `tools/awq_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>`. Build the INT8 PLE table once
-   with `tools/build_int8_ple.py build` ([docs/ple-int8.md](docs/ple-int8.md)).
-   *Alternative (Intel):* Intel @ `4c67bf68` (all files except `model-00016-of-00017.safetensors`), then
-   `tools/intel_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>`.
-3. **Serve.** The model is a parameter: `common.env` + `engines/s16-kv128-mtp3.env` + one model file,
-   `engines/models/awq.env` (recommended) or `engines/models/intel-autoround.env`; `vllm serve <snapshot>` with the flags
-   in `engines/serve-s16-mtp3.args`, `--kv-offloading-size 128`, and the model file's serve config
-   (`engines/serve-config-awq.json` or `engines/serve-config-intel-autoround.json`) as the snapshot's `config.json`
-   ([engines/README.md](engines/README.md)). Same code and flags for both.
-4. **Serving prompt.** The chat template and the default serving prompt are yours to choose. We keep the checkpoint's
-   template and put the serving context (what the model runs on, nothing personal) in a short default system prompt;
-   we may move to an empty engine default and let a gateway add the preamble. None of that is in this repository.
-
-The image path (`image/Dockerfile`, `engines/run-example.sh`) is the b70.1 recipe: it pulls only public images by
-digest and fails unless every patched file carries its recorded sha256 (`image/verify-overlay.sh`). For b70.2 it
-still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; see the CHANGELOG.
-
-## Where to find what
-
-| path / repo | what |
-|---|---|
-| `patches/vllm/`, `patches/vllm-tests/` | the series 0001–0032, exported from the fork branch (one commit per patch on v0.30.0); CPU tests (never applied to the image) |
-| `patches/vllm-xpu-kernels/` | `b70.3/`: our kernel series on vllm-xpu-kernels 0.1.14.1 (the 64-bit GDN conv-state offset, five upstream fixes, B70-K1); `0001-…` at the top: the b70.1 form of the 64-bit fix ([docs/kernels.md](docs/kernels.md)) |
-| `patches/series.txt` | which fork commit goes to which file |
-| `scripts/` | `export-series.sh`, `check-series.sh` (patches/ == fork branch), `make-tree.sh` (a verified source tree) |
-| `image/` | `Dockerfile`, `verify-overlay.sh`, wu1ff's pack files, `derive-serve-config.py` |
-| `engines/` | environments and `vllm serve` flags, incl. the configuration we serve (`s16-kv128-mtp3` + `models/awq.env`; [engines/README.md](engines/README.md)) |
-| `docs/` | [switches](docs/switches.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [known issues](docs/known-issues.md) · [offload fix](docs/offload-fix.md) · [PLE INT8](docs/ple-int8.md) · [PLE on NVMe](docs/ple-nvme.md) · [measurements](docs/measurements/README.md) |
-| `tools/` | `build_int8_ple.py` (INT8 PLE table), `intel_snapshot.py` and `awq_snapshot.py` (snapshots + serve configs), `repro_band.py` (reproduce the offload miss) |
-| [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.30.0-stable` (the release branch from b70.2 on), `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style). `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` are the two working lines that b70.2 consolidates; they are not updated any more |
-| [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels) | `b70/v0.1.14` (tag `v0.1.14.1+b70.3`, what we serve), `b70/v0.1.15` (edge) |
-| [Lumnus/b70-fan-control](https://github.com/Lumnus/b70-fan-control) | sibling repo: a user-space fan table for the B70 |
-
-`PROVENANCE.md` records where every piece comes from, with hashes. `CHANGELOG.md` lists releases.
-
 ## What is in the series
 
 | patch | what | switch |
@@ -245,16 +276,25 @@ still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; 
 
 Every switch: [docs/switches.md](docs/switches.md).
 
-## Two cards (2× B70, ~64 GB RAM)
+## Where to find what
 
-`docker compose up -d` (compose.yaml; or `engines/run-tp2.sh`) serves the albucino FP8-PLE checkpoint (Intel AutoRound
-target) at TP 2 + EP 2 with MTP k=3 and a 131,072-token context: 150 hot experts per layer and rank in VRAM that follow
-the traffic (0040, 0043), the rest pinned in host RAM, cold experts prefetched into VRAM for prefill (0042), the input
-embedding in host RAM (0044), FP8 W8A16 dense projections (0045), INT8 PLE from NVMe, a warm-up request at start (known issues item 13). Measured: ~55 tok/s
-decode at one stream on general prompts (~57 with 0045), ~90–99 tok/s generation on agentic coding sessions, ~3,950 tok/s
-prefill, 201,794 KV tokens; MMLU 87.2 %, HumanEval 158 / 164. Tuning without editing tracked files: `engines/tp2-local.env` (from
-`engines/tp2-local.env.example`). Quality-checked against BF16 dense (MMLU, HumanEval); not yet endurance-tested. Setup, experiments and numbers:
-[docs/two-cards.md](docs/two-cards.md).
+| path / repo | what |
+|---|---|
+| `patches/vllm/`, `patches/vllm-tests/` | the series 0001–0032, exported from the fork branch (one commit per patch on v0.30.0); CPU tests (never applied to the image) |
+| `patches/vllm-xpu-kernels/` | `b70.3/`: our kernel series on vllm-xpu-kernels 0.1.14.1 (the 64-bit GDN conv-state offset, five upstream fixes, B70-K1); `0001-…` at the top: the b70.1 form of the 64-bit fix ([docs/kernels.md](docs/kernels.md)) |
+| `patches/series.txt` | which fork commit goes to which file |
+| `scripts/` | `export-series.sh`, `check-series.sh` (patches/ == fork branch), `make-tree.sh` (a verified source tree), `prepare-models-tp2.sh` (two-card weights) |
+| `HOW-TO-RUN.md` | step-by-step guide for the two-card engine |
+| `compose.yaml`, `.env.example` | the two-card engine with Docker Compose (engine, warm-up, `prepare`) |
+| `image/` | `Dockerfile.tp2` (two-card image), `Dockerfile` (four-card b70.1 image), `verify-overlay.sh` and `verify-tree.py` (hash checks), wu1ff's pack files, `derive-serve-config.py` |
+| `engines/` | environments and `vllm serve` flags: four cards `s16-kv128-mtp3` + `models/awq.env` ([engines/README.md](engines/README.md)); two cards `tp2-hotcold.env` + `serve-tp2.args` |
+| `docs/` | [switches](docs/switches.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [known issues](docs/known-issues.md) · [offload fix](docs/offload-fix.md) · [PLE INT8](docs/ple-int8.md) · [PLE on NVMe](docs/ple-nvme.md) · [measurements](docs/measurements/README.md) |
+| `tools/` | `build_int8_ple.py` (INT8 PLE table), `intel_snapshot.py` and `awq_snapshot.py` (snapshots + serve configs), `repro_band.py` (reproduce the offload miss) |
+| [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.30.0-stable` (the release branch from b70.2 on), `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style). `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` are the two working lines that b70.2 consolidates; they are not updated any more |
+| [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels) | `b70/v0.1.14` (tag `v0.1.14.1+b70.3`, what we serve), `b70/v0.1.15` (edge) |
+| [Lumnus/b70-fan-control](https://github.com/Lumnus/b70-fan-control) | sibling repo: a user-space fan table for the B70 |
+
+`PROVENANCE.md` records where every piece comes from, with hashes. `CHANGELOG.md` lists releases.
 
 ## Work in progress (not in the series)
 

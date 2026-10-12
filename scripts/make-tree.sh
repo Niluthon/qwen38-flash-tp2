@@ -59,20 +59,4 @@ else
 fi
 
 # hash check against image/verify-overlay.sh: every wu1ff-layer and b70-series file must carry its "final" sha256
-python3 - "$dir" "$here/image/verify-overlay.sh" <<'PY'
-import hashlib, re, sys, pathlib
-root, vo = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).read_text()
-def block(name):
-    body = re.search(name + r"='\n(.*?)'", vo, re.S).group(1)
-    return [l.split() for l in body.splitlines() if l.strip()]
-want = {rel: sha for sha, rel in block("PY_FILES")}                 # wu1ff layer
-want.update({rel: sha for sha, _tag, rel in block("B70_FILES")})     # the series result overrides
-bad = 0
-for rel, sha in sorted(want.items()):
-    got = hashlib.sha256((root / rel).read_bytes()).hexdigest()
-    if got != sha:
-        bad += 1
-        print(f"DIFFERENT {rel}: want {sha} got {got}", file=sys.stderr)
-print(f"hash check: {len(want) - bad} of {len(want)} files carry the verify-overlay.sh 'final' sha256")
-sys.exit(1 if bad else 0)
-PY
+python3 "$here/image/verify-tree.py" "$dir"

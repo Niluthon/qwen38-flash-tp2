@@ -3,9 +3,8 @@
 #
 #   MODELS=~/models WORK=~/b70-work engines/run-tp2.sh
 #
-# Image: the official vLLM v0.30.0 XPU image (by digest) with vllm-xpu-kernels 0.1.14.1+b70.3 installed
-# (image/Dockerfile.tp2). The code runs from the source tree on WORK (PYTHONPATH=/work/vllm-b70, branch
-# b70/tp2-hotcold); the residency shim is read from WORK/opt. Environment: engines/tp2-hotcold.env; flags:
+# Same engine as `docker compose up -d` (compose.yaml), without compose. Image: image/Dockerfile.tp2 (`docker compose
+# build`; it carries the patched vLLM, the kernels and the residency shim). Environment: engines/tp2-hotcold.env; flags:
 # engines/serve-tp2.args (one flag and its value per line). Extra arguments are appended to `vllm serve`;
 # DOCKER_ARGS adds `docker run` options (e.g. DOCKER_ARGS='-e VLLM_LOGGING_LEVEL=DEBUG').
 #
