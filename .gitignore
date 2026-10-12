@@ -2,7 +2,7 @@ vllm-src/
 *.pyc
 __pycache__/
 .env
-engines/tp2-local.env
-engines/*.local.args
+engines/two-cards/env/tp2-local.env
+engines/two-cards/args/*.local.args
 engine-data/*
 !engine-data/README.md

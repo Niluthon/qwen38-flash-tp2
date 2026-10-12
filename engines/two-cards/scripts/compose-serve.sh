@@ -7,7 +7,7 @@
 #   warmup  one short chat request (known issues item 13), then exit
 set -euo pipefail
 MODEL_DIR=${MODEL_DIR:-/models/qwen38-w4a16-snapshot}
-SERVE_ARGS_FILE=${SERVE_ARGS_FILE:-/b70-engines/serve-tp2.args}
+SERVE_ARGS_FILE=${SERVE_ARGS_FILE:-/b70-engines/two-cards/args/serve-tp2.args}
 ENGINE_LOG=${ENGINE_LOG:-/work/engine.log}
 PY=/opt/venv/bin/python
 

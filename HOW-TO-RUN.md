@@ -37,7 +37,7 @@ git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 cp .env.example .env
 nano .env                                  # e.g. MODELS=/mnt/nvme/models
 
-# c. build the image: vLLM v0.30.0 XPU + patches + kernels + shim, every piece sha256-checked (~20 GB image)
+# c. build the image: vLLM of release 0.30.0-b70.2 + two-card patches + kernels + shim, all checked (~20 GB image)
 docker compose build
 
 # d. download and prepare the weights, once: ~129 GB download, then ~4 min to build the 52 GB INT8 PLE table
@@ -91,10 +91,10 @@ Keep tracked files unchanged; put your changes in git-ignored files, then run `d
 | file | for | start from |
 |---|---|---|
 | `.env` | host paths (`MODELS`, `ENGINE_DATA`), image name, `HF_TOKEN` | `.env.example` |
-| `engines/tp2-local.env` | engine switches (hot experts, PLE cache, chat defaults, ...) and `EXTRA_ARGS`, extra `vllm serve` flags | `engines/tp2-local.env.example` (each setting explained) |
-| `engines/serve-tp2.local.args` | the full flag list, when you need to **remove** a flag (`EXTRA_ARGS` can only add or override) | `cp engines/serve-tp2.args engines/serve-tp2.local.args`, then `SERVE_ARGS_FILE=/b70-engines/serve-tp2.local.args` in `engines/tp2-local.env` |
+| `engines/two-cards/env/tp2-local.env` | engine switches (hot experts, PLE cache, chat defaults, ...) and `EXTRA_ARGS`, extra `vllm serve` flags | `engines/two-cards/env/tp2-local.env.example` (each setting explained) |
+| `engines/two-cards/args/serve-tp2.local.args` | the full flag list, when you need to **remove** a flag (`EXTRA_ARGS` can only add or override) | `cp engines/two-cards/args/serve-tp2.args engines/two-cards/args/serve-tp2.local.args`, then `SERVE_ARGS_FILE=/b70-engines/two-cards/args/serve-tp2.local.args` in `engines/two-cards/env/tp2-local.env` |
 
-Examples for `engines/tp2-local.env`:
+Examples for `engines/two-cards/env/tp2-local.env`:
 
 ```bash
 EXTRA_ARGS=--max-model-len 65536                       # shorter context
@@ -144,7 +144,7 @@ instead of rebuilding it. Copy the `.ok` file next to it too, and even that chec
 **Old snapshots** made from a checkpoint at another path: delete them, `prepare` makes new ones.
 
 **Your folders have other names and you do not want to rename them.** Skip `prepare` and point the engine at your
-paths in `engines/tp2-local.env` (container paths, `/models` = your `MODELS`). You then make the snapshots yourself with
+paths in `engines/two-cards/env/tp2-local.env` (container paths, `/models` = your `MODELS`). You then make the snapshots yourself with
 `tools/fp8ple_snapshot.py` ([docs/two-cards.md](docs/two-cards.md#weights)).
 
 ```bash
@@ -200,10 +200,10 @@ docker compose run --rm --entrypoint bash prepare -c '
 docker compose run --rm --entrypoint bash prepare -c '
   BF16_PT=/models/intel-w4a16/ple_table_qwen4exp.pt OUT_DIR=/models/intel-int8ple /opt/venv/bin/python /b70-tools/build_int8_ple.py build
   /opt/venv/bin/python /b70-tools/intel_snapshot.py snapshot /models/intel-w4a16 /models/intel-w4a16/ple_table_qwen4exp.pt /models/intel-snapshot
-  cp /b70-engines/serve-config-intel-autoround.json /models/intel-snapshot/config.json'
+  cp /b70-engines/serve-configs/serve-config-intel-autoround.json /models/intel-snapshot/config.json'
 ```
 
-Then in `engines/tp2-local.env`:
+Then in `engines/two-cards/env/tp2-local.env`:
 
 ```bash
 MODEL_DIR=/models/intel-snapshot

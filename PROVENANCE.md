@@ -159,13 +159,13 @@ The other 8 wu1ff files and the 4 binaries/pack files keep their §2 hashes. The
 **vllm-xpu-kernels `0.1.14.1+b70.1`** (stable line, torch 2.13): upstream tag `0.1.14.1` = `6d92b1bfbf32767ecda8e819613eb151e70030ad`
 + the same commit, oneAPI 2026.0. In progress; not published.
 
-**AWQ serving recipe** (engines/awq-s16-kv128-chunked.env, docs/weights.md) [M]:
+**AWQ serving recipe** (engines/four-cards/env/awq-s16-kv128-chunked.env, docs/weights.md) [M]:
 
 | | |
 |---|---|
 | weights | `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125b929543a783ce700c90e36dd1a575c00c` (19 files, 180.77 GB) |
 | index | `tools/awq_snapshot.py snapshot`: 222,746 → 222,579 tensors (−128 PLE shard tensors, −39 `self_attn.indexer.*`); equal, key for key and file for file, to the index of our serving snapshot |
-| serve config | `engines/serve-config-awq.json`, sha256 `c7a2b345927976d911cfd57d1083b71d1a75fee245f61a17b8f126b6717342c8` = `image/files/opt/b70-flashnext/serve-config.json` + `ignore` entries `re:^mtp.*`, `re:.*self_attn\..*` (reproduced by `tools/awq_snapshot.py serve-config`); byte-identical to the file we serve |
+| serve config | `engines/serve-configs/serve-config-awq.json`, sha256 `c7a2b345927976d911cfd57d1083b71d1a75fee245f61a17b8f126b6717342c8` = `image/files/opt/b70-flashnext/serve-config.json` + `ignore` entries `re:^mtp.*`, `re:.*self_attn\..*` (reproduced by `tools/awq_snapshot.py serve-config`); byte-identical to the file we serve |
 | engine | derived from our serving definition: TP4 + EP, 16 slots, capture sizes `[1,2,4,8,16,256,512,1024]`, `--gpu-memory-utilization 0.85`, 128 GiB native CPU KV tier, INT8 PLE on NVMe, 0014jb, temperature 0.7, presence 0. Differences: the checkpoint's chat template instead of our modified one; docker instead of our launcher. Not run in this form |
 
 ## 7. Release 0.30.0-b70.2 (2026-10-07)
@@ -262,7 +262,7 @@ is overwritten by 0032 in `vllm/_xpu_ops.py`; 0023 likewise):
 **Intel weights (the alternative)** [M]: `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`
 (29 files, 181.24 GB; still the head revision on 2026-10-03), license qwen-community-1.0 per the card. Every file
 sha256-verified against the Hugging Face tree at download. Snapshot: `tools/intel_snapshot.py` (224,280 → 224,113
-tensors; equal in count to the snapshot we serve). Serve config `engines/serve-config-intel-autoround.json`, sha256
+tensors; equal in count to the snapshot we serve). Serve config `engines/serve-configs/serve-config-intel-autoround.json`, sha256
 `e6d529e6b791168a252978202596e794b101e1e679ad29494311fba90d5fbfb7`, reproduced by `tools/intel_snapshot.py
 serve-config` byte for byte. INT8 PLE table: as in §6 (built from devan's BF16 table); the identity of Intel's BF16
 PLE rows (shard 16) with devan's table is UNVERIFIED.

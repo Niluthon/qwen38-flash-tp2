@@ -28,7 +28,7 @@ In short, on a machine with 2× B70, ~64 GB RAM, ~185 GB free on NVMe and Docker
 ```bash
 git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 cp .env.example .env               # optional: MODELS=/path/on/nvme (default ~/models)
-docker compose build               # the image: vLLM v0.30.0 XPU + patches + kernels + shim, all sha256-checked
+docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0046 + kernels + shim
 docker compose run --rm prepare    # once: download (~129 GB) and prepare the weights
 docker compose up -d               # serving on port 8000 after ~5 min; model name qwen38-flash-next
 ```
@@ -38,12 +38,12 @@ Already have the weights, or want another quant? [HOW-TO-RUN.md §6](HOW-TO-RUN.
 
 ### What the two-card engine runs
 
-The settings (all in `engines/tp2-hotcold.env` and `engines/serve-tp2.args`): 150 hot experts per layer and rank in
+The settings (all in `engines/two-cards/env/tp2-hotcold.env` and `engines/two-cards/args/serve-tp2.args`): 150 hot experts per layer and rank in
 VRAM that follow the traffic (patches 0040, 0043), the rest pinned in host RAM, cold experts prefetched into VRAM for
 prefill (0042), the input embedding in host RAM (0044), FP8 W8A16 dense projections (0045), the INT8 PLE table from
 NVMe (0013), MTP k=3 with the checkpoint's INT4 draft, 4 sequences, a warm-up request at start (known issues item 13).
 Quality-checked against BF16 dense (MMLU, HumanEval); not yet endurance-tested. Without Compose:
-`engines/run-tp2.sh` / `engines/restart-tp2.sh`. Setup, experiments and numbers:
+`engines/two-cards/scripts/run-tp2.sh` / `engines/two-cards/scripts/restart-tp2.sh`. Setup, experiments and numbers:
 [docs/two-cards.md](docs/two-cards.md).
 
 ## Four cards: the release recipe
@@ -88,16 +88,16 @@ scripts/make-tree.sh 0.30.0-b70.2 /srv/vllm-b70  # the source tree, hash-checked
    with `tools/build_int8_ple.py build` ([docs/ple-int8.md](docs/ple-int8.md)).
    *Alternative (Intel):* Intel @ `4c67bf68` (all files except `model-00016-of-00017.safetensors`), then
    `tools/intel_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>`.
-3. **Serve.** The model is a parameter: `common.env` + `engines/s16-kv128-mtp3.env` + one model file,
-   `engines/models/awq.env` (recommended) or `engines/models/intel-autoround.env`; `vllm serve <snapshot>` with the flags
-   in `engines/serve-s16-mtp3.args`, `--kv-offloading-size 128`, and the model file's serve config
-   (`engines/serve-config-awq.json` or `engines/serve-config-intel-autoround.json`) as the snapshot's `config.json`
+3. **Serve.** The model is a parameter: `common.env` + `engines/four-cards/env/s16-kv128-mtp3.env` + one model file,
+   `engines/four-cards/models/awq.env` (recommended) or `engines/four-cards/models/intel-autoround.env`; `vllm serve <snapshot>` with the flags
+   in `engines/four-cards/args/serve-s16-mtp3.args`, `--kv-offloading-size 128`, and the model file's serve config
+   (`engines/serve-configs/serve-config-awq.json` or `engines/serve-configs/serve-config-intel-autoround.json`) as the snapshot's `config.json`
    ([engines/README.md](engines/README.md)). Same code and flags for both.
 4. **Serving prompt.** The chat template and the default serving prompt are yours to choose. We keep the checkpoint's
    template and put the serving context (what the model runs on, nothing personal) in a short default system prompt;
    we may move to an empty engine default and let a gateway add the preamble. None of that is in this repository.
 
-The image path (`image/Dockerfile`, `engines/run-example.sh`) is the b70.1 recipe: it pulls only public images by
+The image path (`image/Dockerfile`, `engines/four-cards/scripts/run-example.sh`) is the b70.1 recipe: it pulls only public images by
 digest and fails unless every patched file carries its recorded sha256 (`image/verify-overlay.sh`). For b70.2 it
 still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; see the CHANGELOG.
 
@@ -280,7 +280,7 @@ Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 | 0045 | 16-bit dense projections of INC checkpoints as FP8 W8A16 (−0.9 GiB per card; quality-checked on MMLU, HumanEval) | `B70_DENSE_FP8=<regex>` (two cards: the GDN and attention projections) |
 | 0046 | debug: per-step decode route trace for expert-cache studies | `B70_MOE_ROUTE_TRACE=<path>` (with `B70_MOE_ROUTE_COUNT=1`) |
 
-Two cards run 0040, 0042, 0043, 0044 and 0045 on (`engines/tp2-hotcold.env`). Every switch with its default and
+Two cards run 0040, 0042, 0043, 0044 and 0045 on (`engines/two-cards/env/tp2-hotcold.env`). Every switch with its default and
 measurements: [docs/switches.md](docs/switches.md).
 
 ## Where to find what

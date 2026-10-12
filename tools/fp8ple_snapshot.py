@@ -2,7 +2,7 @@
 """fp8ple_snapshot.py — serve snapshot of an Intel-AutoRound checkpoint whose PLE table is FP8 (albucino hybrid).
 
 albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE @ ef554143 is Intel's AutoRound target tensors (the same quantization block
-as engines/serve-config-intel-autoround.json) plus RadixArk's FP8 PLE table in `model-plefp8-*.safetensors`. The
+as engines/serve-configs/serve-config-intel-autoround.json) plus RadixArk's FP8 PLE table in `model-plefp8-*.safetensors`. The
 series serves the INT8 table built from those shards (tools/build_int8_ple_from_fp8.py), so the snapshot:
 
   1. symlinks every file of the checkpoint except config.json and the index (relative links: keep both on one volume);
@@ -11,8 +11,8 @@ series serves the INT8 table built from those shards (tools/build_int8_ple_from_
   3. writes config.json = the given serve config, after checking that the checkpoint's config differs from it only in
      the indexer_* keys and `ple_embedding_dtype` (the quantization block must be identical).
 
-    fp8ple_snapshot.py <checkpoint dir> <engines/serve-config-intel-autoround.json> <new snapshot dir>
-    fp8ple_snapshot.py --keep-quant <runtime/mtp-int4-g32> <engines/serve-config-intel-autoround.json> <new dir>
+    fp8ple_snapshot.py <checkpoint dir> <engines/serve-configs/serve-config-intel-autoround.json> <new snapshot dir>
+    fp8ple_snapshot.py --keep-quant <runtime/mtp-int4-g32> <engines/serve-configs/serve-config-intel-autoround.json> <new dir>
         the same for the checkpoint's MTP draft (a separate compressed-tensors model, `speculative_config.model`):
         config.json = the serve config with the draft's own quantization block.
 

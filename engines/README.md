@@ -1,7 +1,22 @@
-# Example engines
+# Engines
 
-Example configurations for 4× Arc Pro B70 and ~256 GB host RAM. Adjust the paths, the GPU memory fraction and the CPU
-KV size to your host.
+Engine configurations: environment files, `vllm serve` flag files and launch scripts, grouped by setup and file type.
+
+```
+engines/
+  serve-configs/   the snapshots' config.json (serve-config-awq.json, serve-config-intel-autoround.json); both setups
+  two-cards/       2× B70, ~64 GB RAM: the tp2-hotcold engine (compose.yaml uses these)
+    env/             tp2-hotcold.env (defaults), tp2-local.env.example (template for your git-ignored tp2-local.env)
+    args/            serve-tp2.args (vllm serve flags; your optional serve-tp2.local.args goes here too)
+    scripts/         compose-serve.sh (compose entrypoint), run-tp2.sh / restart-tp2.sh (without compose)
+  four-cards/      4× B70, ~256 GB RAM: the release engines below
+    env/             common.env (shared) + one <engine>.env per engine
+    models/          awq.env, intel-autoround.env (one checkpoint each, chosen with MODEL=)
+    args/            serve.args, serve-s16.args, serve-s16-mtp3.args
+    scripts/         run-example.sh (docker; the b70.1 image)
+```
+
+The four-card engines: adjust the paths, the GPU memory fraction and the CPU KV size to your host.
 
 | engine | weights | slots | PLE table | CPU KV tier | offload fix | note |
 |---|---|---|---|---|---|---|
@@ -13,15 +28,15 @@ KV size to your host.
 | `tp2-hotcold` (`docker compose up -d`, or `run-tp2.sh`) | albucino FP8-PLE (Intel AutoRound target) @ `ef554143` | 4 | INT8 from FP8, from NVMe | none | off | **2× B70, ~64 GB RAM**: TP 2 + EP 2, 150 hot experts/layer in VRAM following the traffic, rest pinned in RAM, FP8 dense projections (0040–0045), MTP k=3, 128K context, warm-up at start ([docs/two-cards.md](../docs/two-cards.md)) |
 | `nvme2-kv96-0014jb` | devan W4A16 | 8 | INT8, from NVMe | 96 GiB | on | NVMe frees ~39 GiB; 96 GiB KV spends most of it |
 
-Files: `common.env` (shared environment), `<engine>.env` (the differences, plus the keys `run-example.sh` reads:
-`KV_OFFLOADING_SIZE`, and optionally `MODEL_DIR`, `SERVE_ARGS`, `SERVE_CONFIG`), `models/<model>.env` (one checkpoint's
-`MODEL_DIR` and `SERVE_CONFIG`, chosen with `MODEL=<model>`), `serve.args` / `serve-s16.args`
-/ `serve-s16-mtp3.args` (`vllm serve` flags, one flag and its value per line), `serve-config-awq.json` and
-`serve-config-intel-autoround.json` (serve configs), `run-example.sh` (docker; the b70.1 image).
+Four-card files: `four-cards/env/common.env` (shared environment), `four-cards/env/<engine>.env` (the differences, plus
+the keys `run-example.sh` reads: `KV_OFFLOADING_SIZE`, and optionally `MODEL_DIR`, `SERVE_ARGS` (a file name in
+`four-cards/args/`), `SERVE_CONFIG` (a file name in `serve-configs/`)), `four-cards/models/<model>.env` (one
+checkpoint's `MODEL_DIR` and `SERVE_CONFIG`, chosen with `MODEL=<model>`), `four-cards/args/*.args` (`vllm serve`
+flags, one flag and its value per line).
 
 ```bash
-MODELS=/srv/models CACHE=/srv/cache engines/run-example.sh awq-s16-kv128-chunked b70-flash-next:0.30.0-b70.1
-MODELS=/srv/models CACHE=/srv/cache MODEL=awq engines/run-example.sh s16-kv128-mtp3 <your b70.2 image>
+MODELS=/srv/models CACHE=/srv/cache engines/four-cards/scripts/run-example.sh awq-s16-kv128-chunked b70-flash-next:0.30.0-b70.1
+MODELS=/srv/models CACHE=/srv/cache MODEL=awq engines/four-cards/scripts/run-example.sh s16-kv128-mtp3 <your b70.2 image>
 ```
 
 ## The serving recipe (`s16-kv128-mtp3`, 0.30.0-b70.2; the model is a parameter)

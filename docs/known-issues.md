@@ -79,7 +79,7 @@ Each item: symptoms → cause → workaround. Status as of 2026-10-07 (0.30.0-b7
   scheduling (vLLM's default) leaves residual NaN; the leading candidate is a staging-buffer reuse race.
 - **Workaround (what we serve, 0/90 bad bursts).** `--no-async-scheduling`, and cudagraph capture sizes at every multiple
   of 1+k up to `max-num-seqs`×(1+k) (4, 8, …, 64 for k=3 and 16 slots), so a uniform spec-decode step is never padded
-  (`engines/serve-s16-mtp3.args`). The cost: concurrent long-prompt TTFT ~35–40 % worse than without MTP. The proper
+  (`engines/four-cards/args/serve-s16-mtp3.args`). The cost: concurrent long-prompt TTFT ~35–40 % worse than without MTP. The proper
   fixes (padding rows that write nothing; the race) are work in progress.
 - **Structured output.** Grammar-trimmed drafts give a row of fewer than 1+k tokens, which the stock 0.1.14 GDN kernel
   rejects (the engine crashes on the first `json_schema` request). Fixed by upstream vllm-xpu-kernels #600, which is in
@@ -125,7 +125,7 @@ mode file) falls back to the `official` variant and, before 0032, logged that wa
 ## 12. The release branch: AWQ validated on an earlier branch of the same code, Intel verification in progress
 
 From 0.30.0-b70.2 there is one release branch, `b70/v0.30.0-stable` (tag `v0.30.0-b70.2`), and the model is a serving
-parameter (`engines/s16-kv128-mtp3.env` + `engines/models/awq.env` or `engines/models/intel-autoround.env`). The branch
+parameter (`engines/four-cards/env/s16-kv128-mtp3.env` + `engines/four-cards/models/awq.env` or `engines/four-cards/models/intel-autoround.env`). The branch
 carries the union of the two lines we tested on, with one copy of each fix. It has **not yet been booted on a GPU**.
 
 **AWQ** (`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`, the build we serve and recommend) was validated on an earlier branch of
@@ -175,7 +175,7 @@ snapshot `tools/awq_snapshot.py` writes was compared with ours by index only (sa
   thinking on or off, greedy or sampled, with `FULL_AND_PIECEWISE` or `FULL_DECODE_ONLY`; with `--enforce-eager` the
   stream never reports capturing and the request succeeds. Any short request first prevents it: after one, long first
   chunks run normally.
-- **Workaround.** `engines/run-tp2.sh` sends one short chat request as soon as `/health` answers (`WARMUP=1`, the
+- **Workaround.** `engines/two-cards/scripts/run-tp2.sh` sends one short chat request as soon as `/health` answers (`WARMUP=1`, the
   default). Clients that connect in the few seconds before it finishes can still hit the bug.
 - **Not done.** The root cause (which compiled-path component flips the stream's capture state) is not identified;
   the next step is a compiled run without graphs (`cudagraph_mode: NONE`) with the capture-state probes.

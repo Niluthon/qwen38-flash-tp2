@@ -7,15 +7,17 @@
 #
 # = the official vLLM v0.30.0 XPU image (pinned by digest)
 # + vllm-xpu-kernels 0.1.14.1+b70.3, downloaded from the 0.30.0-b70.2 release (sha256 asserted)
-# + the whole patch series patches/vllm/ (wu1ff's 0001–0005, then the b70 series incl. the two-card patches
-#   0040–0046) applied to the installed vLLM and to /workspace/vllm; every touched file sha256-asserted against
-#   image/verify-overlay.sh ("final" set), every touched .py compiled
+# + vLLM of the release 0.30.0-b70.2: fork tag Lumnus/vllm@v0.30.0-b70.2 (commit asserted; = v0.30.0 + patches
+#   0001–0032), fetched into /workspace/vllm and its vllm/ changes copied into the installed package; the build fails
+#   unless the release changes exactly the files patches/vllm/0001–0032 touch (less the two they restore, UPSTREAM)
+# + the two-card patches 0040–0046 (in no release yet) from patches/vllm/, on top; then every touched file is
+#   sha256-asserted against image/verify-overlay.sh ("final" set) and every touched .py compiled
 # + wu1ff's Level Zero peer-residency shim (no public source), copied from wu1ff's public image BY DIGEST and
-#   sha256-asserted; engines/tp2-hotcold.env LD_PRELOADs it
+#   sha256-asserted; engines/two-cards/env/tp2-hotcold.env LD_PRELOADs it
 #
 # wu1ff's libgdn_index64.so is NOT installed: with kernels b70.3 the stock GDN op is 64-bit (patches 0027, 0032).
 # To run a vLLM source tree instead of the baked-in code (development), set PYTHONPATH=/work/<tree> in
-# engines/tp2-local.env.
+# engines/two-cards/env/tp2-local.env.
 
 ARG BASE_IMAGE=docker.io/vllm/vllm-openai-xpu:v0.30.0@sha256:fc0e112afb64e3a06fe8daff34652435822a629412f38efce8f0f67a46636b8d
 ARG WU1FF_IMAGE=ghcr.io/wu1ff/qwen38-flashnext-b70:1.0.0@sha256:85512b52c09fa660a2e7fe441417129e7c47fac727fd85f66ccea6b65e0a9122
@@ -37,24 +39,53 @@ RUN set -eu; \
     rm -rf "$d"; \
     /opt/venv/bin/python -c "import importlib.metadata as m; v = m.version('vllm-xpu-kernels'); assert v == '0.1.14.1+b70.3', v"
 
-# The series, in filename order (LC_ALL=C): wu1ff's 0001–0005 first, then the b70 patches. --dry-run first so a
-# failing patch never half-applies; --fuzz=0 so a moved base fails loudly. Patches are bind-mounted, not copied.
+# vLLM of the release, then the two-card patches. The image's /workspace/vllm is the v0.30.0 checkout (BASE); the
+# release tag is fetched into it, and every vllm/ file the release adds, changes or removes is applied to the installed
+# package the same way. --fuzz=0 and --dry-run for the patches on top, so a moved base fails loudly.
+ARG VLLM_REPO=https://github.com/Lumnus/vllm.git
+ARG VLLM_TAG=v0.30.0-b70.2
+ARG VLLM_COMMIT=9d79d28d7e32f33bdbd115c85d116583ce679cb6
+ARG VLLM_BASE=ced6857afa0ea7b2e3f0846a62e1394e90f15607
+ARG TP2_PATCHES="0040 0041 0042 0043 0044 0045 0046"
 RUN --mount=type=bind,source=patches/vllm,target=/tmp/b70-patches \
     --mount=type=bind,source=image,target=/tmp/b70-image \
     set -eu; export LC_ALL=C; \
-    command -v patch >/dev/null; \
-    for root in /opt/venv/lib/python3.12/site-packages /workspace/vllm; do \
-      for p in $(ls /tmp/b70-patches/*.patch | grep -v -- '-b70-') $(ls /tmp/b70-patches/*-b70-*.patch); do \
+    site=/opt/venv/lib/python3.12/site-packages; ws=/workspace/vllm; \
+    git config --global --add safe.directory "$ws"; \
+    test "$(git -C "$ws" rev-parse HEAD)" = "${VLLM_BASE}"; \
+    git -C "$ws" fetch -q --depth 1 "${VLLM_REPO}" "refs/tags/${VLLM_TAG}:refs/tags/${VLLM_TAG}"; \
+    got=$(git -C "$ws" rev-parse "${VLLM_TAG}^{commit}"); \
+    [ "$got" = "${VLLM_COMMIT}" ] || { echo "tag ${VLLM_TAG} is $got, want ${VLLM_COMMIT}" >&2; exit 1; }; \
+    git -C "$ws" checkout -q --force "${VLLM_TAG}"; \
+    git -C "$ws" diff --name-only --no-renames "${VLLM_BASE}" "${VLLM_TAG}" -- vllm | sort > /tmp/release-files; \
+    for p in /tmp/b70-patches/*.patch; do \
+      case " ${TP2_PATCHES} " in *" $(basename "$p" | cut -c1-4) "*) continue ;; esac; \
+      sed -n 's#^+++ b/\(vllm/[^[:space:]]*\).*#\1#p; s#^--- a/\(vllm/[^[:space:]]*\).*#\1#p' "$p"; \
+    done | sort -u > /tmp/series-files; \
+    sed -n 's#^[0-9a-f]\{64\}  UPSTREAM  *\(vllm/.*\)$#\1#p' /tmp/b70-image/verify-overlay.sh | sort > /tmp/upstream-files; \
+    comm -23 /tmp/release-files /tmp/series-files > /tmp/only-release; \
+    comm -13 /tmp/release-files /tmp/series-files | comm -23 - /tmp/upstream-files > /tmp/only-series; \
+    if [ -s /tmp/only-release ] || [ -s /tmp/only-series ]; then \
+      echo "release ${VLLM_TAG} and patches/vllm/ (without ${TP2_PATCHES}) differ; only in the release:" >&2; \
+      cat /tmp/only-release >&2; echo "only in the patches (and not restored to upstream):" >&2; cat /tmp/only-series >&2; exit 1; \
+    fi; \
+    git -C "$ws" diff --name-status --no-renames "${VLLM_BASE}" "${VLLM_TAG}" -- vllm | while read -r st f; do \
+      if [ "$st" = D ]; then rm -f "$site/$f"; else install -D -m 0644 "$ws/$f" "$site/$f"; fi; \
+    done; \
+    echo "vLLM ${VLLM_TAG} (${VLLM_COMMIT}): $(wc -l < /tmp/release-files) files -> $site and $ws"; \
+    for root in "$site" "$ws"; do \
+      for n in ${TP2_PATCHES}; do \
+        p=$(ls /tmp/b70-patches/$n-*.patch); \
         patch -d "$root" -p1 --fuzz=0 --forward --no-backup-if-mismatch --dry-run -s < "$p" >/dev/null; \
         patch -d "$root" -p1 --fuzz=0 --forward --no-backup-if-mismatch -s < "$p"; \
       done; \
-      echo "applied $(ls /tmp/b70-patches/*.patch | wc -l) patches -> $root"; \
+      echo "applied two-card patches ${TP2_PATCHES} -> $root"; \
     done; \
-    if find /opt/venv/lib/python3.12/site-packages/vllm /workspace/vllm/vllm \( -name '*.orig' -o -name '*.rej' \) | grep -q .; then \
+    if find "$site/vllm" "$ws/vllm" \( -name '*.orig' -o -name '*.rej' \) | grep -q .; then \
       echo "patch left .orig/.rej files" >&2; exit 1; \
     fi; \
-    /opt/venv/bin/python -I /tmp/b70-image/verify-tree.py /opt/venv/lib/python3.12/site-packages /workspace/vllm; \
-    cd /opt/venv/lib/python3.12/site-packages; \
+    /opt/venv/bin/python -I /tmp/b70-image/verify-tree.py "$site" "$ws"; \
+    cd "$site"; \
     PYTHONDONTWRITEBYTECODE=1 /opt/venv/bin/python -c 'import sys; [compile(open(f, "rb").read(), f, "exec") for f in sys.argv[1:]]; print("compiled", len(sys.argv) - 1, "files")' \
       $(for p in /tmp/b70-patches/*.patch; do sed -n 's#^+++ b/\(vllm/[^[:space:]]*\.py\).*#\1#p' "$p"; done | sort -u)
 
@@ -64,7 +95,9 @@ COPY --from=wu1ff --chmod=0644 /opt/b70-residency-shim/libl0_peer_residency_shim
 RUN echo "ae2c82f549d97393268cbd7b90dba7cf38fd00dbccae54f090b1a545e5613b3c  /opt/b70-residency-shim/libl0_peer_residency_shim.so" | sha256sum -c -
 
 LABEL org.opencontainers.image.title="b70-flash-next:tp2" \
-      org.opencontainers.image.description="vLLM v0.30.0 XPU + the b70 series + kernels 0.1.14.1+b70.3 for 2x Arc Pro B70 (hot/cold experts)" \
+      org.opencontainers.image.description="vLLM 0.30.0-b70.2 (Lumnus/vllm@v0.30.0-b70.2) + two-card patches 0040-0046 + kernels 0.1.14.1+b70.3 for 2x Arc Pro B70" \
+      net.lumnus.vllm.release="v0.30.0-b70.2" \
+      net.lumnus.vllm.commit="9d79d28d7e32f33bdbd115c85d116583ce679cb6" \
       org.opencontainers.image.source="https://github.com/Lumnus/b70-flash-next" \
       org.opencontainers.image.licenses="Apache-2.0 AND MIT"
 

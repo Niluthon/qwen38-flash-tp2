@@ -16,7 +16,7 @@ numbers are in [measurements/b70.2.md](measurements/b70.2.md).
 | QSA indexer weights | shipped; unused on the dense-QSA config (0019/0020 skip them, the snapshot drops them) |
 | MTP head | BF16, in `model_extra_tensors.safetensors` |
 | license | qwen-community-1.0 (card) |
-| what the series needs | patch 0028 (the PLE embedding accepts the INC config), a snapshot made with `tools/intel_snapshot.py`, `engines/serve-config-intel-autoround.json` |
+| what the series needs | patch 0028 (the PLE embedding accepts the INC config), a snapshot made with `tools/intel_snapshot.py`, `engines/serve-configs/serve-config-intel-autoround.json` |
 
 **How it loads.** vLLM maps `auto-round` to its INC config. The 48 routed-expert layers go through the GPTQ MoE path to
 the XPU WNA16 backend (`XPUExpertsWNA16`), the same int4 kernel and weight key as the AWQ build; the repack drops the
@@ -26,7 +26,7 @@ included. The registered but unused `qzeros` cost ~0.1–0.17 GiB of VRAM per ca
 **Snapshot.** `tools/intel_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>` symlinks the
 download except `config.json`, the index and shard 16, writes a filtered index (224,280 → 224,113 tensors: −128 PLE
 tensors, −39 indexer tensors) and links devan's PLE table, which `PLE_TABLE_PATH` uses for the INT8 table's boot
-cross-check. `tools/intel_snapshot.py serve-config engines/serve-config-awq.json <download>/config.json out.json` writes
+cross-check. `tools/intel_snapshot.py serve-config engines/serve-configs/serve-config-awq.json <download>/config.json out.json` writes
 the serve config (the dense-QSA config with the checkpoint's auto-round block) and checks it byte for byte against the
 file we serve.
 
@@ -44,7 +44,7 @@ boot cross-check and every quality test pass, but the identity itself is unverif
 | PLE n-gram table | separate `ple_table_qwen4exp.pt` | inside shard 1 (128 `…ngram_embedding.shard_<i>` tensors) |
 | QSA indexer weights | none | shipped (12 layers + the MTP layer); unused on the dense-QSA config |
 | MTP head | included | in a separate `model_mtp.safetensors` |
-| what the image needs | nothing extra: wu1ff's entrypoint and `serve-config.json` | a snapshot made with `tools/awq_snapshot.py` and `engines/serve-config-awq.json` |
+| what the image needs | nothing extra: wu1ff's entrypoint and `serve-config.json` | a snapshot made with `tools/awq_snapshot.py` and `engines/serve-configs/serve-config-awq.json` |
 
 ## What `tools/awq_snapshot.py` does
 
@@ -58,7 +58,7 @@ boot cross-check and every quality test pass, but the identity itself is unverif
    - `re:^mtp.*`: the MTP tensors in `model_mtp.safetensors`.
 
    `tools/awq_snapshot.py serve-config image/files/opt/b70-flashnext/serve-config.json out.json` reproduces the file
-   byte for byte (sha256 `c7a2b345…7342c8`). `engines/run-example.sh` mounts it over the image's serve config.
+   byte for byte (sha256 `c7a2b345…7342c8`). `engines/four-cards/scripts/run-example.sh` mounts it over the image's serve config.
 
 The INT8 PLE table is the same file for both checkpoints, built by `tools/build_int8_ple.py` from devan's
 `ple_table_qwen4exp.pt`. Our deployment notes record the two checkpoints' BF16 PLE rows as identical; this repository

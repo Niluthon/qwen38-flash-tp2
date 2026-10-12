@@ -19,7 +19,7 @@ set -euo pipefail
 REPO=${REPO:-albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE}
 REVISION=${REVISION:-c6af9fee7ad2cb8ef44b534a99b8c1b81fb0f6da}
 TOOLS=${TOOLS:-/b70-tools}
-CONFIG=${CONFIG:-/b70-engines/serve-config-intel-autoround.json}
+CONFIG=${CONFIG:-/b70-engines/serve-configs/serve-config-intel-autoround.json}
 M=/models
 CKPT=$M/qwen38-w4a16
 PLE=$M/qwen38-w4a16-int8ple

@@ -7,7 +7,7 @@ RAM next to everything else either. `tp2-hotcold` splits them.
 ## Weights
 
 `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` @ `ef554143`: Intel's AutoRound target tensors (the quantization block
-equals `engines/serve-config-intel-autoround.json`) plus RadixArk's FP8 PLE table (`model-plefp8-*`, 128 shards, one
+equals `engines/serve-configs/serve-config-intel-autoround.json`) plus RadixArk's FP8 PLE table (`model-plefp8-*`, 128 shards, one
 global scale) plus an INT4-g32 MTP draft (`runtime/mtp-int4-g32`, compressed-tensors). This host runs revision
 `c6af9fee`. Three one-time steps (`docker compose run --rm prepare` downloads the checkpoint and runs all three):
 
@@ -16,9 +16,9 @@ global scale) plus an INT4-g32 MTP draft (`runtime/mtp-int4-g32`, compressed-ten
 CKPT=/models/qwen38-w4a16 OUT_DIR=/models/qwen38-w4a16-int8ple python3 tools/build_int8_ple_from_fp8.py build
 CKPT=/models/qwen38-w4a16 OUT_DIR=/models/qwen38-w4a16-int8ple python3 tools/build_int8_ple_from_fp8.py verify
 # serve snapshots: the target, and the MTP draft with its own quantization block
-tools/fp8ple_snapshot.py /models/qwen38-w4a16 engines/serve-config-intel-autoround.json /models/qwen38-w4a16-snapshot
+tools/fp8ple_snapshot.py /models/qwen38-w4a16 engines/serve-configs/serve-config-intel-autoround.json /models/qwen38-w4a16-snapshot
 tools/fp8ple_snapshot.py --keep-quant /models/qwen38-w4a16/runtime/mtp-int4-g32 \
-    engines/serve-config-intel-autoround.json /models/qwen38-w4a16-mtp-snapshot
+    engines/serve-configs/serve-config-intel-autoround.json /models/qwen38-w4a16-mtp-snapshot
 ```
 
 `verify` on 262,045 sampled rows: every row re-quantises byte-exact; relative L2 error against the FP8 rows 0.66 %
@@ -51,10 +51,11 @@ created with an explicit `device="cpu"`. Without it they landed in VRAM: torch r
 during loading (the driver overcommits), and the fragmented remainder cost ~3 GiB of KV cache per card.
 `B70_MOE_HOTCOLD_MEMLOG=1` logs torch allocated / reserved and device free memory after every layer's split.
 
-## The engine (`engines/tp2-hotcold.env`, `engines/serve-tp2.args`, `engines/run-tp2.sh`)
+## The engine (`engines/two-cards/env/tp2-hotcold.env`, `engines/two-cards/args/serve-tp2.args`, `engines/two-cards/scripts/run-tp2.sh`)
 
-Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + kernels 0.1.14.1+b70.3 + the patch series
-+ wu1ff's residency shim; everything fetched and hash-checked at build time). Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
+Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
+`Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
+0040–0046 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
 150 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
 `--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
@@ -62,8 +63,8 @@ Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + ke
 ```bash
 docker compose build                  # the image (image/Dockerfile.tp2)
 docker compose run --rm prepare       # once: the weights steps above (scripts/prepare-models-tp2.sh)
-docker compose up -d                  # compose.yaml: engine + one-shot warm-up; or: MODELS=~/models engines/run-tp2.sh
-cp engines/tp2-local.env.example engines/tp2-local.env   # optional: local overrides (B70_* switches, EXTRA_ARGS)
+docker compose up -d                  # compose.yaml: engine + one-shot warm-up; or: MODELS=~/models engines/two-cards/scripts/run-tp2.sh
+cp engines/two-cards/env/tp2-local.env.example engines/two-cards/env/tp2-local.env   # optional: local overrides (B70_* switches, EXTRA_ARGS)
 ```
 
 Launcher notes: `-w /opt/venv` (the image's `/workspace/vllm` checkout would shadow `PYTHONPATH` for `python -m`
@@ -213,7 +214,7 @@ DMA; with swapping on (the default) the leftover cold experts are rarer and the 
 **154 hot experts (the alternative use of that VRAM).** KV 201,794 → 170,152; agentic coding 90.5 / 98.7 → 92.1 /
 98.5 tok/s; general prompts 57.1 → 57.9 tok/s at 1 stream, 81.4 → 84.8 at 4; prefill unchanged; 0 / 120 bad burst
 outputs. +1–4 %, mostly within noise, for 31.6K KV tokens: the default stays at 150 (154 is a line in
-`engines/tp2-local.env.example`). Returns from more hot experts have flattened at this point.
+`engines/two-cards/env/tp2-local.env.example`). Returns from more hot experts have flattened at this point.
 
 ## Excluded or not worth it (as of 2026-10-11)
 
@@ -241,7 +242,7 @@ outputs. +1–4 %, mostly within noise, for 31.6K KV tokens: the default stays a
 
 ## How to reproduce the measurements
 
-Engine: `engines/restart-tp2.sh` (detached start; wait for `[run-tp2] warm-up request OK` in `engine-data/engine.log`).
+Engine: `engines/two-cards/scripts/restart-tp2.sh` (detached start; wait for `[run-tp2] warm-up request OK` in `engine-data/engine.log`).
 Client scripts in `tools/bench_tp2/`, run in any container on the host network (e.g. the dev container, with this
 repository mounted):
 
@@ -286,7 +287,7 @@ All commands run in a container from `b70-flash-next:tp2` (or the dev container)
    views of the pinned arena) equals all experts in VRAM, bit for bit, at 1 / 7 / 64 / 1,024 rows. Needs a free card.
 4. **The PLE table.** `tools/build_int8_ple_from_fp8.py verify`: byte-exact re-quantisation of 262,045 sampled rows,
    error against the FP8 source (0.66 % mean).
-5. **The engine.** Boot `engines/run-tp2.sh`; check the boot lines `B70 hot/cold: 48 layers split`, `PLE NVMe host
+5. **The engine.** Boot `engines/two-cards/scripts/run-tp2.sh`; check the boot lines `B70 hot/cold: 48 layers split`, `PLE NVMe host
    path ready`, `XPU KV cache size`; then a chat request, a `json_schema` request with MTP, a long-context needle, and
    a speed run (decode at 1 and 4 streams, prefill at 3K and 12K tokens). The numbers above came from that sequence.
 

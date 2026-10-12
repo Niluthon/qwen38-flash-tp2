@@ -55,6 +55,6 @@ Third-party material
    Intel/Qwen3.8-Flash-Next-W4A16-AutoRound (revision 4c67bf68), wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 (revision 0939125)
    and devan-carlin/Qwen3.8-Flash-Next-W4A16 (revision 40b8f18d) on Hugging Face, each under its own license terms
    (Qwen3.8-Flash-Next: qwen-community-1.0). image/files/opt/b70-flashnext/serve-config.json is derived from devan's
-   config.json; engines/serve-config-intel-autoround.json carries the Intel checkpoint's quantization block.
+   config.json; engines/serve-configs/serve-config-intel-autoround.json carries the Intel checkpoint's quantization block.
 
 5. Patch 0022 ports vllm-project/vllm#55506 (Apache-2.0, by its authors) to v0.30.0.
