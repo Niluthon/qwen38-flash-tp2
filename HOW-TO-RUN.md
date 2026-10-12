@@ -1,6 +1,8 @@
 # How to run it (two cards)
 
-A step-by-step guide to serving Qwen3.8-Flash-Next on **2× Intel Arc Pro B70** with Docker Compose. It covers a fresh
+A step-by-step guide to serving Qwen3.8-Flash-Next on **2× Intel Arc Pro B70** with Docker Compose. **One card and
+96 GB RAM:** the same steps, plus two lines in `.env` before starting ([engines/one-card/](engines/one-card/README.md);
+not yet booted). It covers a fresh
 machine, daily use, reusing weights you already have, and bringing your own model. The four-card setup has its own
 recipe in the [README](README.md#four-cards-the-release-recipe).
 

@@ -5,7 +5,10 @@ Engine configurations: environment files, `vllm serve` flag files and launch scr
 ```
 engines/
   serve-configs/   the snapshots' config.json (serve-config-awq.json, serve-config-intel-autoround.json); both setups
-  two-cards/       2× B70, ~64 GB RAM: the tp2-hotcold engine (compose.yaml uses these)
+  one-card/        1× B70, 96 GB RAM: tp1-hotcold, not yet booted (one-card/README.md; select it in the root .env)
+    env/             tp1-hotcold.env, tp1-local.env.example
+    args/            serve-tp1.args
+  two-cards/       2× B70, ~64 GB RAM: the tp2-hotcold engine (compose.yaml's default)
     env/             tp2-hotcold.env (defaults), tp2-local.env.example (template for your git-ignored tp2-local.env)
     args/            serve-tp2.args (vllm serve flags; your optional serve-tp2.local.args goes here too)
     scripts/         compose-serve.sh (compose entrypoint), run-tp2.sh / restart-tp2.sh (without compose)

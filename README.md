@@ -8,6 +8,7 @@ series, the kernel build, the engine settings and the measurements; the patched 
 | your machine | what to use | effort |
 |---|---|---|
 | **2× B70** (32 GB each), ~64 GB RAM, NVMe | [**Two cards: Docker Compose**](#two-cards-docker-compose) — one image, one prepare step, `docker compose up -d`; guide: [HOW-TO-RUN.md](HOW-TO-RUN.md) | builds everything itself, also on a fresh PC |
+| **1× B70**, 96 GB RAM | the same Compose setup with the one-card settings: [engines/one-card/](engines/one-card/README.md) (**not yet booted**) | two lines in `.env` |
 | **4× B70**, 256 GB RAM | [Four cards: the release recipe](#four-cards-the-release-recipe) — source tree + kernel wheel, AWQ weights | manual; how the release is served |
 
 Both serve an OpenAI-compatible API (`/v1/chat/completions`, tool calls, reasoning) on port 8000.
