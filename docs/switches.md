@@ -88,7 +88,7 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_HOTCOLD_SWAP` | unset (off) | 0043 | `1`: the hot set follows the traffic. Every period each rank scores its local experts from the prefill route counts (implies `B70_MOE_ROUTE_COUNT=prefill`) and swaps experts between VRAM and pinned RAM in place (weights, scales and expert maps; no graph recapture). Exact: outputs do not depend on placement. We run it on 2× B70. |
 | `B70_MOE_HOTCOLD_SWAP_S` | `5` | 0043 | period, seconds (one round costs 7–16 ms on 2× B70). |
 | `B70_MOE_HOTCOLD_SWAP_DECAY` | `0.95` | 0043 | per-period decay of the scores (half-life ~70 s at 5 s). |
-| `B70_MOE_HOTCOLD_SWAP_PRIOR` | `0.01` | 0044 | weight of the rankings-file order in the score (0.05 before 0044; an offline replay of agentic-coding traces preferred 0.005–0.01). |
+| `B70_MOE_HOTCOLD_SWAP_PRIOR` | `0.01` | 0044 | weight of the rankings-file order in the score (0.05 before 0044; an offline replay of route traces from code prompts at 2 concurrent requests preferred 0.005–0.01). |
 | `B70_MOE_HOTCOLD_SWAP_BUDGET` | `8` (`4` in 0043) | 0043, 0044 | most swaps per layer and period; a swap needs the cold score to beat the hot one by 10 %. |
 
 ## Input embedding in host RAM (0044)

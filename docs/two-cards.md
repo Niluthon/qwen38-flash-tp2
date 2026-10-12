@@ -82,7 +82,7 @@ check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 2
 | host RAM | cold experts 15 GiB pinned per rank; PLE row cache 1 GiB per rank; ~45 GiB used in all, ~16 GiB available |
 | decode, 1 stream | 57–58 tok/s with MTP (26–36 without MTP) |
 | decode, 4 streams | 24 tok/s each, 97 total |
-| prefill | ~3,950 tok/s at 3K–30K tokens with 0042 (~2,600 without); long first requests (17K with thinking, 24K) pass after the warm-up; on the 262K variant a 146K-token needle was found in 82 s |
+| prefill | ~3,950 tok/s at 3K–30K tokens with 0042 (~2,600 without), one request at a time (prefill with concurrent requests: not measured); long first requests (17K with thinking, 24K) pass after the warm-up; on the 262K variant a 146K-token needle was found in 82 s |
 | MTP acceptance | 2.48 tokens per step on a real chat answer (0.82 / 0.69 / 0.43 per position on synthetic text) |
 | boot | ~4–5 min |
 
@@ -122,15 +122,16 @@ Other findings:
 - VRAM budget per card at 0.92: weights 22.55 GiB, non-torch 1.84, peak activation 1.06, graphs 0.45, KV 2.42; vLLM's
   own suggestion is ~0.8 GiB more KV, which util 0.95 takes. Each card has PCIe 5.0 x8 (the board splits x16).
 
-## Experiments, round 2 (2026-10-11): agentic coding, KV never reduced
+## Experiments, round 2 (2026-10-11): code prompts at 2 concurrent requests, KV never reduced
 
 Rule for this round: no change may cost KV (173,610 tokens at 128K). Workload: `tools/bench_tp2/agent_load.py`,
 coding-agent sessions (tool-use system prompt, a real source file from the vLLM tree, 5 turns: implement, test, fix,
-refactor, explain), 12 sessions, 2 at a time, temperature 0 for A/B runs.
+refactor, explain), 12 sessions, **2 concurrent requests**, temperature 0 for A/B runs. Its tok/s = all generated
+tokens / wall time of the run, i.e. the total over the 2 concurrent requests (~half of it per request), prefill included.
 
 | item | result | verdict |
 |---|---|---|
-| **expert swapping (0043)** | agentic coding 57.2 / 58.9 → **66.4 / 76.3 tok/s** (+16 / +30 %, two runs; wall 245 / 286 → 175 / 204 s); decode cold share 30 % → 18–21 %; general prompts re-adapt within minutes (4 streams 88.5 vs 86); KV unchanged | **default** |
+| **expert swapping (0043)** | 2 concurrent requests (code) 57.2 / 58.9 → **66.4 / 76.3 tok/s** total (+16 / +30 %, two runs; wall 245 / 286 → 175 / 204 s); decode cold share 30 % → 18–21 %; general prompts re-adapt within minutes (4 streams 88.5 vs 86); KV unchanged | **default** |
 | hot and cold MoE on two queues at decode | captures and stays bit-identical, but no overlap: 53.9 vs 53.4 ms (4 rows, 48 layers), 198.3 vs 197.8 (16 rows) | not worth it |
 | async scheduling (`--async-scheduling`) | KV 173,610 → 146,788; decode no faster (1 stream ~52 vs ~55, 4 streams 83 vs 84–86); 1 repeat-pattern output in 120 burst requests | not worth it |
 | a more precise MTP draft | the draft is RTN INT4-g32 from RadixArk's NVFP4 (already 4-bit); no higher-precision MTP here; INT8 experts would cost ~1.9 GB VRAM per card | not available without KV loss |
@@ -150,7 +151,7 @@ besides its new text (≤ 0.4 s at ~3,950 tok/s).
 
 | item | result | verdict |
 |---|---|---|
-| **input embedding in pinned host RAM (0044)** | frees 0.59 GiB per card; 142 hot: KV 199,174, agentic coding 70.6 / 81.2 tok/s (136 hot: 66.4 / 76.3); 144 hot: KV 193,412, 73.8 / 79.3; needles 6/6, bursts clean | **default (144 hot)** |
+| **input embedding in pinned host RAM (0044)** | frees 0.59 GiB per card; 142 hot: KV 199,174, 2 concurrent requests (code) 70.6 / 81.2 tok/s total (136 hot: 66.4 / 76.3); 144 hot: KV 193,412, 73.8 / 79.3; needles 6/6, bursts clean | **default (144 hot)** |
 | swap policy from an offline replay (0044 defaults) | prior weight 0.05 → 0.01, budget 4 → 8: decode cold share 14.3 → 12.2 % and 17.2 → 15.3 % on two traces (offline); live within noise | default |
 | drop the MTP draft's own lm_head / embed_tokens | byte-identical to the target's, but vLLM already shares them and frees the copies: KV and weights unchanged | nothing to gain |
 | fine-grained Mamba prefix cache | needs an identified draft KV group (log: none found) and excludes multi-module MTP; a custom version would save ≤ 0.4 s per agent turn | not applicable |
@@ -184,8 +185,8 @@ sessions: the round-3 FP8 agent comparison (prompt totals 207K vs 229K) was conf
 
 | item | result | verdict |
 |---|---|---|
-| **FP8 dense layers (0045) + 150 hot experts** | quality: MMLU 87.33 → 87.23 % on 3,000 paired questions (29 vs 26 discordant, exact McNemar p = 0.79), HumanEval pass@1 157 → 158 / 164 (`run_eval.py`, `he_exec.py`, `compare.py`); KV 193,621 → 201,794; agentic coding 84.5 / 87.5 → 90.5 / 98.7 tok/s (frozen corpus, same prompts); general prompts 53.5 → 57.1 tok/s at 1 stream (steps ~3.5 ms shorter); prefill unchanged; 0 / 120 bad burst outputs | **default** |
-| 8 slots (`--max-num-seqs 8`, capture sizes to 32) | KV 193,621 → 178,324; 4 concurrent agents 105.8 → 106.4 tok/s, 8 concurrent 118.6 → 127.7 (+8 %, wall −13 %); prefix reuse at 8 concurrent 30 → 14 % (KV pressure); one unexplained short answer in 400 eight-wide burst requests | opt-in (tp2-local.env.example) |
+| **FP8 dense layers (0045) + 150 hot experts** | quality: MMLU 87.33 → 87.23 % on 3,000 paired questions (29 vs 26 discordant, exact McNemar p = 0.79), HumanEval pass@1 157 → 158 / 164 (`run_eval.py`, `he_exec.py`, `compare.py`); KV 193,621 → 201,794; 2 concurrent requests (code) 84.5 / 87.5 → 90.5 / 98.7 tok/s total (frozen corpus, same prompts); general prompts 53.5 → 57.1 tok/s at 1 stream (steps ~3.5 ms shorter); prefill unchanged; 0 / 120 bad burst outputs | **default** |
+| 8 slots (`--max-num-seqs 8`, capture sizes to 32) | KV 193,621 → 178,324; 4 concurrent requests (code) 105.8 → 106.4 tok/s total, 8 concurrent 118.6 → 127.7 (+8 %, wall −13 %); prefix reuse at 8 concurrent 30 → 14 % (KV pressure); one unexplained short answer in 400 eight-wide burst requests | opt-in (tp2-local.env.example) |
 | draft-only reduced vocabulary (0046, not committed) | step −2…4 ms, but 5–20 % of real output tokens were outside a 51K-token vocabulary (code-heavy corpus) and acceptance fell 3–11 %: net −3 % (1 stream), −7 % (4 streams); <0.2 % misses needs ~98K of the 124K rows per card (~0.7 ms/step for ~0.5 GiB) | not worth it |
 | adaptive draft length | vLLM's adaptive verification supports only DSpark, excludes local-argmax drafting, and variable-length verify batches are the padded-graph case of known issue 6 | not applicable |
 | cold-expert prefetch at decode | a UVA-reading kernel does not overlap with compute (two-queue test), and the decode graphs cannot express copies whose source experts are chosen on the GPU each step | blocked |
@@ -196,7 +197,7 @@ sessions: the round-3 FP8 agent comparison (prompt totals 207K vs 229K) was conf
 captured decode kernels read through the expert maps (graph-safe), filled by copy-engine DMA from the routes of
 earlier steps; experts the pool misses fall back to the UVA path, so results stay exact. To avoid waits inside the
 graph, the pool would be double-buffered with a two-step lag (fill for step t+1 during step t from the routes of step
-t−1). A per-step route trace (0046, `B70_MOE_ROUTE_TRACE`) of 4,120 agentic decode steps with swapping off
+t−1). A per-step route trace (0046, `B70_MOE_ROUTE_TRACE`) of 4,120 decode steps (code prompts, 2 concurrent requests) with swapping off
 (`tools/bench_tp2/pool_reuse.py`, `pool_churn.py`):
 
 | pool slots per layer | lag | cold routes served by the pool |
@@ -211,8 +212,8 @@ DMA; with swapping on (the default) the leftover cold experts are rarer and the 
 (~−40K KV). Net estimate +1–4 %: not worth it. The lag is not the problem (2–3 points); the cold experts left after
 0043 seldom repeat from step to step.
 
-**154 hot experts (the alternative use of that VRAM).** KV 201,794 → 170,152; agentic coding 90.5 / 98.7 → 92.1 /
-98.5 tok/s; general prompts 57.1 → 57.9 tok/s at 1 stream, 81.4 → 84.8 at 4; prefill unchanged; 0 / 120 bad burst
+**154 hot experts (the alternative use of that VRAM).** KV 201,794 → 170,152; 2 concurrent requests (code) 90.5 / 98.7 → 92.1 /
+98.5 tok/s total; general prompts 57.1 → 57.9 tok/s at 1 stream, 81.4 → 84.8 at 4; prefill unchanged; 0 / 120 bad burst
 outputs. +1–4 %, mostly within noise, for 31.6K KV tokens: the default stays at 150 (154 is a line in
 `engines/two-cards/env/tp2-local.env.example`). Returns from more hot experts have flattened at this point.
 
@@ -220,7 +221,7 @@ outputs. +1–4 %, mostly within noise, for 31.6K KV tokens: the default stays a
 
 | item | why |
 |---|---|
-| more hot experts at the same util (144, 152), 64K context with 152 hot | cost KV (excluded: agentic coding needs the KV) |
+| more hot experts at the same util (144, 152), 64K context with 152 hot | cost KV (excluded: long coding sessions need the KV) |
 | 8,192-token prefill batches | +8–16 % prefill for half the KV; 0042 gives +50 % for none |
 | GPU power cap changes | excluded (host stability) |
 | PLE row cache 6 GiB, PLE lookahead | no gain: 99 % hits when warm, 0.1 ms bubble |
@@ -255,7 +256,7 @@ python3 tools/bench_tp2/bench_det.py                                           #
 python3 tools/bench_tp2/quality.py <tag>        # needles 32K-97K + short answers -> /work/quality-<tag>.json (diff two)
 python3 tools/bench_tp2/prefix_test.py 6000     # prefix cache: TTFT and cached tokens for a repeated 18K prompt
 python3 tools/bench_tp2/stress_mixed.py         # 3 long prefills during 2 decodes; all must be ok
-AGENT_TEMP=0 python3 tools/bench_tp2/agent_load.py 3 12 2   # agentic coding: 12 sessions x 5 turns, 2 at a time
+AGENT_TEMP=0 python3 tools/bench_tp2/agent_load.py 3 12 2   # code prompts: 12 sessions x 5 turns, 2 concurrent requests
 python3 tools/bench_tp2/burst_check.py 30       # known issue 6: 30 bursts of 4 requests, degenerate outputs
 python3 tools/bench_tp2/sim_swap.py "<dir>/r0-*.json"   # offline replay of hot-set policies (route snapshots)
 python3 tools/bench_tp2/ppl.py <tag>            # perplexity on fixed texts (code, docs, Russian) via prompt logprobs
