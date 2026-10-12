@@ -229,6 +229,5 @@ Intel's checkpoint is described in the [README](README.md#models) and [docs/weig
 | engine stays `starting` for over 15 min, or exits | read `docker compose logs engine`; check that nothing else uses the cards (the engine takes 95 % of their memory) and that `prepare` finished |
 | `No such file` for a path under `/models` | the weights are not where the engine looks: section 6 |
 | no `/dev/dri`, or `group render not found` | the GPU driver is not loaded on the host; check `ls /dev/dri` and the kernel log |
-| the whole PC resets while the engine starts, nothing logged | on our host this was CPU undervolting: weight loading is a heavy CPU and memory load. Return the CPU to stock voltage (and check EXPO/PBO settings) |
 
 More: [docs/known-issues.md](docs/known-issues.md); details and measurements: [docs/two-cards.md](docs/two-cards.md).
