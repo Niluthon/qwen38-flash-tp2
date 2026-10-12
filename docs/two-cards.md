@@ -6,7 +6,7 @@ RAM next to everything else either. `tp2-hotcold` splits them.
 
 ## Weights
 
-`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` @ `ef554143`: Intel's AutoRound target tensors (the quantization block
+[`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) @ `ef554143`: Intel's AutoRound target tensors (the quantization block
 equals `engines/serve-configs/serve-config-intel-autoround.json`) plus RadixArk's FP8 PLE table (`model-plefp8-*`, 128 shards, one
 global scale) plus an INT4-g32 MTP draft (`runtime/mtp-int4-g32`, compressed-tensors). This host runs revision
 `c6af9fee`. Three one-time steps (`docker compose run --rm prepare` downloads the checkpoint and runs all three):

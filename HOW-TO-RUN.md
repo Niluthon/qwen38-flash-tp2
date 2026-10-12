@@ -113,7 +113,7 @@ After anything that changes memory use, check the KV cache the engine reports at
 
 | path in `MODELS` | what | made by |
 |---|---|---|
-| `qwen38-w4a16/` | the checkpoint `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`, **all** files incl. `runtime/` (MTP draft, expert rankings) | download |
+| `qwen38-w4a16/` | the checkpoint [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE), **all** files incl. `runtime/` (MTP draft, expert rankings) | download |
 | `qwen38-w4a16-int8ple/ple_ngram_int8_rowscale.safetensors` | the INT8 PLE table | built from the checkpoint |
 | `qwen38-w4a16-snapshot/`, `qwen38-w4a16-mtp-snapshot/` | what the engine loads: symlinks into the checkpoint + `config.json` | made in seconds |
 
@@ -165,7 +165,7 @@ for checkpoints whose experts load through vLLM's GPTQ path: **Intel AutoRound (
 
 | checkpoint | on two cards |
 |---|---|
-| `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` | **the default**; tested |
+| [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) | **the default**; tested |
 | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` (the target tensors above, with a BF16 PLE table) | should work; **not tested on two cards** (recipe below) |
 | your own AutoRound W4A16 quant of Qwen3.8-Flash-Next | as for Intel's; same quantization format |
 | AWQ / llm-compressor (`compressed-tensors`, e.g. `wtdcode/...-AWQ-W4A16`) | **no**: the expert split does not cover this format and the experts do not fit; four cards only |
