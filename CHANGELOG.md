@@ -25,7 +25,7 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 - **0046**: per-step decode route trace, `B70_MOE_ROUTE_TRACE` (diagnostic). Used to show that a fixed VRAM pool for
   cold experts would catch only 26–29 % of cold routes (docs/two-cards.md, round 5).
 - `tp2-hotcold` defaults now: 150 hot experts, 0042 + 0043 + 0044 + 0045 on, util 0.95, 131,072-token context; KV
-  201,794 tokens; agentic coding ~90–99 tok/s. Experiments and the not-worth-it list in docs/two-cards.md; known issues item 14 (torch profiler on XPU).
+  201,794 tokens; ~90–99 tok/s total at 2 streams (code prompts). Experiments and the not-worth-it list in docs/two-cards.md; known issues item 14 (torch profiler on XPU).
 - `compose.yaml` + `engines/compose-serve.sh`: `docker compose up -d` runs the two-card engine with a warm-up service;
   local overrides in `engines/tp2-local.env` (template `.example`), host paths in `.env` (template `.env.example`).
 - `tools/bench_tp2`: `bench_det.py`, `quality.py`, `prefix_test.py`, `stress_mixed.py`, `ar_bench.py`,

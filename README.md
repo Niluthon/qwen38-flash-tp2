@@ -16,8 +16,8 @@ Both serve an OpenAI-compatible API (`/v1/chat/completions`, tool calls, reasoni
 
 Serves `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` (Intel AutoRound target + FP8 PLE table) at tensor parallel 2 +
 expert parallel 2 with MTP speculative decoding and a 131,072-token context. Experts that do not fit in VRAM live in
-host RAM, the PLE table is read from NVMe. Measured on our host: ~55–57 tok/s at one stream on general prompts,
-~90–99 tok/s on agentic coding sessions, ~3,950 tok/s prefill, 201,794 KV tokens; MMLU 87.2 %, HumanEval 158 / 164
+host RAM, the PLE table is read from NVMe. Measured on our host: decode ~55–57 tok/s at 1 stream, ~90–99 tok/s total
+at 2 streams (code prompts), ~3,950 tok/s prefill, 201,794 KV tokens; MMLU 87.2 %, HumanEval 158 / 164
 ([details](#what-the-two-card-engine-runs)).
 
 **→ Full guide: [HOW-TO-RUN.md](HOW-TO-RUN.md)** — machine check, first start, using the API, daily commands,
