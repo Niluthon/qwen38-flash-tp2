@@ -54,7 +54,7 @@ d5ef338178e824f0d2fb9447cdebda1e8f4e7ec9cd7791994083007ff1ad77c8  vllm/v1/worker
 # of 0001–0005. sha256  tag  relative-path-under-vllm/   (both roots)
 B70_FILES='
 c56577011b058f386ddc44b1b713e34a2e4086a68b2c2a6e971f82fdf0dcd1fc  B70-0028      vllm/models/qwen4_exp/nvidia/ngram_embedding.py
-04f0d01e1d88b42bac1ddc0daf5a20adb24cc1e0f35e381bc7c171bda48add34  B70-0043      vllm/models/qwen4_exp/nvidia/model_state.py
+f0a0de26055e7a346b430431012df3bf1bf4f22f0fe0aebbe8e9aa015976faba  B70-0046      vllm/models/qwen4_exp/nvidia/model_state.py
 6e3b952277dfb4beefd34491dfe19664b0d030d1cc98016b63b28859dd4fb7db  B70-0013b     vllm/models/qwen4_exp/nvidia/ple_nvme.py
 0b02bdb26b340d57869861c0570815bc68d36812a87c1b78a16960f3b20f842a  B70-0023c     vllm/v1/worker/gpu/model_runner.py
 98b50a3b6e780ecdb7deb96a1e9ca3663cc7aba9e4ffe051f97c1b14d3df0fe8  B70-0031      vllm/v1/kv_offload/cpu/gpu_worker.py
@@ -79,7 +79,7 @@ e2b41b0b066d1d9e18ca0ce4f135df46ebf0ba0084888441dba4d171d1342021  B70-0022      
 e5014b3e6f2808aa0aca6478e0c650000a0233d16b5abc9cfdf82533b1b749dc  B70-0022      vllm/v1/worker/mamba_utils.py
 6e79d4687c38aad5c26cb2eeeada4909ae60008c266993105d4e4c5ed31326ad  B70-0029      vllm/v1/worker/gpu_model_runner.py
 ab17fa440e054fe1414956d80f08b67fa733171020ebe1a67c8a6bdaab29f9d1  B70-0029b     vllm/v1/worker/gpu/sample/prompt_logprob.py
-1d0efd34a9f9e410f94d126d78404b5bed03e7fb0b9038257dd6414fb05b49c4  B70-0044      vllm/model_executor/layers/fused_moe/b70_hotcold.py
+6a11e503ebc0e3fd5f576e1349e3d3d1eb24d23f69f2733c54bd143bc944c319  B70-0046      vllm/model_executor/layers/fused_moe/b70_hotcold.py
 0f8910c7785eb36c4d366c8ad7bf4f0bac5ae5dabbb69aa972f1eba2889755a5  B70-0044      vllm/model_executor/model_loader/base_loader.py
 37d5958f41c7ff7ea4fbf5395ddf24f3c830fb3a612530d1ab0fadb426572038  B70-0045      vllm/model_executor/layers/quantization/inc/inc.py
 d9f4550fd55b7b1dd29f176b9d0a0ad3d1ed2600a9a4bab66f946d6465665dbc  B70-0045      vllm/model_executor/layers/quantization/online/fp8.py

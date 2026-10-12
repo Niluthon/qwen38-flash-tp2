@@ -187,6 +187,32 @@ sessions: the round-3 FP8 agent comparison (prompt totals 207K vs 229K) was conf
 | adaptive draft length | vLLM's adaptive verification supports only DSpark, excludes local-argmax drafting, and variable-length verify batches are the padded-graph case of known issue 6 | not applicable |
 | cold-expert prefetch at decode | a UVA-reading kernel does not overlap with compute (two-queue test), and the decode graphs cannot express copies whose source experts are chosen on the GPU each step | blocked |
 
+## Experiments, round 5 (2026-10-12): a fixed pool for cold experts at decode, and 154 hot experts
+
+**Fixed virtual pool (measured, not built).** The idea: per layer, a few VRAM slots at fixed addresses that the
+captured decode kernels read through the expert maps (graph-safe), filled by copy-engine DMA from the routes of
+earlier steps; experts the pool misses fall back to the UVA path, so results stay exact. To avoid waits inside the
+graph, the pool would be double-buffered with a two-step lag (fill for step t+1 during step t from the routes of step
+t−1). A per-step route trace (0046, `B70_MOE_ROUTE_TRACE`) of 4,120 agentic decode steps with swapping off
+(`tools/bench_tp2/pool_reuse.py`, `pool_churn.py`):
+
+| pool slots per layer | lag | cold routes served by the pool |
+|---|---|---|
+| 4 | 1 step | 29–31 % |
+| 4 | 2 steps | 26–29 % |
+| 8 | 2 steps | 41–43 % |
+
+A step needs ~4 cold experts per layer. Per step, P = 4 avoids 133 MB of stalling UVA reads (~5.8 ms) for 94 MB of
+DMA; with swapping on (the default) the leftover cold experts are rarer and the saving shrinks to ~3 ms, against
+~1–2 ms for counting routes inside the decode graph plus host work at every step boundary, and ~0.47 GiB of VRAM
+(~−40K KV). Net estimate +1–4 %: not worth it. The lag is not the problem (2–3 points); the cold experts left after
+0043 seldom repeat from step to step.
+
+**154 hot experts (the alternative use of that VRAM).** KV 201,794 → 170,152; agentic coding 90.5 / 98.7 → 92.1 /
+98.5 tok/s; general prompts 57.1 → 57.9 tok/s at 1 stream, 81.4 → 84.8 at 4; prefill unchanged; 0 / 120 bad burst
+outputs. +1–4 %, mostly within noise, for 31.6K KV tokens: the default stays at 150 (154 is a line in
+`engines/tp2-local.env.example`). Returns from more hot experts have flattened at this point.
+
 ## Excluded or not worth it (as of 2026-10-11)
 
 | item | why |
@@ -204,6 +230,8 @@ sessions: the round-3 FP8 agent comparison (prompt totals 207K vs 229K) was conf
 | draft-only reduced vocabulary | real output uses too much of the vocabulary; acceptance loss beats the saved reads |
 | adaptive draft length | DSpark-only in vLLM; conflicts with local-argmax drafting |
 | cold-expert prefetch at decode | needs data-dependent copies inside the decode graphs |
+| fixed VRAM pool for cold experts (P = 4, two-step lag) | catches 26–29 % of cold routes; ~+1–4 % net for ~0.47 GiB |
+| 154 hot experts | +1–4 % for −31.6K KV |
 | deduplicating the draft's lm_head / embed | already shared by vLLM |
 | fine-grained Mamba prefix cache | not applicable to multi-module MTP |
 | all-reduce tuning | 22 µs per call, ~2–3 ms per step |
@@ -231,6 +259,8 @@ python3 tools/bench_tp2/ppl.py <tag>            # perplexity on fixed texts (cod
 python3 tools/bench_tp2/run_eval.py <tag> 3000  # MMLU (3,000 sampled) + HumanEval completions -> /work/eval/<tag>-*.json
 docker run --rm --network none -v $WORK/eval:/eval --entrypoint /opt/venv/bin/python b70-flash-next:tp2 /eval/he_exec.py /eval/<tag>-humaneval.json
 python3 tools/bench_tp2/compare.py <tagA> <tagB>   # paired MMLU (McNemar) and HumanEval differences
+python3 tools/bench_tp2/pool_reuse.py trace-rankRANK.jsonl   # B70_MOE_ROUTE_TRACE output: pool hit rate by size/lag
+python3 tools/bench_tp2/pool_churn.py trace-rank0.jsonl      # pool DMA volume vs UVA reads avoided
 AGENT_DUMP=a.json AGENT_TEMP=0 python3 tools/bench_tp2/agent_load.py 3 12 2; python3 tools/bench_tp2/agent_judge.py a.json
 torchrun --nproc-per-node 2 tools/bench_tp2/ar_bench.py   # 2-card all-reduce latency (engine stopped; tp2 image + env)
 ```
