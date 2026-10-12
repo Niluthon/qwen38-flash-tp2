@@ -62,7 +62,7 @@ Container: `image/Dockerfile.tp2` (the official v0.30.0 XPU image by digest + ke
 ```bash
 docker compose build                  # the image (image/Dockerfile.tp2)
 docker compose run --rm prepare       # once: the weights steps above (scripts/prepare-models-tp2.sh)
-docker compose up -d                  # compose.yaml: engine + one-shot warm-up; or: MODELS=~/models WORK=~/b70-work engines/run-tp2.sh
+docker compose up -d                  # compose.yaml: engine + one-shot warm-up; or: MODELS=~/models engines/run-tp2.sh
 cp engines/tp2-local.env.example engines/tp2-local.env   # optional: local overrides (B70_* switches, EXTRA_ARGS)
 ```
 
@@ -241,7 +241,7 @@ outputs. +1–4 %, mostly within noise, for 31.6K KV tokens: the default stays a
 
 ## How to reproduce the measurements
 
-Engine: `engines/restart-tp2.sh` (detached start; wait for `[run-tp2] warm-up request OK` in `$WORK/engine.log`).
+Engine: `engines/restart-tp2.sh` (detached start; wait for `[run-tp2] warm-up request OK` in `engine-data/engine.log`).
 Client scripts in `tools/bench_tp2/`, run in any container on the host network (e.g. the dev container, with this
 repository mounted):
 
@@ -259,7 +259,7 @@ python3 tools/bench_tp2/burst_check.py 30       # known issue 6: 30 bursts of 4 
 python3 tools/bench_tp2/sim_swap.py "<dir>/r0-*.json"   # offline replay of hot-set policies (route snapshots)
 python3 tools/bench_tp2/ppl.py <tag>            # perplexity on fixed texts (code, docs, Russian) via prompt logprobs
 python3 tools/bench_tp2/run_eval.py <tag> 3000  # MMLU (3,000 sampled) + HumanEval completions -> /work/eval/<tag>-*.json
-docker run --rm --network none -v $WORK/eval:/eval --entrypoint /opt/venv/bin/python b70-flash-next:tp2 /eval/he_exec.py /eval/<tag>-humaneval.json
+docker run --rm --network none -v $PWD/engine-data/eval:/eval --entrypoint /opt/venv/bin/python b70-flash-next:tp2 /eval/he_exec.py /eval/<tag>-humaneval.json
 python3 tools/bench_tp2/compare.py <tagA> <tagB>   # paired MMLU (McNemar) and HumanEval differences
 python3 tools/bench_tp2/pool_reuse.py trace-rankRANK.jsonl   # B70_MOE_ROUTE_TRACE output: pool hit rate by size/lag
 python3 tools/bench_tp2/pool_churn.py trace-rank0.jsonl      # pool DMA volume vs UVA reads avoided

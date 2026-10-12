@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-tp2.sh [extra vllm serve flags...] — the tp2-hotcold engine (2x B70, ~64 GB RAM) in a container.
 #
-#   MODELS=~/models WORK=~/b70-work engines/run-tp2.sh
+#   MODELS=~/models engines/run-tp2.sh       # ENGINE_DATA (default: engine-data/ in the repo) = caches + log
 #
 # Same engine as `docker compose up -d` (compose.yaml), without compose. Image: image/Dockerfile.tp2 (`docker compose
 # build`; it carries the patched vLLM, the kernels and the residency shim). Environment: engines/tp2-hotcold.env; flags:
@@ -15,7 +15,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 IMAGE=${IMAGE:-b70-flash-next:tp2}
-MODELS=${MODELS:-$HOME/models}; WORK=${WORK:-$HOME/b70-work}
+MODELS=${MODELS:-$HOME/models}; WORK=${ENGINE_DATA:-${WORK:-$here/../engine-data}}
 MODEL_DIR=${MODEL_DIR:-/models/qwen38-w4a16-snapshot}
 NAME=${NAME:-b70-tp2}
 mkdir -p "$WORK"/cache/{hf,tmp,triton,vllm,xdg,ple-nvme-native}

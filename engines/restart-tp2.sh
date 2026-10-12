@@ -9,7 +9,7 @@
 # request; wait for "[run-tp2] warm-up request OK" in the log before sending long prompts (known issues item 13).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-WORK=${WORK:-$HOME/b70-work}
+WORK=${ENGINE_DATA:-${WORK:-$here/../engine-data}}
 NAME=${NAME:-b70-tp2}
 log=$WORK/engine.log
 docker rm -f "$NAME" >/dev/null 2>&1 || true

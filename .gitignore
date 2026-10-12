@@ -4,3 +4,5 @@ __pycache__/
 .env
 engines/tp2-local.env
 engines/*.local.args
+engine-data/*
+!engine-data/README.md

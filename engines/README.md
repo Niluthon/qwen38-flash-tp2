@@ -111,8 +111,8 @@ RAM when the host has the room. Details: [docs/ple-nvme.md](../docs/ple-nvme.md)
 
 `compose.yaml` at the repository root runs `tp2-hotcold`: `docker compose up -d` starts it detached, a one-shot
 `warmup` service sends the short first request once `/health` answers, `docker compose logs -f engine` follows the log
-(also in `$WORK/engine.log`), `docker compose down` stops it. Defaults come from `tp2-hotcold.env` and `serve-tp2.args`
+(also in `engine-data/engine.log`), `docker compose down` stops it. Defaults come from `tp2-hotcold.env` and `serve-tp2.args`
 (shared with `run-tp2.sh`); put local changes in `tp2-local.env` (git-ignored; template `tp2-local.env.example`):
 environment switches override the defaults, and `EXTRA_ARGS` appends `vllm serve` flags (the last value of a flag wins).
-Host paths (`MODELS`, `WORK`) and the image go in a root `.env` (template `.env.example`). `compose-serve.sh` is the
+Host paths (`MODELS`, `ENGINE_DATA`) and the image go in a root `.env` (template `.env.example`). `compose-serve.sh` is the
 services' entrypoint (`serve`, `health`, `warmup`).

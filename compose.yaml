@@ -3,7 +3,7 @@
 #   docker compose build                # build the image (downloads the base image, kernels and shim; ~20 GB)
 #   docker compose run --rm prepare     # once: download and prepare the weights (~185 GB on $MODELS)
 #   docker compose up -d                # start; the warm-up service sends one short request once the engine is healthy
-#   docker compose logs -f engine       # follow the log (also written to $WORK/engine.log)
+#   docker compose logs -f engine       # follow the log (also written to engine-data/engine.log)
 #   docker compose down                 # stop
 #
 # Tuning, without editing tracked files:
@@ -12,7 +12,7 @@
 #     `docker compose up -d` again to apply (the engine restarts).
 #   * vllm serve flags: EXTRA_ARGS in engines/tp2-local.env (appended to engines/serve-tp2.args; the last value of a
 #     flag wins), e.g. EXTRA_ARGS=--max-model-len 65536 --gpu-memory-utilization 0.92
-#   * host paths and image: MODELS, WORK, IMAGE in a .env file next to this one (see .env.example).
+#   * host paths and image: MODELS, ENGINE_DATA, IMAGE in a .env file next to this one (see .env.example).
 #
 # Image: image/Dockerfile.tp2 (official vLLM v0.30.0 XPU + the patch series + our kernels + the residency shim).
 # docs/two-cards.md has the details and the measurements.
@@ -28,7 +28,7 @@ x-engine-base: &engine-base
   working_dir: /opt/venv
   volumes:
     - ./engines:/b70-engines:ro
-    - ${WORK:-${HOME}/b70-work}:/work
+    - ${ENGINE_DATA:-${WORK:-./engine-data}}:/work
 
 services:
   engine:
@@ -47,7 +47,7 @@ services:
         required: false
     volumes:
       - ./engines:/b70-engines:ro
-      - ${WORK:-${HOME}/b70-work}:/work
+      - ${ENGINE_DATA:-${WORK:-./engine-data}}:/work
       - ${MODELS:-${HOME}/models}:/models:ro
       - /dev/dri/by-path:/dev/dri/by-path:ro   # oneCCL opens it; --device /dev/dri does not create it
     entrypoint: ["/bin/bash", "/b70-engines/compose-serve.sh", "serve"]
@@ -88,7 +88,7 @@ services:
       - ./engines:/b70-engines:ro
       - ./tools:/b70-tools:ro
       - ./scripts:/b70-scripts:ro
-      - ${WORK:-${HOME}/b70-work}:/work
+      - ${ENGINE_DATA:-${WORK:-./engine-data}}:/work
       - ${MODELS:-${HOME}/models}:/models
     entrypoint: ["/bin/bash", "/b70-scripts/prepare-models-tp2.sh"]
     restart: "no"

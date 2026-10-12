@@ -33,7 +33,7 @@ github.com, huggingface.co); serving runs offline.
 # a. get the repository (the two-card work lives here; Lumnus/b70-flash-next is the four-card upstream)
 git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 
-# b. (optional) choose where the weights go; the defaults are ~/models (weights) and ~/b70-work (caches, log)
+# b. (optional) choose where the weights go; the default is ~/models
 cp .env.example .env
 nano .env                                  # e.g. MODELS=/mnt/nvme/models
 
@@ -78,7 +78,7 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 |---|---|
 | `docker compose up -d` | start, or apply changed settings (the engine restarts) |
 | `docker compose down` | stop |
-| `docker compose logs -f engine` | follow the log (also in `$WORK/engine.log`, default `~/b70-work/engine.log`) |
+| `docker compose logs -f engine` | follow the log (also in `engine-data/engine.log`) |
 | `docker compose ps` | state; `healthy` = serving |
 | `git pull && docker compose build && docker compose up -d` | update to a newer version |
 
@@ -90,7 +90,7 @@ Keep tracked files unchanged; put your changes in git-ignored files, then run `d
 
 | file | for | start from |
 |---|---|---|
-| `.env` | host paths (`MODELS`, `WORK`), image name, `HF_TOKEN` | `.env.example` |
+| `.env` | host paths (`MODELS`, `ENGINE_DATA`), image name, `HF_TOKEN` | `.env.example` |
 | `engines/tp2-local.env` | engine switches (hot experts, PLE cache, chat defaults, ...) and `EXTRA_ARGS`, extra `vllm serve` flags | `engines/tp2-local.env.example` (each setting explained) |
 | `engines/serve-tp2.local.args` | the full flag list, when you need to **remove** a flag (`EXTRA_ARGS` can only add or override) | `cp engines/serve-tp2.args engines/serve-tp2.local.args`, then `SERVE_ARGS_FILE=/b70-engines/serve-tp2.local.args` in `engines/tp2-local.env` |
 
