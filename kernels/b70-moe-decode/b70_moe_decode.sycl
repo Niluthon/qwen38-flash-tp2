@@ -1,0 +1,310 @@
+// b70_moe_decode.sycl — decode-size (M <= 16 rows) INT4 W4A16 MoE for Arc Pro B70, hot (VRAM) + cold (pinned host,
+// UVA) experts in one pass.
+//
+// Why: at decode the stock path (vllm-xpu-kernels XpuFusedMoe, called twice: hot, then cold) costs ~56 us per call
+// before it reads a single expert byte (6 kernels; the grouped GEMM's fixed cost), i.e. ~2 x 48 x 56 us per forward.
+// This op runs three kernels for hot and cold together:
+//   up:     h[t, n]  = silu(x[m] . Wg[e, n]) * (x[m] . Wu[e, n])        (one sub-group per (expert, row block))
+//   down:   y[t, k]  = w[t] * (h[t] . W2[e, k])                           (same split)
+//   gather: out[m,k] = sum over the row's local routes j (fixed order) of y[m*TOPK + j, k]
+// t = route slot (m * TOPK + j). Each local expert is processed once per layer by the sub-groups of its first slot;
+// those cover every row routed to it, 4 rows per pass, so its weights are read from memory once (important for cold
+// experts: PCIe); further passes hit the cache.
+// Measured on one B70 (48 layers in an XPU graph, cold share 0.08, test_moe_decode.py): stock vs this op per layer
+//   1 row 150 -> 66 us, 4 rows 391 -> 241 us, 8 rows 603 -> 397 us, 16 rows 1030 -> 740 us.
+// Intermediate roundings follow the stock path (gemm1 out bf16, silu_and_mul -> bf16, gemm2 out bf16, gather fp32).
+//
+// Layouts (vllm int_wna16._process_weights_xpu + implement_zp, the same for hot and cold):
+//   w13 [E, 2N, K/2] uint8, two signed (two's complement) int4 per byte, low nibble = even k; rows [0,N) gate, [N,2N) up
+//   s13 [E, 2N, K/G] bf16;  w2 [E, K, N/2] uint8;  s2 [E, K, N/G] bf16;  G = 128
+//   hot_map / cold_map [E_global] int32: slot of a global expert in the hot / cold tensors, -1 if not there.
+#include <sycl/sycl.hpp>
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+constexpr int SG = 16;   // sub-group size
+constexpr int GS = 128;  // quant group size
+
+static inline float silu(float v) { return v / (1.f + sycl::native::exp(-v)); }
+
+struct Weights {
+  const uint8_t* w13; const bf16* s13; const uint8_t* w2; const bf16* s2;
+};
+
+// If slot s is the first slot routed to a local expert: fills slots[] with every slot routed to it (at most one per
+// row) and returns their count; 0 = nothing to do for this work-group.
+template <int MMAX>
+static inline int owner_slots(const int32_t* ids, const int32_t* hot_map, const int32_t* cold_map, int s, int S,
+                              int (&slots)[MMAX], int& hs, int& cs) {
+  const int g = ids[s];
+  if (g < 0) return 0;
+  hs = hot_map[g]; cs = cold_map[g];
+  if (hs < 0 && cs < 0) return 0;
+  for (int s2 = 0; s2 < s; ++s2) if (ids[s2] == g) return 0;
+  int nr = 0;
+  for (int t = s; t < S && nr < MMAX; ++t) if (ids[t] == g) slots[nr++] = t;
+  return nr;
+}
+
+// acc[r][m] += scale(r, group) * sum_i q(r, word, i) * act[m][word * 8 + i] over this lane's words of R rows.
+// Each weight word is dequantized once and used for all nr activation rows.
+template <int R, int MMAX, int VW>
+static inline void rows_dot(const uint32_t* const (&rows)[R], const bf16* const (&scales)[R], int words,
+                            const bf16* const (&act)[MMAX], int nr, int lane, float (&acc)[R][MMAX]) {
+  constexpr int WORDS_PER_GROUP = GS / 8;
+  for (int w0 = lane * VW; w0 < words; w0 += SG * VW) {
+    sycl::vec<uint32_t, VW> wv[R];
+    float sc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      wv[r] = *reinterpret_cast<const sycl::vec<uint32_t, VW>*>(rows[r] + w0);
+      sc[r] = (float)scales[r][w0 / WORDS_PER_GROUP];  // VW words never cross a group (16 words per group)
+    }
+#pragma unroll
+    for (int v = 0; v < VW; ++v) {
+      float q[R][8];
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const uint32_t u = wv[r][v];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) q[r][i] = (float)((int)(u << (28 - 4 * i)) >> 28);
+      }
+#pragma unroll
+      for (int m = 0; m < MMAX; ++m) {
+        if (m >= nr) break;
+        const sycl::vec<uint32_t, 4> raw = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(act[m] + (w0 + v) * 8);
+        float xf[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const uint32_t p = raw[i];
+          xf[2 * i] = sycl::bit_cast<float>(p << 16);            // bf16 -> fp32
+          xf[2 * i + 1] = sycl::bit_cast<float>(p & 0xffff0000u);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          float p = 0.f;
+#pragma unroll
+          for (int i = 0; i < 8; ++i) p += q[r][i] * xf[i];
+          acc[r][m] += sc[r] * p;
+        }
+      }
+    }
+  }
+}
+
+template <int MMAX, int R, int VW>
+struct UpKernel {
+  const bf16* x; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map;
+  Weights hot, cold; bf16* h; int M, TOPK, N, K, n_blocks;
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int wg = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
+    const int s = wg / n_blocks, nb = wg % n_blocks;
+    int all[16], hs = -1, cs = -1;
+    const int n_all = owner_slots<16>(ids, hot_map, cold_map, s, M * TOPK, all, hs, cs);
+    if (!n_all) return;
+    const Weights& W = hs >= 0 ? hot : cold;
+    const int e = hs >= 0 ? hs : cs;
+    const int words = K / 8, groups = K / GS;  // uint32 words per row, scale groups per row
+    const uint32_t* base = reinterpret_cast<const uint32_t*>(W.w13) + (size_t)e * 2 * N * words;
+    const bf16* sbase = W.s13 + (size_t)e * 2 * N * groups;
+    constexpr int H = R / 2;  // gate rows n, and their up rows n + N
+    const uint32_t* rows[R]; const bf16* srows[R];
+#pragma unroll
+    for (int r = 0; r < H; ++r) {
+      const int n = nb * H + r;
+      rows[r] = base + (size_t)n * words;             srows[r] = sbase + (size_t)n * groups;
+      rows[r + H] = base + (size_t)(n + N) * words;   srows[r + H] = sbase + (size_t)(n + N) * groups;
+    }
+    for (int c0 = 0; c0 < n_all; c0 += MMAX) {
+    const int nr = sycl::min(MMAX, n_all - c0);
+    const int* slots = all + c0;
+    const bf16* act[MMAX];
+#pragma unroll
+    for (int m = 0; m < MMAX; ++m) act[m] = x + (size_t)(slots[m < nr ? m : 0] / TOPK) * K;
+    float acc[R][MMAX];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+      for (int m = 0; m < MMAX; ++m) acc[r][m] = 0.f;
+    rows_dot<R, MMAX, VW>(rows, srows, words, act, nr, lane, acc);
+    auto sgp = it.get_sub_group();
+#pragma unroll
+    for (int r = 0; r < H; ++r)
+#pragma unroll
+      for (int m = 0; m < MMAX; ++m) {
+        if (m >= nr) break;
+        const float gv = (float)bf16(sycl::reduce_over_group(sgp, acc[r][m], sycl::plus<float>()));
+        const float uv = (float)bf16(sycl::reduce_over_group(sgp, acc[r + H][m], sycl::plus<float>()));
+        if (lane == 0) h[(size_t)slots[m] * N + nb * H + r] = bf16(silu(gv) * uv);
+      }
+    }
+  }
+};
+
+// Down projection with 4 lanes per row: a row is only N/2 = 320 B, so a whole sub-group per row spends more on
+// reductions than on loads. Each lane reads a quarter of a row with 16 B loads; 4 rows per pass, P passes.
+template <int MMAX, int P, typename WT>
+struct DownKernel {
+  const bf16* h; const WT* tw; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map;
+  Weights hot, cold; float* y; int M, TOPK, N, K, n_blocks;
+  static constexpr int LPR = 4, RPP = SG / LPR, R = RPP * P;  // lanes per row, rows per pass, rows per sub-group
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int wg = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
+    const int s = wg / n_blocks, nb = wg % n_blocks;
+    int all[16], hs = -1, cs = -1;
+    const int n_all = owner_slots<16>(ids, hot_map, cold_map, s, M * TOPK, all, hs, cs);
+    if (!n_all) return;
+    const Weights& W = hs >= 0 ? hot : cold;
+    const int e = hs >= 0 ? hs : cs;
+    const int words = N / 8, groups = N / GS, wpart = words / LPR;  // wpart words (multiple of 4) per lane
+    const uint32_t* base = reinterpret_cast<const uint32_t*>(W.w2) + (size_t)e * K * words;
+    const bf16* sbase = W.s2 + (size_t)e * K * groups;
+    const int sub = lane / LPR, part = lane % LPR;
+    for (int c0 = 0; c0 < n_all; c0 += MMAX) {
+    const int nr = sycl::min(MMAX, n_all - c0);
+    const int* slots = all + c0;
+    const bf16* act[MMAX];
+#pragma unroll
+    for (int m = 0; m < MMAX; ++m) act[m] = h + (size_t)slots[m < nr ? m : 0] * N;
+    float acc[P][MMAX];
+#pragma unroll
+    for (int p = 0; p < P; ++p)
+#pragma unroll
+      for (int m = 0; m < MMAX; ++m) acc[p][m] = 0.f;
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+      const int k = nb * R + p * RPP + sub;
+      const uint32_t* row = base + (size_t)k * words;
+      const bf16* srow = sbase + (size_t)k * groups;
+      for (int j = 0; j < wpart; j += 4) {
+        const int w0 = part * wpart + j;
+        const sycl::vec<uint32_t, 4> wv = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(row + w0);
+        const float sc = (float)srow[w0 / (GS / 8)];
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+          float q[8];
+          const uint32_t u = wv[v];
+#pragma unroll
+          for (int i = 0; i < 8; ++i) q[i] = (float)((int)(u << (28 - 4 * i)) >> 28);
+#pragma unroll
+          for (int m = 0; m < MMAX; ++m) {
+            if (m >= nr) break;
+            const sycl::vec<uint32_t, 4> raw =
+                *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(act[m] + (w0 + v) * 8);
+            float pacc = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              pacc += q[2 * i] * sycl::bit_cast<float>(raw[i] << 16);
+              pacc += q[2 * i + 1] * sycl::bit_cast<float>(raw[i] & 0xffff0000u);
+            }
+            acc[p][m] += sc * pacc;
+          }
+        }
+      }
+    }
+    auto sgp = it.get_sub_group();
+#pragma unroll
+    for (int p = 0; p < P; ++p)
+#pragma unroll
+      for (int m = 0; m < MMAX; ++m) {
+        if (m >= nr) break;
+        float v = acc[p][m];
+        v += sycl::permute_group_by_xor(sgp, v, 1);
+        v += sycl::permute_group_by_xor(sgp, v, 2);
+        if (part == 0) {
+          const int k = nb * R + p * RPP + sub;
+          y[(size_t)slots[m] * K + k] = (float)bf16(v) * (float)tw[slots[m]];
+        }
+      }
+    }
+  }
+};
+
+struct GatherKernel {
+  const float* y; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map; bf16* out;
+  int M, TOPK, K;
+  void operator()(sycl::nd_item<1> it) const {
+    const int i = it.get_global_id(0);
+    if (i >= M * K) return;
+    const int m = i / K, k = i % K;
+    float acc = 0.f;
+    for (int j = 0; j < TOPK; ++j) {
+      const int t = m * TOPK + j, g = ids[t];
+      if (g < 0 || (hot_map[g] < 0 && cold_map[g] < 0)) continue;
+      acc += y[(size_t)t * K + k];
+    }
+    out[i] = bf16(acc);
+  }
+};
+
+// One sub-group per (route slot, row block); 4 sub-groups per work-group (measured: slightly faster than 1).
+template <typename KER>
+static void launch_wg(sycl::queue& q, const KER& k, int S) {
+  const size_t total = (size_t)S * k.n_blocks;
+  const int w = (total % 4 == 0) ? 4 : 1;
+  q.parallel_for(sycl::nd_range<1>(total * SG, (size_t)SG * w), k);
+}
+
+template <int MMAX, typename WT>
+static void launch(sycl::queue& q, const torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& tw,
+                   const torch::Tensor& ids, const torch::Tensor& hot_map, const torch::Tensor& cold_map,
+                   Weights hot, Weights cold, int N) {
+  const int M = x.size(0), K = x.size(1), TOPK = ids.size(1), S = M * TOPK;
+  auto h = torch::empty({S, N}, x.options());
+  auto y = torch::empty({S, K}, x.options().dtype(torch::kFloat32));
+  auto* xp = reinterpret_cast<const bf16*>(x.data_ptr());
+  auto* idp = ids.data_ptr<int32_t>();
+  auto* hm = hot_map.data_ptr<int32_t>(); auto* cm = cold_map.data_ptr<int32_t>();
+  auto* hp = reinterpret_cast<bf16*>(h.data_ptr());
+  auto* yp = y.data_ptr<float>();
+  auto* twp = reinterpret_cast<const WT*>(tw.data_ptr());
+  launch_wg(q, UpKernel<MMAX, 4, 4>{xp, idp, hm, cm, hot, cold, hp, M, TOPK, N, K, N / 2}, S);
+  launch_wg(q, DownKernel<MMAX, 4, WT>{hp, twp, idp, hm, cm, hot, cold, yp, M, TOPK, N, K, K / 16}, S);
+  const size_t tot = (size_t)M * K, lg = 256;
+  q.parallel_for(sycl::nd_range<1>((tot + lg - 1) / lg * lg, lg),
+                 GatherKernel{yp, idp, hm, cm, reinterpret_cast<bf16*>(out.data_ptr()), M, TOPK, K});
+}
+
+static Weights wts(const torch::Tensor& w13, const torch::Tensor& s13, const torch::Tensor& w2,
+                   const torch::Tensor& s2) {
+  return {reinterpret_cast<const uint8_t*>(w13.data_ptr()), reinterpret_cast<const bf16*>(s13.data_ptr()),
+          reinterpret_cast<const uint8_t*>(w2.data_ptr()), reinterpret_cast<const bf16*>(s2.data_ptr())};
+}
+
+// out [M, K] bf16 (overwritten), x [M, K] bf16, topk_weights [M, TOPK] fp32|bf16, topk_ids [M, TOPK] int32
+void moe_decode(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, torch::Tensor topk_ids,
+                torch::Tensor hot_map, torch::Tensor cold_map,
+                torch::Tensor hot_w13, torch::Tensor hot_s13, torch::Tensor hot_w2, torch::Tensor hot_s2,
+                torch::Tensor cold_w13, torch::Tensor cold_s13, torch::Tensor cold_w2, torch::Tensor cold_s2) {
+  TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && out.scalar_type() == torch::kBFloat16, "bf16 activations");
+  TORCH_CHECK(hot_s13.scalar_type() == torch::kBFloat16 && cold_s13.scalar_type() == torch::kBFloat16, "bf16 scales");
+  TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32, "int32 topk_ids");
+  TORCH_CHECK(x.is_contiguous() && topk_ids.is_contiguous() && topk_weights.is_contiguous() && out.is_contiguous());
+  const int M = x.size(0), K = x.size(1);
+  const int N = hot_w13.size(1) / 2;
+  TORCH_CHECK(M <= 16, "decode op: at most 16 rows");
+  TORCH_CHECK(hot_w13.size(2) * 2 == K && K % GS == 0 && N % GS == 0, "shapes");
+  TORCH_CHECK((K / 8) % (SG * 4) == 0 && (N / 8) % 16 == 0 && K % 16 == 0 && N % 2 == 0, "row tiling");
+  auto& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+  Weights hot = wts(hot_w13, hot_s13, hot_w2, hot_s2), cold = wts(cold_w13, cold_s13, cold_w2, cold_s2);
+  auto go = [&](auto mmax_tag) {
+    constexpr int MM = decltype(mmax_tag)::value;
+    if (topk_weights.scalar_type() == torch::kFloat32)
+      launch<MM, float>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N);
+    else
+      launch<MM, bf16>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N);
+  };
+  // rows per pass over an expert's weights (an expert routed by more rows takes more passes, from cache):
+  // 4 measured best for 4..16 rows (8: 15-20 % slower, register pressure)
+  if (M <= 2) go(std::integral_constant<int, 2>{});
+  else go(std::integral_constant<int, 4>{});
+}
+
+TORCH_LIBRARY(b70moe, m) {
+  m.def("moe_decode(Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, Tensor hot_map, "
+        "Tensor cold_map, Tensor hot_w13, Tensor hot_s13, Tensor hot_w2, Tensor hot_s2, Tensor cold_w13, "
+        "Tensor cold_s13, Tensor cold_w2, Tensor cold_s2) -> ()");
+}
+TORCH_LIBRARY_IMPL(b70moe, XPU, m) { m.impl("moe_decode", &moe_decode); }

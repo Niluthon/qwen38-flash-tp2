@@ -55,7 +55,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
 `Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
-0040–0047 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
+0040–0048 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
 150 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
 `--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
@@ -254,6 +254,49 @@ Not tried: a third tier on NVMe for the coldest experts. The cold set already fi
 still free), NVMe reads (3–7 GB/s) are slower than the UVA path (21–23 GB/s), and the decode graphs cannot fetch from
 disk, so an expert on NVMe must never be routed while graphs run. It would free RAM, not add speed.
 
+## Experiments, round 7 (2026-10-19): where decode bandwidth goes, a fused decode MoE op and an FP8 draft head (0048)
+
+Bandwidth per component on one B70 (`tools/bench_tp2/decode_bw.py`, `moe_bw.py`; XPU graphs, random data; the
+B70 compresses constant data, which inflates GB/s). A plain 2 GiB read reaches 595 GB/s (98 % of 608).
+
+| component, decode shapes | time | of 608 GB/s |
+|---|---|---|
+| BF16 dense (GDN in_proj/out_proj, attention q/o), 4–16 rows | 30–57 µs per layer | 85–92 % |
+| BF16 lm_head shard (124,160 × 2,560) | 1.09 ms | 96 % |
+| FP8 W8A16 dense (0045) at 4–16 rows | 24–50 µs | 50–56 % (it saves VRAM, not time) |
+| small replicated layers (HC, router, shared expert) | 5–21 µs | 50–77 % (launch-bound) |
+| hot experts, stock (2 `XpuFusedMoe` calls per layer), 1 / 4 / 8 / 16 rows | 83 / 155 / 208 / 338 µs | 30 / 59 / 70 / 80 % |
+| cold experts over PCIe (UVA), 4 / 8 / 16 rows | 381 / 500 / 982 µs per layer | 20 GB/s, the PCIe limit |
+
+Dense layers already run at the memory limit. On each card the losses come from the MoE's fixed costs: each
+`XpuFusedMoe` call costs about 56 µs (6 kernels) before it reads a weight byte, and there are two calls per layer.
+The cold experts are bound by PCIe; only fewer cold reads help there (0047, more hot slots). TP 2 doubles the
+bandwidth across the two cards, but per-card fixed costs, the all-reduces and PCIe do not shrink with it.
+
+0048 adds two things:
+
+- **The fused op** (`kernels/b70-moe-decode`, `B70_MOE_DECODE_OP`) runs hot and cold experts in three kernels and
+  reads each expert once per layer. Per layer: 150 → 66 µs at 1 row, 391 → 241 µs at 4 rows, 1030 → 740 µs at 16
+  rows (cold share 0.08).
+- **The FP8 draft head** (`B70_DRAFT_HEAD_FP8`) cuts each of the three draft passes per step from 1.08 ms to 0.56 ms.
+
+Same harness as round 6; one boot each, in this order, sharing the learned state.
+
+| run | KV | 1 stream fresh | 4 streams fresh | agent #1 / #2 | 1 stream after agents | 4 streams after agents |
+|---|---|---|---|---|---|---|
+| F: image (0047) | 279,001 | 61.4 (45.5–47.9 ms/step) | 112.4 | 83.3 / 96.9 | 56.3 | 113.7 |
+| G: + op, ≤ 8 rows | 279,001 | 73.1 (37.4–41.3) | 113.2 | 105.8 / 107.2 | 68.8 | 115.9 |
+| H: G + FP8 draft head | 271,647 | 76.6 (35.5–38.1) | 112.8 | 110.3 / 116.2 | 70.9 | 113.4 |
+| **I: op ≤ 16 rows + FP8 draft head** | 271,421 | **76.6** (35.8–39.4) | **141.8** (78.2 ms/step) | **105.9 / 115.4** | 68.4 | **144.3** |
+
+- 1 stream +25 %, 4 streams +26 %, code agents +12–27 %. Acceptance is unchanged (2.2–3.6 per step in every run).
+  A sanity prompt at temp 0 answers correctly.
+- G and H show no 4-stream gain because the op was capped at 8 rows (4 streams × 4 tokens = 16). The first 16-row
+  version was slower than stock (register pressure at 16 rows per pass); 4 rows per pass, with more passes served
+  from cache, fixed it.
+- The library is not in the image (no SYCL compiler there), so both switches stay off by default:
+  `tp2-local.env.example` shows how to turn them on.
+
 ## Excluded or not worth it (as of 2026-10-11)
 
 | item | why |
@@ -341,10 +384,13 @@ Not done yet, and worth doing before relying on it:
 
 1. ~~Measure, then set the hot set from this host's traffic~~: 0041 counts routes, 0043 swaps experts as traffic changes.
 2. ~~Bigger prefill chunks~~ and ~~overlap the cold path in prefill~~: done as 0042 (prefetch into VRAM slots).
-3. **Overlap the cold path at decode.** Hot and cold run one after the other on one queue inside the decode graph;
-   issuing the cold GEMM on a second queue would hide part of the PCIe time behind the hot one.
+3. **Overlap the cold path at decode.** Hot and cold run in one fused op since 0048, but the cold reads still go
+   over PCIe at ~20 GB/s and are the largest part of a 4-stream step (round 7); splitting cold experts into their own
+   work-groups that start first would hide some of that time behind the hot experts.
 4. **CPU compute for cold experts at decode** (ktransformers style): host DRAM reads at ~60 GB/s against ~19 GB/s
    over PCIe, so a CPU int4 kernel could beat UVA reads at small batch sizes.
 5. **Read the FP8 PLE shards in place** instead of a 52.5 GB INT8 copy: the 0013 reader would need multi-file row
    offsets and an FP8 dequant path (0007 has one).
 6. **Put B70-0040 on the fork's release branch** so `make-tree.sh` for a release includes it.
+7. **Ship `libb70_moe_decode.so` with the image**: either a release asset checked by sha256 (like the kernels wheel)
+   or a build stage with oneAPI 2026.0 and torch 2.13.0+xpu. Then 0048 could be on by default.

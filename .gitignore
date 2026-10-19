@@ -7,3 +7,4 @@ engines/*/args/*.local.args
 engine-data/*
 !engine-data/README.md
 IDEAS.md
+kernels/*/build/

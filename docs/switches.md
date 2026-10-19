@@ -97,6 +97,9 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_HOTCOLD_STATE_S` | `300` | 0047 | seconds between state writes. |
 | `B70_MOE_HOTCOLD_STATE_MIN_PERIODS` | `12` | 0047 | a state with fewer active periods is ignored at boot. |
 | `B70_MOE_HOTCOLD_STATE_PRIOR` | `0.05` | 0047 | weight of the rankings-file order when the state places the hot set (tie-break for experts the state never saw). |
+| `B70_MOE_DECODE_OP` | unset (off) | 0048 | path to `libb70_moe_decode.so` (build: `kernels/b70-moe-decode/build.sh`; `1` = next to `b70_hotcold.py`): batches of at most `B70_MOE_DECODE_OP_MAX_ROWS` tokens run hot and cold experts in one fused SYCL op (3 kernels, each expert read once) instead of two `XpuFusedMoe` calls. silu without a clamp only; if the library does not load, a warning and the stock path. Not in the image (it has no SYCL compiler): put the library on the work volume, e.g. `B70_MOE_DECODE_OP=/work/libb70_moe_decode.so`. |
+| `B70_MOE_DECODE_OP_MAX_ROWS` | `16` | 0048 | largest batch (tokens) for the fused op (at most 16). |
+| `B70_DRAFT_HEAD_FP8` | unset (off) | 0048 | `1` (XPU): the MTP draft passes use an FP8 W8A16 copy of the lm_head shard (1.08 → 0.56 ms per pass); the target verifies with its BF16 head, so outputs are unchanged. +318 MB per card (KV −7,400 tokens at 262K). |
 
 ## Input embedding in host RAM (0044)
 

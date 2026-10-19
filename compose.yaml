@@ -16,7 +16,7 @@
 #   * another setup: ENGINE_ENV / ENGINE_LOCAL_ENV in .env, e.g. one card: engines/one-card/README.md
 #
 # Image: image/Dockerfile.tp2 (vLLM of release 0.30.0-b70.2 = Lumnus/vllm@v0.30.0-b70.2, the two-card patches
-# 0040-0047, kernels 0.1.14.1+b70.3, the residency shim; on the official vLLM v0.30.0 XPU image).
+# 0040-0048, kernels 0.1.14.1+b70.3, the residency shim; on the official vLLM v0.30.0 XPU image).
 # docs/two-cards.md has the details and the measurements.
 
 name: b70-flash-next

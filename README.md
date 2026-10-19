@@ -30,7 +30,7 @@ In short, on a machine with 2× B70, ~64 GB RAM, ~185 GB free on NVMe and Docker
 ```bash
 git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 cp .env.example .env               # optional: MODELS=/path/on/nvme (default ~/models)
-docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0047 + kernels + shim
+docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0048 + kernels + shim
 docker compose run --rm prepare    # once: download (~129 GB) and prepare the weights
 docker compose up -d               # serving on port 8000 after ~5 min; model name qwen38-flash-next
 ```
