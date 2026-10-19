@@ -60,7 +60,7 @@ services:
       retries: 3
       start_period: 15m   # weight loading + graph capture take ~4-5 min
     stop_grace_period: 90s
-    restart: "no"         # start by hand after a crash or reboot (`docker compose up -d`)
+    restart: "unless-stopped"         # start by hand after a crash or reboot (`docker compose up -d`)
 
   # Known issue 13: with MTP, the first request after start must be short. This runs one, then exits.
   warmup:

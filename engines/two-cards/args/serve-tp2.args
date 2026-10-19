@@ -5,8 +5,8 @@
 --tensor-parallel-size 2
 --enable-expert-parallel
 --trust-remote-code
---gpu-memory-utilization 0.95
---max-model-len 131072
+--gpu-memory-utilization 0.96
+--max-model-len 262144
 --max-num-batched-tokens 4096
 --max-num-seqs 4
 --limit-mm-per-prompt {"image":0,"video":0}
@@ -14,7 +14,7 @@
 --enable-auto-tool-choice
 --tool-call-parser qwen3_xml
 --reasoning-parser qwen3
---override-generation-config {"temperature": 0.7}
+--override-generation-config {"temperature": 0.7, "top_k": 20, "top_p": 0.8, "min_p": 0.0}
 --reasoning-config {"reasoning_end_str": "\n\nI have thought enough; time to answer.\n</think>\n\n"}
 --enable-prompt-tokens-details
 --speculative-config {"method":"mtp","num_speculative_tokens":3,"model":"/models/qwen38-w4a16-mtp-snapshot"}
