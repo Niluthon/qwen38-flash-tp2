@@ -10,7 +10,7 @@
 # + vLLM of the release 0.30.0-b70.2: fork tag Lumnus/vllm@v0.30.0-b70.2 (commit asserted; = v0.30.0 + patches
 #   0001–0032), fetched into /workspace/vllm and its vllm/ changes copied into the installed package; the build fails
 #   unless the release changes exactly the files patches/vllm/0001–0032 touch (less the two they restore, UPSTREAM)
-# + the two-card patches 0040–0046 (in no release yet) from patches/vllm/, on top; then every touched file is
+# + the two-card patches 0040–0047 (in no release yet) from patches/vllm/, on top; then every touched file is
 #   sha256-asserted against image/verify-overlay.sh ("final" set) and every touched .py compiled
 # + wu1ff's Level Zero peer-residency shim (no public source), copied from wu1ff's public image BY DIGEST and
 #   sha256-asserted; engines/two-cards/env/tp2-hotcold.env LD_PRELOADs it
@@ -46,7 +46,7 @@ ARG VLLM_REPO=https://github.com/Lumnus/vllm.git
 ARG VLLM_TAG=v0.30.0-b70.2
 ARG VLLM_COMMIT=9d79d28d7e32f33bdbd115c85d116583ce679cb6
 ARG VLLM_BASE=ced6857afa0ea7b2e3f0846a62e1394e90f15607
-ARG TP2_PATCHES="0040 0041 0042 0043 0044 0045 0046"
+ARG TP2_PATCHES="0040 0041 0042 0043 0044 0045 0046 0047"
 RUN --mount=type=bind,source=patches/vllm,target=/tmp/b70-patches \
     --mount=type=bind,source=image,target=/tmp/b70-image \
     set -eu; export LC_ALL=C; \
@@ -95,7 +95,7 @@ COPY --from=wu1ff --chmod=0644 /opt/b70-residency-shim/libl0_peer_residency_shim
 RUN echo "ae2c82f549d97393268cbd7b90dba7cf38fd00dbccae54f090b1a545e5613b3c  /opt/b70-residency-shim/libl0_peer_residency_shim.so" | sha256sum -c -
 
 LABEL org.opencontainers.image.title="b70-flash-next:tp2" \
-      org.opencontainers.image.description="vLLM 0.30.0-b70.2 (Lumnus/vllm@v0.30.0-b70.2) + two-card patches 0040-0046 + kernels 0.1.14.1+b70.3 for 2x Arc Pro B70" \
+      org.opencontainers.image.description="vLLM 0.30.0-b70.2 (Lumnus/vllm@v0.30.0-b70.2) + two-card patches 0040-0047 + kernels 0.1.14.1+b70.3 for 2x Arc Pro B70" \
       net.lumnus.vllm.release="v0.30.0-b70.2" \
       net.lumnus.vllm.commit="9d79d28d7e32f33bdbd115c85d116583ce679cb6" \
       org.opencontainers.image.source="https://github.com/Lumnus/b70-flash-next" \

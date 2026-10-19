@@ -55,7 +55,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
 `Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
-0040–0046 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
+0040–0047 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
 150 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
 `--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
@@ -216,6 +216,43 @@ DMA; with swapping on (the default) the leftover cold experts are rarer and the 
 98.5 tok/s total; general prompts 57.1 → 57.9 tok/s at 1 stream, 81.4 → 84.8 at 4; prefill unchanged; 0 / 120 bad burst
 outputs. +1–4 %, mostly within noise, for 31.6K KV tokens: the default stays at 150 (154 is a line in
 `engines/two-cards/env/tp2-local.env.example`). Returns from more hot experts have flattened at this point.
+
+## Experiments, round 6 (2026-10-19): rank experts by what decode reads (0047)
+
+The idea: rank experts by use and keep them in the tier their use deserves (VRAM ← pinned RAM). 0043 already swaps,
+but it scored experts by prompt (prefill) routes, while prefill batches ≥ 512 tokens read the whole cold set from the
+0042 slots anyway: only decode pays for a cold expert. 0047 counts the decode graphs' routes (two kernels per layer:
+`remainder` + `index_add_` from a static ones buffer, instead of four), scores by them (prefill at weight 0.1), and
+keeps a long-term ranking on the work volume that places the hot set at the next boot.
+
+Setup: 146 hot, 262,144-token context, util 0.96 (this host's settings), KV 279,001 tokens in every run (278,888 in B).
+One boot each, in this order; per boot `bench_det.py`, then `agent_load.py 3 12 2` twice (AGENT_TEMP=0, frozen
+corpus), then `bench_det.py` again (general prompts after the code sessions). Harness: `engine-data/ab/ab.sh`
+(local, not committed).
+
+| run | 1 stream, fresh (mean tok/s) | 4 streams, fresh | agent #1 / #2 (tok/s total) | 1 stream after agents | 4 streams after agents | decode cold share (agents) |
+|---|---|---|---|---|---|---|
+| A: 0043 as before | 55.3 | 98.4 | 90.5 / 94.1 | 53.8 | 69.9 | — (not counted) |
+| B: A + decode counting (scores unchanged) | 55.4 | 100.5 | 89.9 / 91.6 | 52.8 | 71.7 | 8–10 % |
+| C: 0047 decode scores, no saved state | 55.7 | 137.5 | 87.5 / 99.5 | 54.2 | 114.5 | 6–8 % |
+| **D: C + the state C saved (the default now)** | **60.7** | 110.6 | 86.6 / **100.2** | 55.3 | **113.2** | 6–8 % |
+| E: D's settings from the rebuilt image (0047 baked in, no overrides; KV 279,114) | 62.7 | 110.6 | 91.6 / 98.4 | 57.0 | 120.8 | — |
+
+- Counting inside the decode graphs costs nothing measurable now: ms/step A 49.5 / 59.3 / 46.9 / 44.9 vs B 49.5 / 59.1 /
+  47.9 / 45.5 on the four fixed prompts.
+- With prefill scores the hot set follows the prompts: after the code sessions, general prose decodes with 17–34 %
+  cold routes (B) and 4 streams drop to 70 tok/s; with decode scores 12–13 % and 113–115 tok/s.
+- In the code sessions themselves: decode cold share 8–10 → 6–8 %, the adapted run 94.1 → 99.5–100.2 tok/s (+6 %). The
+  first run of each boot (cold prefix cache, mostly prefill) is within noise (86.6–90.5).
+- The saved state makes the first requests after a restart faster: 1 stream fresh 55.3 → 60.7 tok/s (the code prompt
+  58.6 → 75.8). It is ranked by this host's traffic, so it also carries its bias (here: code); 0043/0047 keep adapting.
+- Swap rounds grow with decode scores (~8,300 swaps per rank in 13 minutes in C; 15–40 ms per round every 5 s,
+  ≤ 0.8 % of the time).
+- Prefill cold share rises (7 → 9–10 %): expected and harmless with 0042 for batches ≥ 512 tokens.
+
+Not tried: a third tier on NVMe for the coldest experts. The cold set already fits in RAM (~15 GiB per rank, ~16 GiB
+still free), NVMe reads (3–7 GB/s) are slower than the UVA path (21–23 GB/s), and the decode graphs cannot fetch from
+disk, so an expert on NVMe must never be routed while graphs run. It would free RAM, not add speed.
 
 ## Excluded or not worth it (as of 2026-10-11)
 

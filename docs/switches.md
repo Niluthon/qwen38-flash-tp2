@@ -81,7 +81,7 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_HOTCOLD_MEMLOG` | unset (off) | 0040 | `1`: log torch allocated / reserved and device free memory after every layer's split (otherwise every 12th layer). |
 | `B70_MOE_COLD_PREFETCH` | unset (off) | 0042 | `1`: batches with at least `B70_MOE_COLD_PREFETCH_MIN_TOKENS` tokens (prefill) run the cold experts from two VRAM slots instead of UVA reads; layer L+1's cold experts are DMA'd on a copy stream while layer L computes. Same kernel and bytes (outputs unchanged). Costs two layers' cold experts of VRAM (0.53 GiB per card at 136–144 hot). On 2× B70: prefill ~2,600 → ~3,950 tok/s. |
 | `B70_MOE_COLD_PREFETCH_MIN_TOKENS` | `512` | 0042 | smallest batch that uses the slots (min 64); smaller batches, and every decode graph (capture sizes ≤ 16), keep the UVA path. |
-| `B70_MOE_ROUTE_COUNT` | unset (off) | 0041, 0043 | `prefill`: count routes per (layer, global expert) in eager batches (prefill, mixed) only, nothing added to the decode graphs; `1`: also inside the decode graphs (~4 % decode cost; for measurements). Log line per period: the share of this rank's prefill and decode routes served by cold experts. Eager counting starts with the first real batch (the profiling run, and so the KV size, is unchanged). |
+| `B70_MOE_ROUTE_COUNT` | unset (off) | 0041, 0043, 0047 | `prefill`: count routes per (layer, global expert) in eager batches (prefill, mixed) only, nothing added to the decode graphs; `1`: also inside the decode graphs (two kernels per layer since 0047, cost within noise; four before, ~4 %). Log line per period: the share of this rank's prefill and decode routes served by cold experts. Eager counting starts with the first real batch (the profiling run, and so the KV size, is unchanged). |
 | `B70_MOE_ROUTE_COUNT_S` | `60` | 0041 | period of the log line / dump, seconds (read on the host after the per-step sync of the NVMe PLE path, so it needs `B70_PLE_INT8_NVME=1`). |
 | `B70_MOE_ROUTE_COUNT_PATH` | unset | 0041 | write cumulative counts to `<path>-rank<r>.json` (`{"<layer>": [count per global expert]}`), the input for re-ranking. |
 | `B70_MOE_ROUTE_TRACE` | unset | 0046 | with `B70_MOE_ROUTE_COUNT=1`: write `<path>-rank<r>.jsonl`, the cold set per layer and then one line per decode step with the experts each layer routed to. A diagnostic for expert-cache studies (`tools/bench_tp2/pool_reuse.py`). |
@@ -90,6 +90,13 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_HOTCOLD_SWAP_DECAY` | `0.95` | 0043 | per-period decay of the scores (half-life ~70 s at 5 s). |
 | `B70_MOE_HOTCOLD_SWAP_PRIOR` | `0.01` | 0044 | weight of the rankings-file order in the score (0.05 before 0044; an offline replay of route traces from code prompts at 2 concurrent requests preferred 0.005–0.01). |
 | `B70_MOE_HOTCOLD_SWAP_BUDGET` | `8` (`4` in 0043) | 0043, 0044 | most swaps per layer and period; a swap needs the cold score to beat the hot one by 10 %. |
+| `B70_MOE_HOTCOLD_SWAP_SOURCE` | `prefill` | 0047 | what the swap scores count: `prefill` = eager-batch routes (0043); `decode` = the decode graphs' routes (needs `B70_MOE_ROUTE_COUNT=1`, else falls back to `prefill` with a warning) plus `B70_MOE_HOTCOLD_SWAP_PREFILL_W` x the prefill routes, each normalised per layer and period. Prefill batches ≥ 512 tokens read all cold experts from the 0042 slots, so only decode pays for a cold expert. Two-card default: `decode`. |
+| `B70_MOE_HOTCOLD_SWAP_PREFILL_W` | `0.1` | 0047 | weight of the prefill routes with `SOURCE=decode`. |
+| `B70_MOE_HOTCOLD_STATE` | unset (off) | 0047 | `<prefix>`: keep a long-term score per expert and write it to `<prefix>-rank<r>.json`; at boot, a state with enough periods places the hot set (instead of the rankings file alone) and seeds the swap scores. Two-card default: `/work/hotcold-state`. Delete the files to start from the checkpoint's ranking again. |
+| `B70_MOE_HOTCOLD_STATE_DECAY` | `0.999` | 0047 | long-term decay per active swap period (idle time does not count; half-life ~58 min of traffic at 5 s). |
+| `B70_MOE_HOTCOLD_STATE_S` | `300` | 0047 | seconds between state writes. |
+| `B70_MOE_HOTCOLD_STATE_MIN_PERIODS` | `12` | 0047 | a state with fewer active periods is ignored at boot. |
+| `B70_MOE_HOTCOLD_STATE_PRIOR` | `0.05` | 0047 | weight of the rankings-file order when the state places the hot set (tie-break for experts the state never saw). |
 
 ## Input embedding in host RAM (0044)
 
