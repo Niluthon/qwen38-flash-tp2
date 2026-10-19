@@ -12,6 +12,8 @@
 #   unless the release changes exactly the files patches/vllm/0001–0032 touch (less the two they restore, UPSTREAM)
 # + the two-card patches 0040–0048 (in no release yet) from patches/vllm/, on top; then every touched file is
 #   sha256-asserted against image/verify-overlay.sh ("final" set) and every touched .py compiled
+# + libb70_moe_decode.so (patch 0048's fused decode MoE op), compiled in stage b70moe from kernels/b70-moe-decode with
+#   icpx 2026.0 from Intel's apt repository
 # + wu1ff's Level Zero peer-residency shim (no public source), copied from wu1ff's public image BY DIGEST and
 #   sha256-asserted; engines/two-cards/env/tp2-hotcold.env LD_PRELOADs it
 #
@@ -23,6 +25,29 @@ ARG BASE_IMAGE=docker.io/vllm/vllm-openai-xpu:v0.30.0@sha256:fc0e112afb64e3a06fe
 ARG WU1FF_IMAGE=ghcr.io/wu1ff/qwen38-flashnext-b70:1.0.0@sha256:85512b52c09fa660a2e7fe441417129e7c47fac727fd85f66ccea6b65e0a9122
 
 FROM ${WU1FF_IMAGE} AS wu1ff
+
+# b70moe: the fused hot+cold decode MoE op of patch 0048 (kernels/b70-moe-decode), compiled against this image's
+# torch with icpx 2026.0 (= its SYCL runtime, intel-sycl-rt 2026.0.0) from Intel's apt repository (key sha256
+# asserted, package version pinned); ocloc for the AOT bmg target is in the base image. Only the .so is kept.
+FROM ${BASE_IMAGE} AS b70moe
+ARG ONEAPI_KEY_URL=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+ARG ONEAPI_KEY_SHA256=db932ba032a71f732dc415eef5f4f185fc7ae768487d7a357bc2772746b6c48c
+ARG ONEAPI_COMPILER=intel-oneapi-compiler-dpcpp-cpp-2026.0=2026.0.0-947
+RUN set -eu; \
+    /opt/venv/bin/python -I -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+      "${ONEAPI_KEY_URL}" /tmp/oneapi.pub; \
+    echo "${ONEAPI_KEY_SHA256}  /tmp/oneapi.pub" | sha256sum -c -; \
+    gpg --dearmor < /tmp/oneapi.pub > /usr/share/keyrings/oneapi-archive-keyring.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+      > /etc/apt/sources.list.d/oneapi.list; \
+    apt-get update -q; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${ONEAPI_COMPILER}"; \
+    rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,source=kernels/b70-moe-decode,target=/src \
+    set -eu; \
+    set +u; . /opt/intel/oneapi/setvars.sh --force >/dev/null; set -u; \
+    icpx --version | head -1; \
+    bash /src/compile.sh /src /out/libb70_moe_decode.so /opt/venv/bin/python
 
 FROM ${BASE_IMAGE}
 
@@ -88,6 +113,12 @@ RUN --mount=type=bind,source=patches/vllm,target=/tmp/b70-patches \
     cd "$site"; \
     PYTHONDONTWRITEBYTECODE=1 /opt/venv/bin/python -c 'import sys; [compile(open(f, "rb").read(), f, "exec") for f in sys.argv[1:]]; print("compiled", len(sys.argv) - 1, "files")' \
       $(for p in /tmp/b70-patches/*.patch; do sed -n 's#^+++ b/\(vllm/[^[:space:]]*\.py\).*#\1#p' "$p"; done | sort -u)
+
+# 0048's fused decode MoE op (stage b70moe), next to b70_hotcold.py: B70_MOE_DECODE_OP=1 loads it. Loading it here
+# checks that it links against this image's torch and SYCL runtime (no GPU needed).
+COPY --from=b70moe --chmod=0755 /out/libb70_moe_decode.so \
+     /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/libb70_moe_decode.so
+RUN /opt/venv/bin/python -c "import torch; torch.ops.load_library('/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/libb70_moe_decode.so'); print('b70moe op:', torch.ops.b70moe.moe_decode)"
 
 # P7 — Level Zero peer-residency shim (without it Level Zero mirrors device memory into host RAM). wu1ff layer
 # sha256:512b136c0deacc7459daf8226f7ce8143a14a782070f4fa6312c0e7185e60401.

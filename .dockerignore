@@ -4,3 +4,4 @@ docs
 tools
 engines
 engine-data
+kernels/*/build

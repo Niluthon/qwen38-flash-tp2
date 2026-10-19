@@ -4,15 +4,18 @@ One SYCL op, `torch.ops.b70moe.moe_decode`, for batches of at most 16 tokens. It
 the cold experts (pinned host RAM, read over PCIe through UVA) together in three kernels: up projection with
 silu·mul, down projection with the route weight, then a gather. Each expert's weights are read once per layer. The
 stock path makes two `XpuFusedMoe` calls per layer, and each call costs about 56 µs before it reads any weight byte.
-Patch 0048 calls this op when `B70_MOE_DECODE_OP` is set (docs/switches.md).
+Patch 0048 calls this op when `B70_MOE_DECODE_OP` is set (docs/switches.md); the two-card engine sets it to `1`.
+
+The image builds the library itself: stage `b70moe` of `image/Dockerfile.tp2` installs icpx 2026.0 (the runtime's
+SYCL version) from Intel's apt repository and runs `compile.sh` against the image's torch. For development without a
+rebuild:
 
     kernels/b70-moe-decode/build.sh     # -> build/libb70_moe_decode.so
     cp kernels/b70-moe-decode/build/libb70_moe_decode.so engine-data/
     # engines/two-cards/env/tp2-local.env:  B70_MOE_DECODE_OP=/work/libb70_moe_decode.so
 
-`build.sh` needs a compile image that has oneAPI 2026.0 (icpx) and torch 2.13.0+xpu, the runtime's versions. Name it
-with `COMPILE_IMAGE`; the default is `k8v4-compile-2026:latest`. The engine image has no SYCL compiler, so the
-library is not baked in.
+`build.sh` runs `compile.sh` in a container that has oneAPI 2026.0 and torch 2.13.0+xpu (`COMPILE_IMAGE`, default
+`k8v4-compile-2026:latest`; `COMPILE_SETVARS` = its setvars.sh).
 
 Check correctness and timing on one card. The script compares against the stock path, runs 48 layers in an XPU
 graph, and takes the cold share as its argument:

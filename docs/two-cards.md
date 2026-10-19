@@ -294,8 +294,8 @@ Same harness as round 6; one boot each, in this order, sharing the learned state
 - G and H show no 4-stream gain because the op was capped at 8 rows (4 streams × 4 tokens = 16). The first 16-row
   version was slower than stock (register pressure at 16 rows per pass); 4 rows per pass, with more passes served
   from cache, fixed it.
-- The library is not in the image (no SYCL compiler there), so both switches stay off by default:
-  `tp2-local.env.example` shows how to turn them on.
+- Both are on by default in `tp2-hotcold.env` (I's settings). The image compiles the op itself in a builder stage
+  (icpx 2026.0 from Intel's apt repository, against the image's torch), so nothing is prepared on the host.
 
 ## Excluded or not worth it (as of 2026-10-11)
 
@@ -392,5 +392,3 @@ Not done yet, and worth doing before relying on it:
 5. **Read the FP8 PLE shards in place** instead of a 52.5 GB INT8 copy: the 0013 reader would need multi-file row
    offsets and an FP8 dequant path (0007 has one).
 6. **Put B70-0040 on the fork's release branch** so `make-tree.sh` for a release includes it.
-7. **Ship `libb70_moe_decode.so` with the image**: either a release asset checked by sha256 (like the kernels wheel)
-   or a build stage with oneAPI 2026.0 and torch 2.13.0+xpu. Then 0048 could be on by default.
