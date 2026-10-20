@@ -1,6 +1,6 @@
 # Two cards and ~64 GB of RAM: hot/cold experts (patch 0040) and the `tp2-hotcold` engine
 
-The 4-card recipe keeps every routed expert in VRAM and the INT8 PLE table on NVMe. On 2× Arc Pro B70 (2 × 32 GB) the
+The four-card setup ([Lumnus/b70-flash-next](https://github.com/Lumnus/b70-flash-next), not part of this repository) keeps every routed expert in VRAM. On 2× Arc Pro B70 (2 × 32 GB) the
 routed experts alone are 58 GiB, so they cannot all live in VRAM; with 61 GiB of host RAM they cannot all live pinned in
 RAM next to everything else either. `tp2-hotcold` splits them.
 
@@ -82,6 +82,9 @@ check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 2
 
 ## Measured (2× B70, 61 GiB RAM, compute-runtime as installed, 2026-10-10/11; single runs, ±10 % noise)
 
+The first measurements of the engine, kept for the record; the rounds below change the settings. The speed of the
+current build is in the README, "Speed of the current build" (round 10, run P).
+
 ### Units in the experiment tables
 
 Every speed table below follows one schema. Each header names the unit; cells are bare numbers.
@@ -92,7 +95,8 @@ Every speed table below follows one schema. Each header names the unit; cells ar
   time is given it is **ms/step** of the whole batch.
 - **agents** — `agent_load.py 3 12 2`: 12 coding-agent sessions at **2 concurrent requests** (temperature 0, frozen
   corpus). **tok/s** = all generated tokens over wall time, i.e. the total across the 2 concurrent requests.
-- **KV tokens** — the XPU KV cache size from the boot log, per card. Higher = more context per request.
+- **KV tokens** — the XPU KV cache size from the boot log: the token pool shared by all requests (each card stores
+  its half of the attention heads for every token; one number for the engine, not per card). Higher = more context.
 - **decode cold share** — the share of decode routes that hit cold experts (logged by `B70_MOE_ROUTE_COUNT`); lower
   is faster because cold experts come over PCIe.
 - **fresh / after agents** — measured right after boot, and again after the two code-agent sessions (the hot set
@@ -372,9 +376,9 @@ that falls back to the GPU path, and the CPU's partial sums added in the gather.
 One-card microbench, µs per layer (48 layers in an XPU graph, cold share 0.08); the CPU path uses 8 threads on one
 CCD, at the given share of the cold experts:
 
-| rows (tokens) | GPU only | + CPU, 30 % | + CPU, 70 % (default) | + CPU, 100 % |
+| rows (tokens) | GPU only, µs/layer | + CPU 30 %, µs/layer | + CPU 70 % (default), µs/layer | + CPU 100 %, µs/layer |
 |---|---|---|---|---|
-| 1 | 66 µs | 63 | 48 | 45 |
+| 1 | 66 | 63 | 48 | 45 |
 | 4 | 226 | 190 | 142 | 143 |
 | 8 | 353 | 262 | 204 | 211 |
 | 16 | 638 | 477 | 343 | 359 |
@@ -405,6 +409,14 @@ the wait work-group computes the experts itself, and the plan switches the path 
 Not tried: overlap the next layer's CPU work behind the current one (the mailbox scheme is per layer; the CPU is
 busy ~100–150 µs of a ~260 µs layer), and per-layer lookahead needs the next layer's routing, which decode cannot
 know. 0043's swaps still move cold experts between RAM tiers; the CPU pool reads whatever is pinned.
+
+Re-check with the revised 0049 (per-rank log line, `B70_MOE_CPU` from the host's `.env`/shell via Compose), rebuilt
+image, one boot each, `bench_det.py`, 2026-10-20 (KV 271,308 tokens both):
+
+| run | 1 stream ms/step (the 4 prompts) | 1 stream tok/s (the 4 prompts) | 4 streams tok/s · ms/step |
+|---|---|---|---|
+| `B70_MOE_CPU=0 docker compose up -d` (log: `CPU path off (B70_MOE_CPU=0)` on both ranks) | 40.1 / 35.7 / 38.8 / 36.7 | 67.0 / 97.5 / 57.5 / 79.5 | 142.1 · 75.1 |
+| default (log: `CPU path on`, cores 0 and 8) | 33.9 / 31.4 / 32.1 / 31.6 | 77.7 / 109.0 / 72.0 / 96.0 | 180.2 · 62.1 |
 
 ## Round 10 (2026-10-20): the PLE table from the checkpoint's FP8 shards (item 5, 0050)
 
@@ -472,6 +484,151 @@ vs 134–190 s), with no effect on step time. Rollback image: `b70-flash-next:tp
 set the INT8 lines from `tp2-local.env.example`, otherwise `B70_PLE_FP8=1` pins the whole FP8 table, ~24 GiB per rank).
 The INT8 table in `/models/qwen38-w4a16-int8ple` (52.5 GB) is no longer read; delete it to free the space, or keep
 it for the fallback.
+
+## Round 11 (2026-10-20): spike, what would all experts in VRAM buy at decode? (3-bit experts idea)
+
+Idea (from Paiton's Qwen3.8-Flash-Next W3A8 release on 2× R9700): store the routed experts at ~3.1 bits per weight so
+all 256 per rank fit in VRAM (~22 GiB per card instead of ~18.3 GiB for 146 int4 hot experts), and drop the cold path.
+Before quantizing anything, measure the best case: the decode MoE op with every expert resident vs today's layout.
+
+`tools/bench_tp2/allvram_spike.py` runs the image's `b70moe.moe_decode` (0048/0049) on 32 layers in one XPU graph,
+random int4 data, scaled to 48 layers; engine stopped. Routing: half of the 10 picks on this rank, decode cold share
+0.10 (the engine logs 0.085–0.12). A = 146 hot, cold over PCIe only; B = A + the 0049 CPU path at 70 % (today's
+default); C = 255 hot, never-routed dummy cold expert (all resident, int4). B on both cards at once = two
+processes, CPU pools on cores 0 and 8, as in the engine (range over three passes).
+
+MoE time for 48 layers per forward, ms:
+
+| rows (tokens) | A: hot/cold, GPU only, ms | B: today (CPU path), one card, ms | B: today, both cards at once, ms | C: all in VRAM, int4, ms |
+|---|---|---|---|---|
+| 1 | 3.46 | 2.34 | 2.33–2.79 | 2.04 |
+| 2 | 7.03 | 4.34 | – | 3.37 |
+| 4 | 9.78 | 6.37 | 6.69–7.86 | 5.72 |
+| 8 | 19.48 | 10.00 | 12.43–13.58 | 10.08 |
+| 16 | 38.34 | 18.03 | 24.45–25.74 | 17.50 |
+
+What that means for the engine (1 stream ≈ 4 rows per target forward at ~32–36 ms/step; 4 streams ≈ 16 rows at
+~61 ms/step): all-resident int4 saves ~1–2 ms/step at 1 stream (3–6 %) and ~7–8 ms/step at 4 streams (~12 %). At
+3.1 bits the expert bytes shrink by ~24 %; if C were fully bandwidth-bound that is another ~1.4 ms at 4 rows and
+~4 ms at 16 rows, i.e. best case ~3 ms/step (~9 %) at 1 stream and ~11 ms/step (~18 %) at 4 streams. Costs: KV
+271K → ~140–150K tokens per card (max context ~128K instead of 262K), a full re-quantization of 121B routed
+parameters with a quality risk (Paiton lists early reply endings in agent sessions past ~30K tokens for its 3-bit),
+an int3 decode kernel and a prefill path.
+
+Verdict: the 0049 CPU path already hides most of the cold cost; all-VRAM 3-bit experts are not worth half the KV for
+1-stream decode. MoE is only ~7 ms of a ~33 ms 1-stream step: the other ~26 ms (dense/GDN layers, all-reduces,
+three draft passes, lm_head, sampling, host) is where Paiton's ~13 ms/step (216 tok/s at ~2.9 tokens per update)
+differs from ours. Next: a per-component breakdown of the non-MoE step. Prefill (Paiton ~8,200 tok/s vs our ~4,000,
+no cold prefetch when all is resident) was not measured here.
+
+Correction from the step trace below: inside the engine the decode op takes 9.3–9.9 ms per 1-stream step and
+25.0–26.3 ms per 4-stream step, more than the microbench's B column (random uniform routing, no engine around it).
+Against C that puts the all-resident int4 saving at up to ~4 ms/step at 1 stream (~12 %) and ~8 ms/step at 4
+streams (~15 %), int3 somewhat more. The verdict stands (half the KV, re-quantization, quality risk), but the
+saving is ~2× what the microbench alone suggested.
+
+### Where a decode step goes (step trace, kernels/b70-step-trace)
+
+`kernels/b70-step-trace`: host-stamped marks at every module boundary (depth 2 below a decoder layer) and around
+every all-reduce, captured into the decode graphs of the running two-card engine (the dev tree with the trace patch,
+otherwise today's defaults). Load: `bench_det.py 400` (1 stream = 4 tokens per target forward with MTP 3; 4 streams
+= 16). 596 one-stream and 120 four-stream steps per rank; medians for the step parts, means for the modules. The
+marks add +1.5–2 ms per step (bench_det 34.4–37.7 vs 32.6–36.0 ms/step without), about 1.35 µs inside each module's
+time. Ranks agree within 0.6 ms per category; the table shows rank 0 (rank 1 in brackets where it differs by
+more than 0.2 ms).
+
+ms per step:
+
+| part of the step | 1 stream (T = 4), ms/step | 4 streams (T = 16), ms/step |
+|---|---|---|
+| step period (target begin to next target begin) | 34.2 | 54.9 (55.2) |
+| target forward | 27.9 | 47.0 |
+| · MoE routed experts: decode op (0048/0049) | 9.9 (9.3) | 26.3 (25.0) |
+| · hyper-connections (4 small replicated GEMMs + mix/combine per layer) | 5.4 | 6.2 (6.4) |
+| · linear attention (GDN): projections, conv, recurrence (36 layers) | 3.6 | 5.4 |
+| · all-reduces (97 per forward, incl. waiting for the other card) | 2.8 (3.2) | 4.3 (5.4) |
+| · MoE glue: top-k routing, route counting (0047), modular-kernel wrapper | 2.4 | 2.2 |
+| · MoE router GEMM + shared expert + shared gate | 2.3 | 2.5 (2.6) |
+| · full attention: qkv/o, rope, attention (12 layers) | 2.0 | 2.7 |
+| · PLE, embedding, final mixer | 0.3 | 0.4 (+3.0 mean outliers) |
+| target lm_head + sampling + rejection (unmarked, between target and drafts) | 1.3 | 1.5 |
+| 3 draft passes | 3.9 | 4.5 |
+| · of which the FP8 draft lm_head | 1.7 | 1.8 |
+| after the drafts, before the next target (draft sampling, input prep, host) | 1.1 | 1.4 (1.5) |
+
+What it says (1 stream):
+
+- MoE decode op 9.6 ms is a third of the step; the cold path costs ~4 ms of it against all-resident (C, 5.7 ms).
+- Hyper-connections are the second-largest item: 5.4 ms (but see the next section: the fusable part is ~3.8 ms and
+  the oneDNN up GEMM is already at 77 % of bandwidth; measured best case ~0.85 ms per step).
+- MoE glue 2.4 ms (top-k 0.66, route counting + id conversion ~0.8, wrappers ~0.65): ~50 µs per layer of small
+  kernels around the op; folding top-k and counting into the op's plan kernel is worth up to ~2 ms (~6 %).
+- All-reduces 2.8–3.2 ms (~30 µs each incl. skew); GDN, attention, router/shared: 7.9 ms together.
+- Outside the target forward: 6.3 ms (lm_head + sampling 1.3, drafts 3.9, host 1.1).
+
+### Fused hyper-connection kernels (kernels/b70-hc): measured, gain too small so far
+
+The 5.4 ms "hyper-connections" row above overstates what a fused kernel can win: it also holds the combine+RMSNorm
+kernel, the per-layer glue and ~0.5 ms of trace marks. Measured alone (`kernels/b70-hc/test_hc.py`, one B70, 96
+sites with distinct weights in one XPU graph), the stock path after combine+norm is:
+
+| µs per site | M = 1 | M = 4 | M = 8 | M = 16 |
+|---|---|---|---|---|
+| stock total: down GEMM + silu + up GEMM + gate-mix | 37.1 | 39.4 | 39.2 | 39.7 |
+| · oneDNN down GEMM (10,240 → 336, 6.9 MB) | 19.5 | 21.4 | 21.1 | 21.2 |
+| · Triton silu | 0.9 | 0.8 | 0.8 | 0.9 |
+| · oneDNN up GEMM (320 → 10,240, 6.5 MB) | 13.6 | 13.9 | 14.3 | 14.9 |
+| · Triton gate-mix | 1.0 | 1.1 | 1.1 | 1.2 |
+| b70hc down + silu (one kernel) | 16.4 | 16.5 | 18.5 | 29.2 |
+| b70hc up + sigmoid + mix (best of 3 designs) | 23.8 | 31.0 | 42.1 | 66.8 |
+| hybrid: b70hc down+silu, oneDNN up, Triton mix | 32.2 | 32.4 | 34.4 | 45.4 |
+
+Bandwidth floor of a site: 13.4 MB at 595 GB/s = 22.5 µs. The oneDNN up GEMM already runs at 77 %; the down GEMM
+at 54 % is the only real loss. Numerics of b70hc match the stock path: down ≤ 2 ulp (99.8–100 % identical), outputs
+bit-identical at most shapes, max rel L2 1.4e-4, on real layer-5 weights.
+
+Best case from here: a down kernel at ~13 µs for every M ≤ 16 with the stock up GEMM and gate-mix, ~9 µs per site,
+i.e. ~0.85 ms per step (~2.5 % at 1 stream, ~1.5 % at 4 streams); a full fusion adds at most ~0.3 ms. The hybrid as
+it stands wins 0.67 ms per step at M = 4 and loses at M = 16. Verdict: below the 3 % noise threshold; not wired into
+the engine. Kept on the branch (kernels/b70-hc) in case the down kernel is improved for M = 16.
+
+### MoE glue into the decode op's library (0051, `B70_MOE_GLUE=1`): exact, ~1.5 %, opt-in
+
+Op-level marks (step trace with `B70_STEP_TRACE_OPS` on the MoE block and the runner) split the 2.4 ms "MoE glue"
+row into real kernels. Measured alone (`tools/bench_tp2/moe_glue_bench.py`, 48 per graph, one B70), µs per layer:
+
+| kernel | M = 1, µs/layer | M = 4, µs/layer | M = 16, µs/layer |
+|---|---|---|---|
+| router GEMM (2560 → 512, bf16) | 8.4 | 8.3 | 8.1 |
+| `_moe_C.topk_softmax` | 11.9 | 11.8 | 11.9 |
+| route count (0047): remainder + `index_add_` | 4.1 | 12.4 | 6.0 |
+| a trivial kernel (fill) | 0.9 | 0.9 | 0.8 |
+
+0051 moves the last two into `libb70_moe_decode.so`:
+
+- `moe_decode_counted`: the 0047 count done by the op's plan kernel (one atomic per route slot), two kernels fewer
+  per layer. Counts and outputs identical to moe_decode + remainder/index_add_ (test_glue.py).
+- `topk_softmax`: one 64-wide work-group per row, 6.3 µs vs 11.9. Ids identical to the stock op on 1,860 rows
+  (random, router-like, tie-heavy, padding rows), weights within 7 fp32 ulp; degenerate rows (any NaN or +inf
+  logit, or all -inf) give the stock XPU result: ids 0, NaN weights. That case is real: the memory-profiling run
+  feeds NaN logits, and the first version wrote id 0x7fffffff there, which faulted the next kernel (DEVICE_LOST at
+  boot). The test keeps that case. A packed 64-bit argmax key was slower (11.4 µs: 64-bit group max is emulated).
+
+Two cards, one boot each, dev tree with the 0051 library (Q = switch off = today's path, R = on); bench_det ms/step
+(the 4 prompts), two runs each:
+
+| run | KV tokens | 1 stream ms/step, run 1 | 1 stream ms/step, run 2 | 4 streams ms/step (run 1 / 2) | agents tok/s (2 concurrent) | prefill tok/s (3K / 12K / 30K) |
+|---|---|---|---|---|---|---|
+| Q: glue off | 271,308 | 34.4 / 31.9 / 32.5 / 31.4 | 37.1 / 31.2 / 36.6 / 30.9 | 62.8 / 60.7 | 120.2 / 136.2 | 3,995 / 4,129 / 3,980 |
+| R: glue on | 271,195 | 34.7 / 31.4 / 33.0 / 32.0 | 34.4 / 30.3 / 35.3 / 30.8 | 61.7 / 60.1 | 121.2 / 121.4 | 4,027 / 4,157 / 3,980 |
+
+Perplexity (four fixed texts, two passes): Q 5.321–5.328 / 3.926–3.951 / 7.259 / 5.390, R 5.327–5.351 / 3.941–3.949 /
+7.225 / 5.348: within ±0.8 % (the ±1 % gate passes).
+
+Verdict: works and is exact where it should be; the gain is what the microbench predicts (~0.85 ms per 1-stream
+step: 5.6 µs top-k + ~12 µs count per layer) and lands at ~0.5–0.85 ms (≈1.5 %) in bench_det, inside the single-run
+noise. Opt-in, not in the image's patch list: the vLLM side is `kernels/b70-moe-decode/vllm-0051-moe-glue.patch`
+(apply to a dev tree), the library ops ship in `kernels/b70-moe-decode` (a superset: moe_decode is unchanged).
 
 ## Excluded or not worth it (as of 2026-10-11)
 

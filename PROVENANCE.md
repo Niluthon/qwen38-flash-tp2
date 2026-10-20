@@ -6,6 +6,12 @@ Where every piece of the image comes from, and the hashes that prove it. Grades:
 it by `scripts/export-series.sh` and checked by `scripts/check-series.sh`. From 0.30.0-b70.2 the branch is
 `b70/v0.30.0-stable`, tag `v0.30.0-b70.2` (§7).
 
+**This repository now carries only the two-card setup** (`image/Dockerfile.tp2`, `engines/two-cards/`). The four-card
+and one-card files this record refers to (`image/Dockerfile`, `image/files/`, `image/derive-serve-config.py`,
+`engines/four-cards/`, `tools/awq_snapshot.py`, `docs/measurements/`) were removed; they remain in
+[Lumnus/b70-flash-next](https://github.com/Lumnus/b70-flash-next) and in this repository's git history. The hashes
+below are unchanged.
+
 ## 1. Bases
 
 | Piece | Identity | Grade |

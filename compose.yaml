@@ -13,7 +13,8 @@
 #   * vllm serve flags: EXTRA_ARGS in engines/two-cards/env/tp2-local.env (appended to engines/two-cards/args/serve-tp2.args; the last value of a
 #     flag wins), e.g. EXTRA_ARGS=--max-model-len 65536 --gpu-memory-utilization 0.92
 #   * host paths and image: MODELS, ENGINE_DATA, IMAGE in a .env file next to this one (see .env.example).
-#   * another setup: ENGINE_ENV / ENGINE_LOCAL_ENV in .env, e.g. one card: engines/one-card/README.md
+#   * the CPU path for cold experts: B70_MOE_CPU=0 (off) or 1 (on, the default) in .env or the shell.
+#   * another environment file: ENGINE_ENV / ENGINE_LOCAL_ENV in .env (default: the two files above).
 #
 # Image: image/Dockerfile.tp2 (vLLM of release 0.30.0-b70.2 = Lumnus/vllm@v0.30.0-b70.2, the two-card patches
 # 0040-0049, kernels 0.1.14.1+b70.3, the residency shim; on the official vLLM v0.30.0 XPU image).
@@ -52,6 +53,10 @@ services:
       - ${ENGINE_DATA:-${WORK:-./engine-data}}:/work
       - ${MODELS:-${HOME}/models}:/models:ro
       - /dev/dri/by-path:/dev/dri/by-path:ro   # oneCCL opens it; --device /dev/dri does not create it
+    environment:
+      # B70_MOE_CPU from the root .env or the shell (e.g. `B70_MOE_CPU=0 docker compose up -d`): the CPU path for cold
+      # experts (0049) on (1) or off (0); empty = what the env files say. Applied by compose-serve.sh.
+      B70_MOE_CPU_FROM_HOST: ${B70_MOE_CPU:-}
     entrypoint: ["/bin/bash", "/b70-engines/two-cards/scripts/compose-serve.sh", "serve"]
     healthcheck:
       test: ["CMD", "/bin/bash", "/b70-engines/two-cards/scripts/compose-serve.sh", "health"]

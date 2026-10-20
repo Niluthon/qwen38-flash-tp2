@@ -3,7 +3,9 @@
 Three 4-bit checkpoints of Qwen3.8-Flash-Next run on this series. We serve and recommend the AWQ build (since
 2026-09-30; with MTP and kernels b70.3 since 2026-10-04); Intel's AutoRound build served in between (2026-10-02 to 04) and
 is the documented alternative; devan's W4A16 (from 2026-09-28) is the reference. The README ranks them and says why; the
-numbers are in [measurements/b70.2.md](measurements/b70.2.md).
+numbers are in the four-card upstream [Lumnus/b70-flash-next](https://github.com/Lumnus/b70-flash-next) (`docs/measurements/b70.2.md`). This
+repository serves only the two-card engine, which uses the albucino FP8-PLE checkpoint (Intel's target tensors;
+[two-cards.md](two-cards.md#weights)); AWQ and devan are four-card only and kept here as background.
 
 ## Intel AutoRound (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68`)
 
@@ -44,9 +46,9 @@ boot cross-check and every quality test pass, but the identity itself is unverif
 | PLE n-gram table | separate `ple_table_qwen4exp.pt` | inside shard 1 (128 `…ngram_embedding.shard_<i>` tensors) |
 | QSA indexer weights | none | shipped (12 layers + the MTP layer); unused on the dense-QSA config |
 | MTP head | included | in a separate `model_mtp.safetensors` |
-| what the image needs | nothing extra: wu1ff's entrypoint and `serve-config.json` | a snapshot made with `tools/awq_snapshot.py` and `engines/serve-configs/serve-config-awq.json` |
+| what the four-card image needed | nothing extra: wu1ff's entrypoint and `serve-config.json` | a snapshot made with `tools/awq_snapshot.py` and `engines/serve-configs/serve-config-awq.json` (four-card upstream) |
 
-## What `tools/awq_snapshot.py` does
+## What `tools/awq_snapshot.py` did (four-card upstream; not in this repository)
 
 1. **Snapshot.** Symlinks the AWQ download into a new directory, writes a filtered `model.safetensors.index.json`
    without the 128 PLE shard tensors and the 39 `self_attn.indexer.*` tensors, and links `ple_table_qwen4exp.pt` to
@@ -57,8 +59,8 @@ boot cross-check and every quality test pass, but the identity itself is unverif
    - `re:.*self_attn\..*`: the full-attention projections are BF16 in this checkpoint;
    - `re:^mtp.*`: the MTP tensors in `model_mtp.safetensors`.
 
-   `tools/awq_snapshot.py serve-config image/files/opt/b70-flashnext/serve-config.json out.json` reproduces the file
-   byte for byte (sha256 `c7a2b345…7342c8`). `engines/four-cards/scripts/run-example.sh` mounts it over the image's serve config.
+   `tools/awq_snapshot.py serve-config <wu1ff's serve-config.json> out.json` reproduces the file byte for byte
+   (sha256 `c7a2b345…7342c8`). The four-card upstream's `run-example.sh` mounts it over the image's serve config.
 
 The INT8 PLE table is the same file for both checkpoints, built by `tools/build_int8_ple.py` from devan's
 `ple_table_qwen4exp.pt`. Our deployment notes record the two checkpoints' BF16 PLE rows as identical; this repository

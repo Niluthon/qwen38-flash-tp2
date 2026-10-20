@@ -101,11 +101,13 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_DECODE_OP` | unset (off) | 0048 | path to `libb70_moe_decode.so` (`1` = the image's copy next to `b70_hotcold.py`, built in the image's `b70moe` stage; or a self-built one, `kernels/b70-moe-decode/build.sh`): batches of at most `B70_MOE_DECODE_OP_MAX_ROWS` tokens run hot and cold experts in one fused SYCL op (3 kernels, each expert read once) instead of two `XpuFusedMoe` calls. silu without a clamp only; if the library does not load, a warning and the stock path. Two-card default: `1`. |
 | `B70_MOE_DECODE_OP_MAX_ROWS` | `16` | 0048 | largest batch (tokens) for the fused op (at most 16). |
 | `B70_DRAFT_HEAD_FP8` | unset (off) | 0048 | `1` (XPU): the MTP draft passes use an FP8 W8A16 copy of the lm_head shard (1.08 → 0.56 ms per pass); the target verifies with its BF16 head, so outputs are unchanged. +318 MB per card (KV −7,600 tokens at 262K). Two-card default: `1`. |
-| `B70_MOE_CPU` | unset (off) | 0049 | `1`: the decode op gives `B70_MOE_CPU_PCT` % of each layer's cold experts to a host pool that computes them in pinned RAM (AVX-512 BF16, same bf16 roundings) while the GPU does the hot and the other cold experts; the GPU waits per layer on a mailbox in host memory (uncached loads, ~3 µs). Needs the CPU-path kernel (the image builds it) and an AVX-512 BF16 CPU. On a GPU-wait timeout the op computes the experts itself and switches the path off (a stderr line). Two-card default: `1`. |
+| `B70_MOE_CPU` | unset (off) | 0049 | `1`: the decode op gives `B70_MOE_CPU_PCT` % of each layer's cold experts to a host pool that computes them in pinned RAM (AVX-512 BF16, same bf16 roundings) while the GPU does the hot and the other cold experts; the GPU waits per layer on a mailbox in host memory (uncached loads, ~3 µs). Needs the CPU-path kernel (the image builds it) and an AVX-512 BF16 CPU. On a GPU-wait timeout the op computes the experts itself and switches the path off (a stderr line). Anything but `1` = off: every cold expert stays on the GPU path. Each rank logs `B70 decode op: CPU path on` / `off (B70_MOE_CPU=…)` / `requested but this CPU has no AVX-512 BF16` (then it is set to `0`). Two-card default: `1`; with Compose also settable from the host: `B70_MOE_CPU=0` in the root `.env` or the shell overrides both env files. |
 | `B70_MOE_CPU_PCT` | `50` | 0049 | percent of a layer's cold experts computed by the CPU pool (70 measured best; 100 was slightly worse at 16 rows). |
+| `B70_MOE_GLUE` | unset (off) | 0051 (dev tree only: `kernels/b70-moe-decode/vllm-0051-moe-glue.patch`) | `1`: at decode (<= `B70_MOE_DECODE_OP_MAX_ROWS` tokens) the 0047 route count runs inside the decode op's plan kernel (`moe_decode_counted`, replaces remainder + `index_add_`) and top-k softmax runs as `b70moe.topk_softmax` (same ids, weights within a few fp32 ulp, degenerate rows like the stock op). Needs `B70_MOE_DECODE_OP` and a library built from the current `kernels/b70-moe-decode`. ~1.5 % per decode step (docs/two-cards.md, round 11). |
+| `B70_MOE_GLUE_PARTS` | `count,topk` | 0051 | which glue pieces `B70_MOE_GLUE=1` enables. |
 | `B70_MOE_CPU_MIN_ROWS` | `1` | 0049 | batches with fewer tokens than this skip the CPU path. |
 | `B70_MOE_CPU_THREADS` | `8` | 0049 | threads of the per-rank pool (poller included). |
-| `B70_MOE_CPU_FIRST_CORE` | `8 × TP rank` | 0049 | first core the pool pins its threads to: each rank gets its own 8-core CCD on a 16-core host. Set explicitly to override. |
+| `B70_MOE_CPU_FIRST_CORE` | `8 × TP rank` | 0049 | first core the pool pins its threads to (cores first … first + `B70_MOE_CPU_THREADS` − 1): unset = each rank its own 8-core CCD on a 16-core host; one number = the same first core for every rank; a comma list = one per TP rank, e.g. `0,6` for two pools of 6 threads on a 12-core CPU. |
 | `B70_MOE_CPU_TIMEOUT_MS` | `500` | 0049 | GPU wait bound per layer before the timeout fallback. |
 | `B70_MOE_CPU_STALL_US` | `0` | 0049 | tests: stall the pool this long per request, to exercise the timeout fallback. |
 
@@ -151,3 +153,13 @@ boundary, and a probe that zeroes block 0 around FULL replays. The flag files ar
 Ungated in b70.2: 0020 and 0022 (MTP loader indexer skip; vllm#55506 port), 0028 (acts only on an INC config), 0032
 (log once). Every patch that adds a log line logs once per process when it first acts (e.g. `B70-0029b`, `B70-0031`),
 so a deployment can confirm what is active.
+
+## Measurement only (dev tree, not in the image)
+
+| variable | default | source | effect |
+|---|---|---|---|
+| `B70_STEP_TRACE` | unset (off) | `kernels/b70-step-trace` (`vllm-step-trace.patch`) | path to `libb70_step_trace.so`: host-stamped marks at module boundaries and around every all-reduce, captured into the decode graphs; ~+1.5–2 ms per step. Report: `tools/bench_tp2/step_trace_report.py`. |
+| `B70_STEP_TRACE_DIR` / `_EVERY` / `_DEPTH` | `/work/step-trace` / `256` / `2` | same | dump directory, engine steps between dumps, module depth below a decoder layer that gets marks. |
+| `B70_STEP_TRACE_WRAP` | unset | same | `module:Class.method,...`: marks around methods that are not module forwards. |
+| `B70_STEP_TRACE_OPS` | unset | same | as `_WRAP`, plus a mark around every op the method dispatches (TorchDispatchMode; ~+10 ms per step on the MoE block). |
+| `B70_STEP_TRACE_CORE_<dev>` | `23 + 8 * dev` | same | core of the poller thread that stamps the marks. |

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """intel_snapshot.py — make a serve snapshot of Intel/Qwen3.8-Flash-Next-W4A16-AutoRound for this series.
 
-The AutoRound checkpoint (revision 4c67bf68) needs the same treatment as the AWQ one (tools/awq_snapshot.py), adapted
+The AutoRound checkpoint (revision 4c67bf68) needs the same treatment as the AWQ one (tools/awq_snapshot.py in Lumnus/b70-flash-next), adapted
 to its layout (docs/weights.md):
 
   1. its PLE n-gram table (128 BF16 tensors `...ple.ple_embedding.ngram_embedding.shard_<i>.weight`) is the whole of

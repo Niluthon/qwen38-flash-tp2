@@ -8,8 +8,8 @@ Third-party material
 ====================
 
 1. wu1ff / B70-LLM-Controller (MIT) — https://github.com/wu1ff/B70-LLM-Controller
-   - image/files/opt/b70-flashnext/serve-config.json and image/files/opt/b70-flashnext/prepare-serve.sh are
-     wu1ff's files, unchanged (byte-identical, checked by image/verify-overlay.sh).
+   - image/verify-overlay.sh records the hashes of wu1ff's serve-config.json and prepare-serve.sh (used by the
+     four-card image of Lumnus/b70-flash-next; the files themselves are no longer in this repository).
    - patches/vllm/0001–0005 are wu1ff's Python changes to vLLM v0.30.0, re-derived as unified diffs from the
      whole-file overlays in wu1ff's pack image (ghcr.io/wu1ff/qwen38-flashnext-b70@sha256:85512b52…). Applying
      them reproduces wu1ff's files byte-for-byte.
@@ -54,7 +54,8 @@ Third-party material
 4. Model weights and data are not included. The configurations target the checkpoints
    Intel/Qwen3.8-Flash-Next-W4A16-AutoRound (revision 4c67bf68), wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 (revision 0939125)
    and devan-carlin/Qwen3.8-Flash-Next-W4A16 (revision 40b8f18d) on Hugging Face, each under its own license terms
-   (Qwen3.8-Flash-Next: qwen-community-1.0). image/files/opt/b70-flashnext/serve-config.json is derived from devan's
-   config.json; engines/serve-configs/serve-config-intel-autoround.json carries the Intel checkpoint's quantization block.
+   (Qwen3.8-Flash-Next: qwen-community-1.0); the two-card engine serves albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE.
+   engines/serve-configs/serve-config-awq.json derives from devan's config.json (via wu1ff's serve-config.json);
+   engines/serve-configs/serve-config-intel-autoround.json carries the Intel checkpoint's quantization block.
 
 5. Patch 0022 ports vllm-project/vllm#55506 (Apache-2.0, by its authors) to v0.30.0.

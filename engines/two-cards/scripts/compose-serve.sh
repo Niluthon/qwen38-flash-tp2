@@ -22,6 +22,8 @@ port() {  # the last --port given (default 8000)
 
 case "${1:-serve}" in
   serve)
+    # B70_MOE_CPU from the host (.env / shell, via compose.yaml) wins over the env files
+    if [ -n "${B70_MOE_CPU_FROM_HOST:-}" ]; then export B70_MOE_CPU=$B70_MOE_CPU_FROM_HOST; fi
     mkdir -p /work/cache/{hf,tmp,triton,vllm,xdg,ple-nvme-native}
     mapfile -t a < <(args)
     : > "$ENGINE_LOG"
