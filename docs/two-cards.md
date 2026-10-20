@@ -55,10 +55,14 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
 `Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
-0040–0049 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
-150 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
-`--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
-4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
+0040–0049 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-20, after the experiments below): TP 2 + EP 2,
+146 hot experts per layer and rank, swapped by what decode reads (0043 + 0047, long-term ranking on the work volume),
+the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch
+for prefill (0042), the fused decode MoE op (0048) with 70 % of the cold experts computed by the CPU pool (0049) and an
+FP8 draft head, MTP k=3 with the checkpoint's draft, `--gpu-memory-utilization 0.96`, 262,144-token context, image
+input off (`--limit-mm-per-prompt` 0), 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU
+KV tier. It listens on 0.0.0.0:8000. The env switches are in `engines/two-cards/env/tp2-hotcold.env` and
+`docs/switches.md`.
 
 ```bash
 docker compose build                  # the image (image/Dockerfile.tp2)
@@ -76,7 +80,25 @@ check here because each card has 29.2–29.4 GiB free at start (0.95 × 30.3 = 2
 
 ## Measured (2× B70, 61 GiB RAM, compute-runtime as installed, 2026-10-10/11; single runs, ±10 % noise)
 
-| | |
+### Units in the experiment tables
+
+Every speed table below follows one schema. Each header names the unit; cells are bare numbers.
+
+- **1 stream** — `bench_det.py` at temperature 0: four fixed prompts, one at a time. Reported as **tok/s** for the
+  prompt (mean over the four, when one number) or as **ms/step** per prompt (four numbers). Lower ms/step is faster.
+- **4 streams** — the same four prompts in parallel: **tok/s** is the total across the four streams; where the step
+  time is given it is **ms/step** of the whole batch.
+- **agents** — `agent_load.py 3 12 2`: 12 coding-agent sessions at **2 concurrent requests** (temperature 0, frozen
+  corpus). **tok/s** = all generated tokens over wall time, i.e. the total across the 2 concurrent requests.
+- **KV tokens** — the XPU KV cache size from the boot log, per card. Higher = more context per request.
+- **decode cold share** — the share of decode routes that hit cold experts (logged by `B70_MOE_ROUTE_COUNT`); lower
+  is faster because cold experts come over PCIe.
+- **fresh / after agents** — measured right after boot, and again after the two code-agent sessions (the hot set
+  adapts to the traffic).
+- One boot each, in order; ±5–10 % noise on single runs, ~3 % on ms/step. `bench_det` ms/step is the repeatable
+  number; tok/s follows MTP acceptance and can swing.
+
+| what | value |
 |---|---|
 | VRAM per card | weights ~22.6 GiB (136 hot experts × 48 layers, dense, MTP draft); 150 hot experts, embedding in host RAM, FP8 dense projections, prefetch slots 0.53 GiB; **201,794 KV tokens** at util 0.95 and a 131,072-token context (1.54 × a full request); 193,621 with 144 hot and BF16 dense; 173,610 with 136 hot and the embedding in VRAM; 144,945 at 0.92 / 65,536 without prefetch |
 | host RAM | cold experts 15 GiB pinned per rank; PLE row cache 1 GiB per rank; ~45 GiB used in all, ~16 GiB available |
@@ -94,12 +116,12 @@ Not yet measured: quality benchmarks against the 4-card engine, a multi-day stab
 engine's ms per step can be compared directly (repeatable within ~3 %). The word-salad cells of `bench2.py` swing
 ±30 % between identical runs at 1 stream (acceptance depends on the random text); do not compare configs with them.
 
-| configuration | KV tokens | 1 stream | 4 streams | prefill 3K / 12K / 30K | verdict |
+| configuration | KV tokens | 1 stream tok/s (ms/step range) | 4 streams tok/s | prefill tok/s (3K / 12K / 30K prompts) | verdict |
 |---|---|---|---|---|---|
-| baseline: 136 hot, util 0.92, 64K | 144,854 | 54.8 tok/s (45–61 ms/step) | 80.8 | 2,599 / 2,608 / 2,575 | reference |
+| baseline: 136 hot, util 0.92, 64K | 144,854 | 54.8 (45–61) | 80.8 | 2,599 / 2,608 / 2,575 | reference |
 | 128K context (else baseline) | 166,171 | real prompts 45.5 (= 64K) | — | 2,544 / 2,592 / 2,560 | no decode cost |
 | PLE row cache 6 GiB + lookahead | 144,854 | 54.2 | 74–78 | 2,479 / 2,577 / 2,547 | no gain (cache already 99 % hits when warm) |
-| MTP k=2 | 152,724 | 51.4 (40–54 ms/step, acceptance −15–24 %) | 74 | 2,432 / 2,544 / 2,522 | worse; keep k=3 |
+| MTP k=2 | 152,724 | 51.4 (40–54; acceptance −15–24 %) | 74 | 2,432 / 2,544 / 2,522 | worse; keep k=3 |
 | 8,192-token batches | 76,671 | ~same | 73.5 | 2,497 / 2,774 / 2,952 | +8–16 % prefill for half the KV; no |
 | rankings from 40 local requests | 143,029 | 46.0 (cold share 24 → 33 %) | 61 | — | overfit; keep the checkpoint's |
 | `--kv-cache-dtype fp8` | 227,086 | 50.5 (acceptance −3–12 %) | 74 | 2,522 / 2,527 / 2,188 | +57 % KV, −5–8 % decode; only when KV-bound |
@@ -230,7 +252,7 @@ One boot each, in this order; per boot `bench_det.py`, then `agent_load.py 3 12 
 corpus), then `bench_det.py` again (general prompts after the code sessions). Harness: `engine-data/ab/ab.sh`
 (local, not committed).
 
-| run | 1 stream, fresh (mean tok/s) | 4 streams, fresh | agent #1 / #2 (tok/s total) | 1 stream after agents | 4 streams after agents | decode cold share (agents) |
+| run | 1 stream tok/s (mean of the 4 prompts) | 4 streams tok/s | agents tok/s (2 concurrent, total) | 1 stream tok/s after agents | 4 streams tok/s after agents | decode cold share (agents) |
 |---|---|---|---|---|---|---|
 | A: 0043 as before | 55.3 | 98.4 | 90.5 / 94.1 | 53.8 | 69.9 | — (not counted) |
 | B: A + decode counting (scores unchanged) | 55.4 | 100.5 | 89.9 / 91.6 | 52.8 | 71.7 | 8–10 % |
@@ -238,8 +260,8 @@ corpus), then `bench_det.py` again (general prompts after the code sessions). Ha
 | **D: C + the state C saved (the default now)** | **60.7** | 110.6 | 86.6 / **100.2** | 55.3 | **113.2** | 6–8 % |
 | E: D's settings from the rebuilt image (0047 baked in, no overrides; KV 279,114) | 62.7 | 110.6 | 91.6 / 98.4 | 57.0 | 120.8 | — |
 
-- Counting inside the decode graphs costs nothing measurable now: ms/step A 49.5 / 59.3 / 46.9 / 44.9 vs B 49.5 / 59.1 /
-  47.9 / 45.5 on the four fixed prompts.
+- Counting inside the decode graphs costs nothing measurable now: the four fixed prompts' ms/step, A 49.5 / 59.3 /
+  46.9 / 44.9 vs B 49.5 / 59.1 / 47.9 / 45.5.
 - With prefill scores the hot set follows the prompts: after the code sessions, general prose decodes with 17–34 %
   cold routes (B) and 4 streams drop to 70 tok/s; with decode scores 12–13 % and 113–115 tok/s.
 - In the code sessions themselves: decode cold share 8–10 → 6–8 %, the adapted run 94.1 → 99.5–100.2 tok/s (+6 %). The
@@ -259,14 +281,14 @@ disk, so an expert on NVMe must never be routed while graphs run. It would free 
 Bandwidth per component on one B70 (`tools/bench_tp2/decode_bw.py`, `moe_bw.py`; XPU graphs, random data; the
 B70 compresses constant data, which inflates GB/s). A plain 2 GiB read reaches 595 GB/s (98 % of 608).
 
-| component, decode shapes | time | of 608 GB/s |
+| component, decode shapes | time per call | rate (or % of 608 GB/s where noted) |
 |---|---|---|
 | BF16 dense (GDN in_proj/out_proj, attention q/o), 4–16 rows | 30–57 µs per layer | 85–92 % |
 | BF16 lm_head shard (124,160 × 2,560) | 1.09 ms | 96 % |
 | FP8 W8A16 dense (0045) at 4–16 rows | 24–50 µs | 50–56 % (it saves VRAM, not time) |
 | small replicated layers (HC, router, shared expert) | 5–21 µs | 50–77 % (launch-bound) |
-| hot experts, stock (2 `XpuFusedMoe` calls per layer), 1 / 4 / 8 / 16 rows | 83 / 155 / 208 / 338 µs | 30 / 59 / 70 / 80 % |
-| cold experts over PCIe (UVA), 4 / 8 / 16 rows | 381 / 500 / 982 µs per layer | 20 GB/s, the PCIe limit |
+| hot experts, stock (2 `XpuFusedMoe` calls per layer), 1 / 4 / 8 / 16 rows | 83 / 155 / 208 / 338 µs per layer | 30 / 59 / 70 / 80 % |
+| cold experts over PCIe (UVA), 4 / 8 / 16 rows | 381 / 500 / 982 µs per layer | 20 GB/s — the PCIe limit, not a % of VRAM bandwidth |
 
 Dense layers already run at the memory limit. On each card the losses come from the MoE's fixed costs: each
 `XpuFusedMoe` call costs about 56 µs (6 kernels) before it reads a weight byte, and there are two calls per layer.
@@ -282,12 +304,12 @@ bandwidth across the two cards, but per-card fixed costs, the all-reduces and PC
 
 Same harness as round 6; one boot each, in this order, sharing the learned state.
 
-| run | KV | 1 stream fresh | 4 streams fresh | agent #1 / #2 | 1 stream after agents | 4 streams after agents |
+| run | KV tokens | 1 stream tok/s (ms/step range) | 4 streams tok/s | agents tok/s (2 concurrent, total) | 1 stream tok/s after agents | 4 streams tok/s after agents |
 |---|---|---|---|---|---|---|
-| F: image (0047) | 279,001 | 61.4 (45.5–47.9 ms/step) | 112.4 | 83.3 / 96.9 | 56.3 | 113.7 |
+| F: image (0047) | 279,001 | 61.4 (45.5–47.9) | 112.4 | 83.3 / 96.9 | 56.3 | 113.7 |
 | G: + op, ≤ 8 rows | 279,001 | 73.1 (37.4–41.3) | 113.2 | 105.8 / 107.2 | 68.8 | 115.9 |
 | H: G + FP8 draft head | 271,647 | 76.6 (35.5–38.1) | 112.8 | 110.3 / 116.2 | 70.9 | 113.4 |
-| **I: op ≤ 16 rows + FP8 draft head** | 271,421 | **76.6** (35.8–39.4) | **141.8** (78.2 ms/step) | **105.9 / 115.4** | 68.4 | **144.3** |
+| **I: op ≤ 16 rows + FP8 draft head** | 271,421 | **76.6** (35.8–39.4) | **141.8** | **105.9 / 115.4** | 68.4 | **144.3** |
 
 - 1 stream +25 %, 4 streams +26 %, code agents +12–27 %. Acceptance is unchanged (2.2–3.6 per step in every run).
   A sanity prompt at temp 0 answers correctly.
@@ -316,10 +338,10 @@ filled most of the GPU's 2,048 thread slots while they waited on PCIe. Per layer
 cold bytes alone need at 26 GB/s. Worker counts: 64 too few (slower at all sizes), 512 too many (they crowd out the
 hot experts); 128 is the default.
 
-| run (one boot each, KV ~271.6K) | 1 stream fresh (ms/step) | 4 streams fresh | agent #1 / #2 | 1 stream after agents (ms/step) | 4 streams after agents |
+| run (one boot each, KV ~271.6K) | 1 stream ms/step (the 4 prompts) | 4 streams tok/s · ms/step | agents tok/s (2 concurrent, total) | 1 stream ms/step after agents | 4 streams tok/s · ms/step after agents |
 |---|---|---|---|---|---|
-| J: image (0048) | 41.1 / 38.1 / 42.0 / 38.5 | 135.1 (80.8 ms) | 100.8 / 113.5 | 46.2 / 37.2 / 46.1 / 37.7 | 141.2 (77.4 ms) |
-| K: J + plan + cold workers | 41.1 / 37.6 / 41.9 / 37.7 | 142.0 (76.4 ms) | 111.6 / 118.4 | 45.9 / 36.5 / 44.3 / 38.3 | 146.4 (73.7 ms) |
+| J: image (0048) | 41.1 / 38.1 / 42.0 / 38.5 | 135.1 · 80.8 | 100.8 / 113.5 | 46.2 / 37.2 / 46.1 / 37.7 | 141.2 · 77.4 |
+| K: J + plan + cold workers | 41.1 / 37.6 / 41.9 / 37.7 | 142.0 · 76.4 | 111.6 / 118.4 | 45.9 / 36.5 / 44.3 / 38.3 | 146.4 · 73.7 |
 
 4 streams +4–5 %, 1 stream ~1 % (one cold expert or two per layer leave little to overlap), agents +4–10 %.
 
@@ -345,9 +367,10 @@ that falls back to the GPU path, and the CPU's partial sums added in the gather.
 
 ## Experiments, round 9 (2026-10-19/20): the CPU computes part of the cold experts (0049)
 
-One-card microbench (48 layers in a graph, cold share 0.08), CPU path with 8 threads on one CCD:
+One-card microbench, µs per layer (48 layers in an XPU graph, cold share 0.08); the CPU path uses 8 threads on one
+CCD, at the given share of the cold experts:
 
-| rows | GPU only | CPU + GPU, 30 % | 70 % | 100 % |
+| rows (tokens) | GPU only | + CPU, 30 % | + CPU, 70 % (default) | + CPU, 100 % |
 |---|---|---|---|---|
 | 1 | 66 µs | 63 | 48 | 45 |
 | 4 | 226 | 190 | 142 | 143 |
@@ -362,10 +385,10 @@ CPU path off: results stayed correct and the graphs did not hang.
 Two cards, one boot each (the same harness as rounds 6–8; L = the image with 0048's op, M = the op + CPU path at
 70 %, one pool per rank pinned to its own CCD):
 
-| run | 1 stream fresh (ms/step) | 4 streams fresh | agent #1 / #2 | 1 stream after agents (ms/step) | 4 streams after agents |
+| run | 1 stream ms/step (the 4 prompts) | 4 streams tok/s · ms/step | agents tok/s (2 concurrent, total) | 1 stream ms/step after agents | 4 streams tok/s · ms/step after agents |
 |---|---|---|---|---|---|
-| L: GPU only | 41.1 / 37.4 / 41.5 / 38.3 | 146.6 (77.0 ms) | 103.9 / 120.1 | 46.8 / 36.8 / 46.0 / 38.5 | 149.5 (73.2 ms) |
-| **M: + CPU path** | **34.6 / 31.8 / 34.4 / 31.6** | **170.1 (62.6 ms)** | **119.4 / 129.8** | 35.6 / 30.8 / 36.2 / 30.4 | **179.2 (60.5 ms)** |
+| L: GPU only | 41.1 / 37.4 / 41.5 / 38.3 | 146.6 · 77.0 | 103.9 / 120.1 | 46.8 / 36.8 / 46.0 / 38.5 | 149.5 · 73.2 |
+| **M: + CPU path** | **34.6 / 31.8 / 34.4 / 31.6** | **170.1 · 62.6** | **119.4 / 129.8** | 35.6 / 30.8 / 36.2 / 30.4 | **179.2 · 60.5** |
 
 1 stream −16 % step time, 4 streams −19 %, agents +8–15 %, acceptance unchanged, decode cold share unchanged, zero
 timeouts in the engine logs. Paired perplexity on four fixed texts (CPU on vs off): +0.4 / −0.6 / +0.3 / +1.2 % —
@@ -403,7 +426,7 @@ know. 0043's swaps still move cold experts between RAM tiers; the CPU pool reads
 | deduplicating the draft's lm_head / embed | already shared by vLLM |
 | fine-grained Mamba prefix cache | not applicable to multi-module MTP |
 | all-reduce tuning | 22 µs per call, ~2–3 ms per step |
-| CPU compute for cold experts | ~~breaks the decode graphs~~: a handshake inside the graph works (round 8); not built yet |
+| CPU compute for cold experts | ~~breaks the decode graphs~~ → built as 0049 (round 9): the CPU pool + mailbox handshake work and are on by default |
 
 ## How to reproduce the measurements
 
