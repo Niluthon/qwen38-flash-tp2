@@ -58,7 +58,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
 `Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
 0040–0050, 0052 and 0053 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-20, after the experiments below): TP 2 + EP 2,
-146 hot experts per layer and rank, swapped by what decode reads (0043 + 0047, long-term ranking on the work volume),
+156 hot experts per layer and rank, swapped by what decode reads (0043 + 0047, long-term ranking on the work volume),
 the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch
 for prefill (0042), the fused decode MoE op (0048) with 70 % of the cold experts computed by the CPU pool (0049) and an
 FP8 draft head, MTP k=3 with the checkpoint's draft, `--gpu-memory-utilization 0.96`, 262,144-token context, image
@@ -772,6 +772,33 @@ the boot log). Step time −0.4 ms at 1 stream (the verify head, ~1.3 %, within 
 181–187 tok/s. agent_load tok/s follows the length of the generated answers (temperature 0, but 2 concurrent
 requests and the hot/cold swap make them vary from run to run: 15–22K tokens in the same configuration); bursts and
 stress_mixed clean. Off: `B70_HEAD_FP8=0` (KV back to ~379K).
+
+### Spending it: more hot experts (156, the default now)
+
+The ~2.2 GiB per card freed by levers 2, 3 and 5 went to hot experts instead of KV (`engine-data/ab/hot_sweep.sh`:
+kv_lever per count, then bench2 prefill twice; 0053 image, `B70_MOE_HOT_EXPERTS` only). Each expert costs ~8.3K KV
+tokens; 162 is the most that stays above the 262,144-token context.
+
+| hot experts per rank | KV tokens | bench_det #1 ms/step (4 prompts; 4 streams) | 4 streams tok/s (#1 / #2) | decode cold share (log, per period) | agents tok/s | prefill 3K / 12K / 30K tok/s | card 0 free at peak, MiB |
+|---|---|---|---|---|---|---|---|
+| 146 (Q4) | 400,513 | 33.5 / 31.6 / 31.9 / 30.3; 61.2 | 181.8 / 183.2 | 0.067–0.120 | 109.0 / 120.4 | 4,097 / 4,098 / 3,952 | 778 |
+| **156 (default)** | **317,695** | **31.8 / 30.4 / 31.2 / 29.2; 56.2** | **195.6 / 196.8** | **0.053–0.093** | **126.3 / 128.5** | **4,069–4,169 / 4,196–4,237 / 3,991–4,000** | **914** |
+| 162 | 271,195 | 30.9 / 29.8 / 30.1 / 28.5; 54.3 | 203.0 / 197.2 | 0.049–0.082 | 126.7 / 135.5 | 4,081–4,141 / 4,244–4,271 / 4,021 | 831 |
+
+156: 4 streams +7.6 % tok/s (−8.2 % ms/step), 1 stream −0.9 ms/step, prefill +1–3 %; 10 bursts, 0 bad. 162 adds
+~0.7 ms/step at 1 stream and is within noise at 4 streams, for 46K fewer KV tokens: the default is 156, which keeps
+318K tokens for long coding sessions (162 is a line in `tp2-local.env.example`).
+
+BetterBench on the 156 default (`~/.betterbench/runs/20261020-211813-qwen38-flash-next`, 20 passes, temperature 0.7)
+against the morning's run (commit `816cc78`: 146 hot, before 0050/0052/0053):
+
+| measurement | morning (146 hot) | 156 hot, 0052 + 0053 | unit |
+|---|---|---|---|
+| decode, 1 request, weighted median | 94.1 | 99.9 | tok/s |
+| time to first token, 1 request, p50 | 281 | 253 | ms |
+| gap between streamed updates, p99 | 40.8 | 39.6 | ms |
+| decode total at 1 / 2 / 4 / 8 requests | 81.6 / 121.9 / 166.1 / 165.4 | 84.2 / 130.7 / 178.5 / 177.7 | tok/s |
+| prefill median at 1.5K / 6K / 12K / 24K / 47K tokens | 2,368 / 3,883 / 3,921 / 3,863 / 3,689 | 2,622 / 3,928 / 3,956 / 3,872 / 3,704 | tok/s |
 
 ### Paiton's W3A8 experts: does all-resident 3-bit pay on a B70? (spike, `kernels/b70-w3-spike`)
 
