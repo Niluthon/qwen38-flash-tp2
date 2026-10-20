@@ -9,9 +9,12 @@
 //   gather: out[m,k] = sum over the row's local routes j (fixed order) of y[m*TOPK + j, k]
 // t = route slot (m * TOPK + j). Each local expert is processed once per layer by the sub-groups of its first slot;
 // those cover every row routed to it, 4 rows per pass, so its weights are read from memory once (important for cold
-// experts: PCIe); further passes hit the cache.
+// experts: PCIe); further passes hit the cache. A one-work-group plan kernel lists the batch's local experts, cold
+// first; 128 "cold worker" sub-groups loop over the cold experts' row blocks while every other sub-group takes one hot
+// block, so the PCIe-bound cold reads run beside the hot ones without taking most of the GPU's thread slots.
 // Measured on one B70 (48 layers in an XPU graph, cold share 0.08, test_moe_decode.py): stock vs this op per layer
-//   1 row 150 -> 66 us, 4 rows 391 -> 241 us, 8 rows 603 -> 397 us, 16 rows 1030 -> 740 us.
+//   1 row 150 -> 65 us, 4 rows 391 -> 226 us, 8 rows 603 -> 353 us, 16 rows 1068 -> 638 us (82-91 % of the time the
+//   cold bytes alone need over PCIe at the 26 GB/s this op reaches; the link's ceiling is 28.7 GB/s).
 // Intermediate roundings follow the stock path (gemm1 out bf16, silu_and_mul -> bf16, gemm2 out bf16, gather fp32).
 //
 // Layouts (vllm int_wna16._process_weights_xpu + implement_zp, the same for hot and cold):
@@ -33,19 +36,52 @@ struct Weights {
   const uint8_t* w13; const bf16* s13; const uint8_t* w2; const bf16* s2;
 };
 
-// If slot s is the first slot routed to a local expert: fills slots[] with every slot routed to it (at most one per
-// row) and returns their count; 0 = nothing to do for this work-group.
-template <int MMAX>
-static inline int owner_slots(const int32_t* ids, const int32_t* hot_map, const int32_t* cold_map, int s, int S,
-                              int (&slots)[MMAX], int& hs, int& cs) {
-  const int g = ids[s];
-  if (g < 0) return 0;
+// Plan (one work-group): the local experts of this batch, cold ones first, each with the route slots that use it.
+//   plan[0] = count, plan[1] = cold count; owner i: plan[2 + i * PSTRIDE] = number of slots nr, then the nr slots.
+// Cold experts first, so their PCIe reads start with the first wave of work-groups and the hot experts' VRAM reads
+// fill the GPU around them; the grid's trailing work-groups (past the count) exit at once.
+constexpr int PSTRIDE = 17;
+struct PlanKernel {
+  const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map; int32_t* plan; int S;
+  void operator()(sycl::nd_item<1> it) const {
+    const int t = it.get_local_id(0);
+    auto grp = it.get_group();
+    int owner = 0, cold = 0, g = -1;
+    if (t < S) {
+      g = ids[t];
+      if (g >= 0) {
+        const int hs = hot_map[g], cs = cold_map[g];
+        if (hs >= 0 || cs >= 0) {
+          owner = 1;
+          for (int s2 = 0; s2 < t; ++s2) if (ids[s2] == g) { owner = 0; break; }
+          cold = owner && hs < 0;
+        }
+      }
+    }
+    const int hot = owner && !cold;
+    const int n_cold = sycl::reduce_over_group(grp, cold, sycl::plus<int>());
+    const int cold_rank = sycl::exclusive_scan_over_group(grp, cold, sycl::plus<int>());
+    const int hot_rank = sycl::exclusive_scan_over_group(grp, hot, sycl::plus<int>());
+    const int count = sycl::reduce_over_group(grp, owner, sycl::plus<int>());
+    if (owner) {
+      int32_t* p = plan + 2 + (cold ? cold_rank : n_cold + hot_rank) * PSTRIDE;
+      int nr = 0;
+      for (int s2 = t; s2 < S && nr < 16; ++s2) if (ids[s2] == g) p[1 + nr++] = s2;
+      p[0] = nr;
+    }
+    if (t == 0) { plan[0] = count; plan[1] = n_cold; }
+  }
+};
+
+// The owner of work-group index i: its slots, and its slot in the hot or cold weights. 0 = nothing to do.
+static inline int plan_owner(const int32_t* plan, const int32_t* ids, const int32_t* hot_map, const int32_t* cold_map,
+                             int i, const int32_t*& slots, int& hs, int& cs) {
+  if (i >= plan[0]) return 0;
+  const int32_t* p = plan + 2 + i * PSTRIDE;
+  slots = p + 1;
+  const int g = ids[slots[0]];
   hs = hot_map[g]; cs = cold_map[g];
-  if (hs < 0 && cs < 0) return 0;
-  for (int s2 = 0; s2 < s; ++s2) if (ids[s2] == g) return 0;
-  int nr = 0;
-  for (int t = s; t < S && nr < MMAX; ++t) if (ids[t] == g) slots[nr++] = t;
-  return nr;
+  return p[0];
 }
 
 // acc[r][m] += scale(r, group) * sum_i q(r, word, i) * act[m][word * 8 + i] over this lane's words of R rows.
@@ -96,13 +132,25 @@ static inline void rows_dot(const uint32_t* const (&rows)[R], const bf16* const 
 
 template <int MMAX, int R, int VW>
 struct UpKernel {
-  const bf16* x; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map;
-  Weights hot, cold; bf16* h; int M, TOPK, N, K, n_blocks;
+  const bf16* x; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map; const int32_t* plan;
+  Weights hot, cold; bf16* h; int M, TOPK, N, K, n_blocks, cw;
+  // Sub-groups [0, cw) are cold workers: they loop over every (cold expert, row block) job, so few thread slots wait
+  // on PCIe while the rest of the GPU streams hot experts from VRAM; sub-group cw + j takes hot job j. cw = 0: one
+  // job per sub-group, cold first.
   [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
-    const int wg = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
-    const int s = wg / n_blocks, nb = wg % n_blocks;
-    int all[16], hs = -1, cs = -1;
-    const int n_all = owner_slots<16>(ids, hot_map, cold_map, s, M * TOPK, all, hs, cs);
+    const int w = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
+    auto sgp = it.get_sub_group();
+    const int n_cold = plan[1];
+    if (w < cw) {
+      for (int job = w; job < n_cold * n_blocks; job += cw) run(job / n_blocks, job % n_blocks, lane, sgp);
+      return;
+    }
+    const int job = w - cw;
+    run((cw ? n_cold : 0) + job / n_blocks, job % n_blocks, lane, sgp);
+  }
+  void run(int oi, int nb, int lane, sycl::sub_group sgp) const {
+    const int32_t* all; int hs = -1, cs = -1;
+    const int n_all = plan_owner(plan, ids, hot_map, cold_map, oi, all, hs, cs);
     if (!n_all) return;
     const Weights& W = hs >= 0 ? hot : cold;
     const int e = hs >= 0 ? hs : cs;
@@ -119,7 +167,7 @@ struct UpKernel {
     }
     for (int c0 = 0; c0 < n_all; c0 += MMAX) {
     const int nr = sycl::min(MMAX, n_all - c0);
-    const int* slots = all + c0;
+    const int32_t* slots = all + c0;
     const bf16* act[MMAX];
 #pragma unroll
     for (int m = 0; m < MMAX; ++m) act[m] = x + (size_t)(slots[m < nr ? m : 0] / TOPK) * K;
@@ -129,7 +177,6 @@ struct UpKernel {
 #pragma unroll
       for (int m = 0; m < MMAX; ++m) acc[r][m] = 0.f;
     rows_dot<R, MMAX, VW>(rows, srows, words, act, nr, lane, acc);
-    auto sgp = it.get_sub_group();
 #pragma unroll
     for (int r = 0; r < H; ++r)
 #pragma unroll
@@ -148,13 +195,25 @@ struct UpKernel {
 template <int MMAX, int P, typename WT>
 struct DownKernel {
   const bf16* h; const WT* tw; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map;
-  Weights hot, cold; float* y; int M, TOPK, N, K, n_blocks;
+  const int32_t* plan; Weights hot, cold; float* y; int M, TOPK, N, K, n_blocks, cw;
   static constexpr int LPR = 4, RPP = SG / LPR, R = RPP * P;  // lanes per row, rows per pass, rows per sub-group
+  // Sub-groups [0, cw) are cold workers: they loop over every (cold expert, row block) job, so few thread slots wait
+  // on PCIe while the rest of the GPU streams hot experts from VRAM; sub-group cw + j takes hot job j. cw = 0: one
+  // job per sub-group, cold first.
   [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
-    const int wg = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
-    const int s = wg / n_blocks, nb = wg % n_blocks;
-    int all[16], hs = -1, cs = -1;
-    const int n_all = owner_slots<16>(ids, hot_map, cold_map, s, M * TOPK, all, hs, cs);
+    const int w = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
+    auto sgp = it.get_sub_group();
+    const int n_cold = plan[1];
+    if (w < cw) {
+      for (int job = w; job < n_cold * n_blocks; job += cw) run(job / n_blocks, job % n_blocks, lane, sgp);
+      return;
+    }
+    const int job = w - cw;
+    run((cw ? n_cold : 0) + job / n_blocks, job % n_blocks, lane, sgp);
+  }
+  void run(int oi, int nb, int lane, sycl::sub_group sgp) const {
+    const int32_t* all; int hs = -1, cs = -1;
+    const int n_all = plan_owner(plan, ids, hot_map, cold_map, oi, all, hs, cs);
     if (!n_all) return;
     const Weights& W = hs >= 0 ? hot : cold;
     const int e = hs >= 0 ? hs : cs;
@@ -164,7 +223,7 @@ struct DownKernel {
     const int sub = lane / LPR, part = lane % LPR;
     for (int c0 = 0; c0 < n_all; c0 += MMAX) {
     const int nr = sycl::min(MMAX, n_all - c0);
-    const int* slots = all + c0;
+    const int32_t* slots = all + c0;
     const bf16* act[MMAX];
 #pragma unroll
     for (int m = 0; m < MMAX; ++m) act[m] = h + (size_t)slots[m < nr ? m : 0] * N;
@@ -204,7 +263,6 @@ struct DownKernel {
         }
       }
     }
-    auto sgp = it.get_sub_group();
 #pragma unroll
     for (int p = 0; p < P; ++p)
 #pragma unroll
@@ -242,7 +300,7 @@ struct GatherKernel {
 // One sub-group per (route slot, row block); 4 sub-groups per work-group (measured: slightly faster than 1).
 template <typename KER>
 static void launch_wg(sycl::queue& q, const KER& k, int S) {
-  const size_t total = (size_t)S * k.n_blocks;
+  const size_t total = (size_t)S * k.n_blocks + k.cw;
   const int w = (total % 4 == 0) ? 4 : 1;
   q.parallel_for(sycl::nd_range<1>(total * SG, (size_t)SG * w), k);
 }
@@ -260,8 +318,13 @@ static void launch(sycl::queue& q, const torch::Tensor& out, const torch::Tensor
   auto* hp = reinterpret_cast<bf16*>(h.data_ptr());
   auto* yp = y.data_ptr<float>();
   auto* twp = reinterpret_cast<const WT*>(tw.data_ptr());
-  launch_wg(q, UpKernel<MMAX, 4, 4>{xp, idp, hm, cm, hot, cold, hp, M, TOPK, N, K, N / 2}, S);
-  launch_wg(q, DownKernel<MMAX, 4, WT>{hp, twp, idp, hm, cm, hot, cold, yp, M, TOPK, N, K, K / 16}, S);
+  auto plan = torch::empty({2 + S * PSTRIDE}, ids.options());
+  // cold workers (sub-groups): 128 measured best (64: cold reads too slow; 512: they crowd out hot experts)
+  constexpr int cw = 128;
+  auto* pp = plan.data_ptr<int32_t>();
+  q.parallel_for(sycl::nd_range<1>(256, 256), PlanKernel{idp, hm, cm, pp, S});
+  launch_wg(q, UpKernel<MMAX, 4, 4>{xp, idp, hm, cm, pp, hot, cold, hp, M, TOPK, N, K, N / 2, cw}, S);
+  launch_wg(q, DownKernel<MMAX, 4, WT>{hp, twp, idp, hm, cm, pp, hot, cold, yp, M, TOPK, N, K, K / 16, cw}, S);
   const size_t tot = (size_t)M * K, lg = 256;
   q.parallel_for(sycl::nd_range<1>((tot + lg - 1) / lg * lg, lg),
                  GatherKernel{yp, idp, hm, cm, reinterpret_cast<bf16*>(out.data_ptr()), M, TOPK, K});
@@ -284,7 +347,7 @@ void moe_decode(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, 
   TORCH_CHECK(x.is_contiguous() && topk_ids.is_contiguous() && topk_weights.is_contiguous() && out.is_contiguous());
   const int M = x.size(0), K = x.size(1);
   const int N = hot_w13.size(1) / 2;
-  TORCH_CHECK(M <= 16, "decode op: at most 16 rows");
+  TORCH_CHECK(M <= 16 && M * topk_ids.size(1) <= 256, "decode op: at most 16 rows, 256 route slots");
   TORCH_CHECK(hot_w13.size(2) * 2 == K && K % GS == 0 && N % GS == 0, "shapes");
   TORCH_CHECK((K / 8) % (SG * 4) == 0 && (N / 8) % 16 == 0 && K % 16 == 0 && N % 2 == 0, "row tiling");
   auto& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();

@@ -297,6 +297,52 @@ Same harness as round 6; one boot each, in this order, sharing the learned state
 - Both are on by default in `tp2-hotcold.env` (I's settings). The image compiles the op itself in a builder stage
   (icpx 2026.0 from Intel's apt repository, against the image's torch), so nothing is prepared on the host.
 
+## Experiments, round 8 (2026-10-19): cold reads at decode (item 3) and a CPU spike for cold experts (item 4)
+
+**Where the cold bytes come from.** Measured on this host with the engine stopped (`engine-data/spike4/`, local):
+
+| path | GB/s |
+|---|---|
+| one card reading pinned host RAM (UVA kernel, copy kernel or copy engine; alone or both cards at once) | 28.7 per card |
+| the 0048 op on cold experts only | 25.6–26.3 |
+| CPU cores reading RAM (8 or 16 threads) | 64–69 (the cores' fabric limit, not the RAM's) |
+| CPU while both cards stream from RAM | 44.5, with the cards still at 27.5 each: ~100 GB/s of RAM in total |
+
+**Item 3, kernel side.** A one-work-group plan kernel now lists the batch's local experts, cold first, so no
+work-group is wasted on route slots of other ranks or repeated experts, and 128 "cold worker" sub-groups loop over the
+cold experts while the rest of the GPU takes the hot ones (one job each). Without the workers, the cold work-groups
+filled most of the GPU's 2,048 thread slots while they waited on PCIe. Per layer at cold share 0.08: 4 rows 241 →
+226 µs, 8 rows 397 → 353 µs, 16 rows 740 → 638 µs; hot only, 16 rows: 473 → 340 µs. That is 82–91 % of the time the
+cold bytes alone need at 26 GB/s. Worker counts: 64 too few (slower at all sizes), 512 too many (they crowd out the
+hot experts); 128 is the default.
+
+| run (one boot each, KV ~271.6K) | 1 stream fresh (ms/step) | 4 streams fresh | agent #1 / #2 | 1 stream after agents (ms/step) | 4 streams after agents |
+|---|---|---|---|---|---|
+| J: image (0048) | 41.1 / 38.1 / 42.0 / 38.5 | 135.1 (80.8 ms) | 100.8 / 113.5 | 46.2 / 37.2 / 46.1 / 37.7 | 141.2 (77.4 ms) |
+| K: J + plan + cold workers | 41.1 / 37.6 / 41.9 / 37.7 | 142.0 (76.4 ms) | 111.6 / 118.4 | 45.9 / 36.5 / 44.3 / 38.3 | 146.4 (73.7 ms) |
+
+4 streams +4–5 %, 1 stream ~1 % (one cold expert or two per layer leave little to overlap), agents +4–10 %.
+
+**Item 4, spike (measured, not built).** Cold experts are bound by PCIe (26 of 28.7 GB/s per card), while RAM still
+has room: the CPU can add ~44 GB/s next to both cards. Two questions decided whether a CPU path is possible:
+
+- *A CPU kernel fast enough.* AVX-512 BF16 (`vpermw` nibble → bf16 lookup, `vdpbf16ps` on (even, odd) pairs, one
+  scale FMA per 128-group), same weight layout as the GPU, persistent spin pool, 8 threads: 58–64 GB/s of expert
+  weights for 1–4 rows per expert, 31–33 GB/s at 8 rows, 17 GB/s at 16 (compute-bound). At decode a cold expert is
+  routed by 1–2 rows, so it runs memory-bound. Relative error vs fp64 ~1e-7.
+- *A GPU ↔ CPU handshake inside a captured decode graph.* A device counter makes each replay's request unique. The
+  GPU writes it to a host flag; a host thread answers; the GPU spins on a done flag. Plain, `volatile`, system-scope
+  atomic loads, RMW atomics, fences and uncached Level Zero host memory all kept returning a stale cached value
+  (waits timed out whenever the CPU needed > ~15 µs). A load with an **uncached read hint**
+  (`annotated_ptr` + `read_hint<cache_control<uncached, L1, L3>>`) works: 48 handshakes per replay, all served, no
+  timeouts, ~3 µs each, and the GPU waits exactly the CPU's work time.
+
+Estimate if built: CPU and GPU share a layer's cold experts (≈ 26 + 22–30 GB/s per rank, ~100 GB/s of RAM in total),
+which roughly halves the cold time: 4 rows ~226 → ~130 µs per layer (hot-bound), 16 rows ~640 → ~350 µs, i.e.
++10–15 % at 1 stream and +20–25 % at 4 streams before overheads. Needed: the plan kernel assigns some cold experts to
+the CPU and copies their rows to host memory, a per-rank pool pinned to one CCD each, a wait kernel with a timeout
+that falls back to the GPU path, and the CPU's partial sums added in the gather.
+
 ## Excluded or not worth it (as of 2026-10-11)
 
 | item | why |
@@ -319,7 +365,7 @@ Same harness as round 6; one boot each, in this order, sharing the learned state
 | deduplicating the draft's lm_head / embed | already shared by vLLM |
 | fine-grained Mamba prefix cache | not applicable to multi-module MTP |
 | all-reduce tuning | 22 µs per call, ~2–3 ms per step |
-| CPU compute for cold experts | a host round trip per layer breaks the decode graphs; low priority |
+| CPU compute for cold experts | ~~breaks the decode graphs~~: a handshake inside the graph works (round 8); not built yet |
 
 ## How to reproduce the measurements
 
@@ -384,11 +430,10 @@ Not done yet, and worth doing before relying on it:
 
 1. ~~Measure, then set the hot set from this host's traffic~~: 0041 counts routes, 0043 swaps experts as traffic changes.
 2. ~~Bigger prefill chunks~~ and ~~overlap the cold path in prefill~~: done as 0042 (prefetch into VRAM slots).
-3. **Overlap the cold path at decode.** Hot and cold run in one fused op since 0048, but the cold reads still go
-   over PCIe at ~20 GB/s and are the largest part of a 4-stream step (round 7); splitting cold experts into their own
-   work-groups that start first would hide some of that time behind the hot experts.
-4. **CPU compute for cold experts at decode** (ktransformers style): host DRAM reads at ~60 GB/s against ~19 GB/s
-   over PCIe, so a CPU int4 kernel could beat UVA reads at small batch sizes.
+3. ~~Overlap the cold path at decode~~: the fused op (0048) with the plan kernel and cold workers (round 8) runs at
+   82–91 % of the PCIe bound; what is left needs fewer bytes over PCIe (item 4, or more hot experts).
+4. **CPU compute for cold experts at decode**: spike done (round 8). The CPU kernel reaches 58–64 GB/s and the
+   in-graph handshake works; next is building it into the op (estimate +10–15 % at 1 stream, +20–25 % at 4).
 5. **Read the FP8 PLE shards in place** instead of a 52.5 GB INT8 copy: the 0013 reader would need multi-file row
    offsets and an FP8 dequant path (0007 has one).
 6. **Put B70-0040 on the fork's release branch** so `make-tree.sh` for a release includes it.
