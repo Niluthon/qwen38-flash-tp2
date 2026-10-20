@@ -9,10 +9,12 @@ RAM next to everything else either. `tp2-hotcold` splits them.
 [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) @ `ef554143`: Intel's AutoRound target tensors (the quantization block
 equals `engines/serve-configs/serve-config-intel-autoround.json`) plus RadixArk's FP8 PLE table (`model-plefp8-*`, 128 shards, one
 global scale) plus an INT4-g32 MTP draft (`runtime/mtp-int4-g32`, compressed-tensors). This host runs revision
-`c6af9fee`. Three one-time steps (`docker compose run --rm prepare` downloads the checkpoint and runs all three):
+`c6af9fee`. The engine reads the FP8 PLE shards in place (0050, round 10), so `docker compose run --rm prepare`
+only downloads the checkpoint and makes the two serve snapshots. The INT8 table is the fallback (0008 + 0013) and is
+built only with `BUILD_INT8_PLE=1`:
 
 ```bash
-# INT8 PLE table for 0008/0013, built from the FP8 shards (~3.5 min, 52.5 GB on NVMe)
+# optional: INT8 PLE table for the 0008/0013 fallback, built from the FP8 shards (~3.5 min, 52.5 GB on NVMe)
 CKPT=/models/qwen38-w4a16 OUT_DIR=/models/qwen38-w4a16-int8ple python3 tools/build_int8_ple_from_fp8.py build
 CKPT=/models/qwen38-w4a16 OUT_DIR=/models/qwen38-w4a16-int8ple python3 tools/build_int8_ple_from_fp8.py verify
 # serve snapshots: the target, and the MTP draft with its own quantization block
@@ -55,12 +57,12 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
 `Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
-0040–0049 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-20, after the experiments below): TP 2 + EP 2,
+0040–0050 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-20, after the experiments below): TP 2 + EP 2,
 146 hot experts per layer and rank, swapped by what decode reads (0043 + 0047, long-term ranking on the work volume),
 the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch
 for prefill (0042), the fused decode MoE op (0048) with 70 % of the cold experts computed by the CPU pool (0049) and an
 FP8 draft head, MTP k=3 with the checkpoint's draft, `--gpu-memory-utilization 0.96`, 262,144-token context, image
-input off (`--limit-mm-per-prompt` 0), 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU
+input off (`--limit-mm-per-prompt` 0), 4 slots, 4,096-token batches, the checkpoint's FP8 PLE shards read in place from NVMe (0050) with a 2 GiB row cache, no CPU
 KV tier. It listens on 0.0.0.0:8000. The env switches are in `engines/two-cards/env/tp2-hotcold.env` and
 `docs/switches.md`.
 
@@ -404,6 +406,73 @@ Not tried: overlap the next layer's CPU work behind the current one (the mailbox
 busy ~100–150 µs of a ~260 µs layer), and per-layer lookahead needs the next layer's routing, which decode cannot
 know. 0043's swaps still move cold experts between RAM tiers; the CPU pool reads whatever is pinned.
 
+## Round 10 (2026-10-20): the PLE table from the checkpoint's FP8 shards (item 5, 0050)
+
+Until now the engine serves the PLE table from an INT8 copy (0008 + 0013) that `prepare` builds from the
+checkpoint's FP8 shards: 52.5 GB more on the NVMe, ~3.5 min, and a second rounding (0.66 % mean relative L2 error
+against the FP8 rows). 0050 (`B70_PLE_FP8_NVME=1`, with `B70_PLE_FP8=1`, `B70_PLE_FP8_PATH=/models/qwen38-w4a16`)
+reads the 128 FP8 shard tensors in their 10 checkpoint files directly, through the same 0013 host hook and pinned row
+cache. Design, boot checks, switches and the full verification table: docs/ple-nvme.md, "The checkpoint's FP8 shards
+in place".
+
+What changes per step: nothing on the card except the dequant (0007's LUT instead of `q × s`); on the host a row is
+160 B instead of 164 B (+2.5 % rows in the same cache) and comes from one of 10 files instead of one.
+
+| check (host side, engine untouched) | result |
+|---|---|
+| new tests (synthetic multi-file checkpoint + the real one) | 21 / 21 pass |
+| FP8 rows read in place, re-quantised, vs the INT8 table served today (1,500 random rows) | byte-equal |
+| 0013 / 0013b regression tests | 22 / 22 pass |
+| read time per call, FP8 vs INT8, ms (8 / 64 / 8,192 rows) | 0.21 vs 0.21 / 0.54–0.59 vs 0.54–0.56 / 50.3–50.6 vs 50.7 |
+
+Two cards, one boot each, in this order, idle engine (`engine-data/ab/ab10.sh`: the rounds 6–9 harness plus
+prefill cells and two perplexity passes). Both runs use the dev tree with 0050 (`PYTHONPATH=/work/dev-tree`), so
+only the table differs: N = the INT8 table from NVMe (today's settings), O = the FP8 shards in place (the five lines
+from `tp2-local.env.example`). Both boots log `PLE NVMe host path ready`; O also logs `128 shards in 10 files` and
+`4352 rows byte-equal to the mmap, 65536 own rows NaN-free` on each rank.
+
+| run | KV tokens | 1 stream ms/step (the 4 prompts) | 4 streams tok/s · ms/step | agents tok/s (2 concurrent, total) | 1 stream ms/step after agents | 4 streams tok/s · ms/step after agents | prefill tok/s (3K / 12K / 30K) |
+|---|---|---|---|---|---|---|---|
+| N: INT8 table from NVMe | 271,534 | 34.7 / 31.8 / 32.2 / 32.1 | 178.3 · 61.1 | 114.9 / 129.8 | 35.6 / 31.4 / 37.2 / 30.9 | 186.2 · 59.7 | 4,086 / 4,135 / 3,979 |
+| **O: FP8 shards in place** | 271,308 | 34.7 / 31.7 / 31.8 / 32.1 | 184.8 · 61.4 | 124.9 / 131.5 | 36.8 / 31.8 / 36.8 / 31.3 | 185.1 · 59.5 | 4,085 / 4,151 / 3,983 |
+| **P: rebuilt image (0050 baked in), new defaults, no overrides (the default now)** | 271,195 | 36.0 / 32.6 / 33.6 / 33.4 | 176.8 · 62.5 | 119.3 / 137.1 | 36.8 / 31.3 / 37.8 / 31.6 | 177.8 · 61.7 | 4,021 / 4,143 / 3,973 |
+
+PLE host path over each whole run (both ranks, the 14 one-minute stats windows after warm-up; reads = rows read
+from NVMe; bubble = the per-step host time before the forward, ms):
+
+| run | steps | cache hit rate | reads per step | bubble p50 (median of windows), ms | bubble p99 (median of windows), ms |
+|---|---|---|---|---|---|
+| N: INT8 | 15,220 | 0.905 | 27.8 | 0.51 | 8.88 |
+| O: FP8 | 15,590 | 0.902 | 26.9 | 0.49 | 8.90 |
+| P: image, FP8 | 17,670 | 0.911 | 24.0 | 0.66 | 9.29 |
+
+Perplexity on the four fixed texts (`engine-data/ab/ppl10.py`, prompt logprobs, mean of two passes; run-to-run
+spread within one config up to 0.35 %):
+
+| text | N: INT8, ppl | O: FP8, ppl | O vs N, % |
+|---|---|---|---|
+| README.md | 5.328 | 5.338 | +0.19 |
+| docs_switches.md | 3.957 | 3.936 | −0.53 |
+| docs_two-cards.md | 7.239 | 7.208 | −0.43 |
+| b70_moe_decode.sycl | 5.373 | 5.396 | +0.43 |
+
+P (the rebuilt image) on the same texts: 5.324 / 3.949 / 7.224 / 5.375, i.e. −0.08 / −0.21 / −0.21 / +0.03 % vs N.
+
+Verdict: equal within noise on every axis. Step times differ by ≤ 0.4 ms, prefill by ≤ 0.4 %, hit rate and bubble
+are the same, and perplexity moves ±0.5 % in both directions (the ±1 % gate passes). KV differs by 226 tokens, which
+is within boot-to-boot spread (an N boot with the stale decode-op library earlier the same day gave 271,647). The
+agents' first-run difference (114.9 vs 124.9) follows the generated token count (18,998 vs 23,745 at temperature 0:
+batching), not the PLE path. What 0050 buys is not speed: 52.5 GB less on the NVMe, no 3.5-minute build step in
+`prepare`, and the checkpoint's own FP8 values instead of an INT8 re-rounding of them. **Now the default** (P): the image is rebuilt with 0050 (the build applies it with `--fuzz=0` and checks all 40
+file hashes), `tp2-hotcold.env` sets `B70_PLE_FP8=1`, `B70_PLE_FP8_NVME=1`, `B70_PLE_FP8_PATH=/models/qwen38-w4a16`
+(INT8 off), and `prepare` builds the INT8 table only with `BUILD_INT8_PLE=1`. P's first bench_det is ~1 ms/step
+slower than O's (at the edge of the ~3 % noise); its second bench_det, agents and prefill match N and O, so it is
+read as noise. Its bubble p50 is 0.15 ms higher (16 stats windows instead of 14: its agent runs were longer, 183 / 181 s
+vs 134–190 s), with no effect on step time. Rollback image: `b70-flash-next:tp2-pre0050` (it has no 0050: with it,
+set the INT8 lines from `tp2-local.env.example`, otherwise `B70_PLE_FP8=1` pins the whole FP8 table, ~24 GiB per rank).
+The INT8 table in `/models/qwen38-w4a16-int8ple` (52.5 GB) is no longer read; delete it to free the space, or keep
+it for the fallback.
+
 ## Excluded or not worth it (as of 2026-10-11)
 
 | item | why |
@@ -475,7 +544,10 @@ All commands run in a container from `b70-flash-next:tp2` (or the dev container)
    views of the pinned arena) equals all experts in VRAM, bit for bit, at 1 / 7 / 64 / 1,024 rows. Needs a free card.
 4. **The PLE table.** `tools/build_int8_ple_from_fp8.py verify`: byte-exact re-quantisation of 262,045 sampled rows,
    error against the FP8 source (0.66 % mean).
-5. **The engine.** Boot `engines/two-cards/scripts/run-tp2.sh`; check the boot lines `B70 hot/cold: 48 layers split`, `PLE NVMe host
+5. **The FP8 shards in place (0050).** `pytest --noconftest tests/b70/test_ple_fp8_nvme.py` and
+   `tests/b70/test_ple_int8_nvme.py` (CPU only; run the container with `--security-opt seccomp=unconfined`, or the
+   io_uring cases fail with EPERM under Docker's default profile).
+6. **The engine.** Boot `engines/two-cards/scripts/run-tp2.sh`; check the boot lines `B70 hot/cold: 48 layers split`, `PLE NVMe host
    path ready`, `XPU KV cache size`; then a chat request, a `json_schema` request with MTP, a long-context needle, and
    a speed run (decode at 1 and 4 streams, prefill at 3K and 12K tokens). The numbers above came from that sequence.
 
@@ -495,6 +567,7 @@ Not done yet, and worth doing before relying on it:
    82–91 % of the PCIe bound; what is left needs fewer bytes over PCIe (item 4, or more hot experts).
 4. ~~CPU compute for cold experts at decode~~: built as 0049 and on by default (round 9): 1 stream −16 % step time,
    4 streams −19 %, agents +8–15 %; the timeout fallback keeps the graphs safe.
-5. **Read the FP8 PLE shards in place** instead of a 52.5 GB INT8 copy: the 0013 reader would need multi-file row
-   offsets and an FP8 dequant path (0007 has one).
+5. **Read the FP8 PLE shards in place** instead of a 52.5 GB INT8 copy: built as 0050 (round 10), opt-in
+   (`B70_PLE_FP8_NVME=1`); equal to the INT8 path within noise (speed, cache, perplexity) and the default since the
+   image rebuild; `prepare` no longer builds the INT8 table.
 6. **Put B70-0040 on the fork's release branch** so `make-tree.sh` for a release includes it.

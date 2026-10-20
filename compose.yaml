@@ -77,8 +77,9 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # One-time setup, not started by `up`: `docker compose run --rm prepare` downloads the checkpoint and builds the
-  # INT8 PLE table and the serve snapshots on $MODELS (scripts/prepare-models-tp2.sh; skips what is already there).
+  # One-time setup, not started by `up`: `docker compose run --rm prepare` downloads the checkpoint and makes the
+  # serve snapshots on $MODELS (scripts/prepare-models-tp2.sh; skips what is already there). BUILD_INT8_PLE=1 also
+  # builds the INT8 PLE table, only needed for the INT8 fallback (the engine reads the FP8 shards in place, 0050).
   prepare:
     <<: *engine-base
     profiles: [setup]
@@ -86,6 +87,7 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       REVISION: ${REVISION:-}
       SKIP_DOWNLOAD: ${SKIP_DOWNLOAD:-0}
+      BUILD_INT8_PLE: ${BUILD_INT8_PLE:-0}
     volumes:
       - ./engines:/b70-engines:ro
       - ./tools:/b70-tools:ro

@@ -42,8 +42,8 @@ Already have the weights, or want another quant? [HOW-TO-RUN.md §6](HOW-TO-RUN.
 
 The settings (all in `engines/two-cards/env/tp2-hotcold.env` and `engines/two-cards/args/serve-tp2.args`): 150 hot experts per layer and rank in
 VRAM that follow the traffic (patches 0040, 0043), the rest pinned in host RAM, cold experts prefetched into VRAM for
-prefill (0042), the input embedding in host RAM (0044), FP8 W8A16 dense projections (0045), the INT8 PLE table from
-NVMe (0013), MTP k=3 with the checkpoint's INT4 draft, 4 sequences, a warm-up request at start (known issues item 13).
+prefill (0042), the input embedding in host RAM (0044), FP8 W8A16 dense projections (0045), the checkpoint's FP8 PLE
+shards read in place from NVMe (0013 + 0050), MTP k=3 with the checkpoint's INT4 draft, 4 sequences, a warm-up request at start (known issues item 13).
 Quality-checked against BF16 dense (MMLU, HumanEval); not yet endurance-tested. Without Compose:
 `engines/two-cards/scripts/run-tp2.sh` / `engines/two-cards/scripts/restart-tp2.sh`. Setup, experiments and numbers:
 [docs/two-cards.md](docs/two-cards.md).

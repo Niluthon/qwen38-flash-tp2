@@ -7,13 +7,13 @@ the end. Set the variables in the serving container's environment; `vllm serve` 
 A variable that is not listed here is ignored. Older builds used a `LUMNUS_` prefix for the same switches; those
 names are no longer read, so a deployment that still sets them runs with the feature off.
 
-## PLE n-gram table (0006, 0007, 0008, 0013, 0013b)
+## PLE n-gram table (0006, 0007, 0008, 0013, 0013b, 0050)
 
 | variable | default | patch | effect |
 |---|---|---|---|
 | `B70_PLE_DIRECT_PINNED` | unset (off) | 0006 | `1`: fill the pinned PLE slabs straight from the memory-mapped table file, per TP rank, instead of first loading a pageable copy per rank. Measured boot host-RAM peak on 4 ranks with the BF16 table: ~191 GiB → ~158 GiB. |
 | `B70_PLE_FP8` | unset (off) | 0007 | `1`: keep the table as FP8 E4M3 (one global scale) in the pinned slabs; needs `B70_PLE_FP8_PATH`. Exclusive with `B70_PLE_INT8`. |
-| `B70_PLE_FP8_PATH` | — | 0007 | `.safetensors` with a `table` tensor (or the checkpoint's `…shard_<i>.weight` keys) plus one `weight_scale`. |
+| `B70_PLE_FP8_PATH` | — | 0007, 0050 | `.safetensors` with a `table` tensor (or the checkpoint's `…shard_<i>.weight` keys) plus one `weight_scale`. Since 0050 also a checkpoint directory or its `model.safetensors.index.json`: then only the `…ple_embedding.…` tensors are used, from every file that holds one (they must share one prefix). |
 | `B70_PLE_FP8_CROSSCHECK` | `1` | 0007 | `0` skips the boot cross-check against the BF16 table (only runs when `PLE_TABLE_PATH` is set). |
 | `B70_PLE_FP8_MAX_REL_ERR` | `0.25` | 0007 | refuse to start above this relative L2 error on 4,096 random rows. |
 | `B70_PLE_FP8_DEQUANT` | `lut` | 0007 | `cast` uses the stock cast-and-multiply instead of the 256-entry lookup table (bitwise equal). |
@@ -34,6 +34,7 @@ names are no longer read, so a deployment that still sets them runs with the fea
 | `B70_PLE_INT8_NVME_LOOKAHEAD_TOKENS` | scheduler's `max_num_batched_tokens` | 0013b | tokens predicted per step (unset or `0` = the default). |
 | `B70_PLE_INT8_NVME_NATIVE_DIR` | `$TMPDIR/b70-ple-nvme` | 0013b | where the C reader is compiled at first use (needs `gcc`, present in the base image). |
 | `B70_PLE_INT8_NVME_NATIVE_LIB` | — | 0013b | use this prebuilt reader `.so` instead of compiling. |
+| `B70_PLE_FP8_NVME` | unset (off) | 0050 | `1` (with `B70_PLE_FP8=1`): serve the FP8 table from NVMe in place, straight from the shards `B70_PLE_FP8_PATH` names (160 B/row, the checkpoint's own values), through the 0013 row cache and host hook; no INT8 copy and no pinned table (docs/ple-nvme.md). Every `B70_PLE_INT8_NVME_*` tuning switch above applies to it too (cache size, I/O threads, stats, sync-only, boot sample, reader, lookahead, native dir/lib); `B70_PLE_INT8_NVME` and `B70_PLE_INT8_NVME_PATH` do not. |
 
 `PLE_TABLE_PATH` (wu1ff's variable, the BF16 table) is still read: it is the source table for BF16 serving and the
 reference for the FP8/INT8 cross-checks.
@@ -82,7 +83,7 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_COLD_PREFETCH` | unset (off) | 0042 | `1`: batches with at least `B70_MOE_COLD_PREFETCH_MIN_TOKENS` tokens (prefill) run the cold experts from two VRAM slots instead of UVA reads; layer L+1's cold experts are DMA'd on a copy stream while layer L computes. Same kernel and bytes (outputs unchanged). Costs two layers' cold experts of VRAM (0.53 GiB per card at 136–144 hot). On 2× B70: prefill ~2,600 → ~3,950 tok/s. |
 | `B70_MOE_COLD_PREFETCH_MIN_TOKENS` | `512` | 0042 | smallest batch that uses the slots (min 64); smaller batches, and every decode graph (capture sizes ≤ 16), keep the UVA path. |
 | `B70_MOE_ROUTE_COUNT` | unset (off) | 0041, 0043, 0047 | `prefill`: count routes per (layer, global expert) in eager batches (prefill, mixed) only, nothing added to the decode graphs; `1`: also inside the decode graphs (two kernels per layer since 0047, cost within noise; four before, ~4 %). Log line per period: the share of this rank's prefill and decode routes served by cold experts. Eager counting starts with the first real batch (the profiling run, and so the KV size, is unchanged). |
-| `B70_MOE_ROUTE_COUNT_S` | `60` | 0041 | period of the log line / dump, seconds (read on the host after the per-step sync of the NVMe PLE path, so it needs `B70_PLE_INT8_NVME=1`). |
+| `B70_MOE_ROUTE_COUNT_S` | `60` | 0041 | period of the log line / dump, seconds (read on the host after the per-step sync of the NVMe PLE path, so it needs an NVMe PLE path: `B70_PLE_INT8_NVME=1` or `B70_PLE_FP8_NVME=1`). |
 | `B70_MOE_ROUTE_COUNT_PATH` | unset | 0041 | write cumulative counts to `<path>-rank<r>.json` (`{"<layer>": [count per global expert]}`), the input for re-ranking. |
 | `B70_MOE_ROUTE_TRACE` | unset | 0046 | with `B70_MOE_ROUTE_COUNT=1`: write `<path>-rank<r>.jsonl`, the cold set per layer and then one line per decode step with the experts each layer routed to. A diagnostic for expert-cache studies (`tools/bench_tp2/pool_reuse.py`). |
 | `B70_MOE_HOTCOLD_SWAP` | unset (off) | 0043 | `1`: the hot set follows the traffic. Every period each rank scores its local experts from the prefill route counts (implies `B70_MOE_ROUTE_COUNT=prefill`) and swaps experts between VRAM and pinned RAM in place (weights, scales and expert maps; no graph recapture). Exact: outputs do not depend on placement. We run it on 2× B70. |

@@ -24,6 +24,12 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
   paired quality gate (MMLU 87.33 → 87.23 %, p = 0.79; HumanEval 157 → 158 / 164); on in `tp2-hotcold`.
 - **0046**: per-step decode route trace, `B70_MOE_ROUTE_TRACE` (diagnostic). Used to show that a fixed VRAM pool for
   cold experts would catch only 26–29 % of cold routes (docs/two-cards.md, round 5).
+- **0050**: the PLE table read in place from the checkpoint's FP8 shards on NVMe, `B70_PLE_FP8_NVME` (with
+  `B70_PLE_FP8=1`; `B70_PLE_FP8_PATH` may be the checkpoint directory). Multi-file row store in `ple_nvme.py`
+  (per-read fds in the native/io_uring readers), boot checks (reader = mmap bytes, no NaN codes). On in
+  `tp2-hotcold.env`: speed, cache hit rate and perplexity equal to the INT8 table (docs/two-cards.md round 10);
+  `prepare` no longer builds the 52.5 GB INT8 table (`BUILD_INT8_PLE=1` for the fallback). Tests:
+  `tests/b70/test_ple_fp8_nvme.py`.
 - `tp2-hotcold` defaults now: 150 hot experts, 0042 + 0043 + 0044 + 0045 on, util 0.95, 131,072-token context; KV
   201,794 tokens; ~90–99 tok/s total at 2 streams (code prompts). Experiments and the not-worth-it list in docs/two-cards.md; known issues item 14 (torch profiler on XPU).
 - `compose.yaml` + `engines/compose-serve.sh`: `docker compose up -d` runs the two-card engine with a warm-up service;

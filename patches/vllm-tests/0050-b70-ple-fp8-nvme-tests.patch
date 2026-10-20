@@ -1,0 +1,569 @@
+From fcb70305faca8f7999ad427ea7513231bb54e259 Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 02:48:58 +0000
+Subject: [PATCH] B70-0050: read the checkpoint's FP8 PLE shards from NVMe in
+ place
+
+B70_PLE_FP8_NVME=1 (with B70_PLE_FP8=1) serves the PLE n-gram table straight from the checkpoint's FP8 shards
+(128 tensors in 10 .safetensors files, 160 B rows, one global scale) through 0013's host hook and pinned row
+cache, so the 52.5 GB INT8 copy from tools/build_int8_ple_from_fp8.py is no longer needed. B70_PLE_FP8_PATH may
+now be a checkpoint directory or its model.safetensors.index.json (only the ple_embedding tensors are mapped).
+
+- ple_nvme: PleNvmeRowStore takes segments (file, data start, first row, rows): one fd per file, per-read fds in
+  the native pool and io_uring readers (NULL = the single-file path, unchanged); clone() for the lookahead.
+  fp8_ple_locations / fp8_ple_segments resolve the shards in place; fp8_nan_rows for the boot check.
+- ngram_embedding: _b70_fp8_nvme_load (reader bytes == mmap bytes on 4,096 rows + every shard's ends, NaN-free
+  sample of the rank's rows), FP8 rows gathered as bytes, dequantised by 0007's LUT after the all-reduce.
+  B70_PLE_INT8_NVME_SYNC_ONLY works for the FP8 table too. All B70_PLE_INT8_NVME_* tuning switches apply.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/b70/test_ple_fp8_nvme.py | 536 +++++++++++++++++++++++++++++++++
+ 1 file changed, 536 insertions(+)
+ create mode 100644 tests/b70/test_ple_fp8_nvme.py
+
+diff --git a/tests/b70/test_ple_fp8_nvme.py b/tests/b70/test_ple_fp8_nvme.py
+new file mode 100644
+index 0000000..67b8652
+--- /dev/null
++++ b/tests/b70/test_ple_fp8_nvme.py
+@@ -0,0 +1,536 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70 0050 host-side tests: the checkpoint's FP8 PLE shards read in place.
++
++CPU only, no vLLM import (same rules as test_ple_int8_nvme.py):
++    /opt/venv/bin/python -m pytest --noconftest -q tests/b70/test_ple_fp8_nvme.py
++
++``ple_nvme.py`` is loaded by path; the 0007/0050 mmap helpers are extracted
++from ngram_embedding.py with ``ast`` (their relative import of ple_nvme is
++served from a fake package).
++
++Env:
++  PLE_FP8_CKPT        checkpoint with the FP8 shards (default /models/qwen38-w4a16);
++                      the real-file tests are skipped when absent
++  PLE_NVME_TABLE      the INT8 table built from it (default
++                      /models/qwen38-w4a16-int8ple/ple_ngram_int8_rowscale.safetensors);
++                      used for the FP8 -> INT8 equality test, skipped when absent
++  PLE_FP8_TEST_ROWS   random rows for the real-file tests (default 2000)
++  PLE_NVME_TMP        scratch dir for the synthetic files (/tmp/ple-nvme)
++"""
++
++from __future__ import annotations
++
++import ast
++import errno
++import importlib.util
++import json
++import os
++import sys
++import types
++from pathlib import Path
++
++import numpy as np
++import pytest
++import torch
++
++ROOT = Path(__file__).resolve().parents[2]
++NVIDIA = ROOT / "vllm" / "models" / "qwen4_exp" / "nvidia"
++CKPT = os.environ.get("PLE_FP8_CKPT", "/models/qwen38-w4a16")
++INT8 = os.environ.get(
++    "PLE_NVME_TABLE", "/models/qwen38-w4a16-int8ple/ple_ngram_int8_rowscale.safetensors"
++)
++os.environ.setdefault("PLE_NVME_TABLE", INT8)
++TMP = Path(os.environ.get("PLE_NVME_TMP", "/tmp/ple-nvme"))
++ROW = 160
++PFX = "model.language_model.layers.1.ple.ple_embedding."
++
++
++def _load(name: str, path: Path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++pn = _load("ple_nvme", NVIDIA / "ple_nvme.py")
++
++
++def _embedding_helpers():
++    """0007/0050 module-level helpers of ngram_embedding.py, verbatim."""
++    keep = {"_b70_mmap_safetensors", "_b70_mmap_safetensors_any", "_b70_ple_tensor_filter",
++            "_b70_ple_fp8_segments", "_b70_fp8_lut", "_b70_fp8_dequantize_lut"}
++    source = (NVIDIA / "ngram_embedding.py").read_text()
++    tree = ast.parse(source)
++    body = []
++    for node in tree.body:
++        if isinstance(node, ast.FunctionDef) and node.name in keep:
++            body.append(node)
++        elif (isinstance(node, ast.Assign) and len(node.targets) == 1
++              and isinstance(node.targets[0], ast.Name)
++              and node.targets[0].id == "_B70_SAFETENSORS_DTYPES"):
++            body.append(node)
++    assert {n.name for n in body if isinstance(n, ast.FunctionDef)} == keep
++    package = types.ModuleType("b70fake")
++    package.__path__ = []
++    sys.modules["b70fake"] = package
++    sys.modules["b70fake.ple_nvme"] = pn
++    namespace = {"torch": torch, "os": os, "__name__": "b70fake.ngram_embedding",
++                 "__package__": "b70fake"}
++    module = ast.Module(body=body, type_ignores=[])
++    ast.fix_missing_locations(module)
++    exec(compile(module, str(NVIDIA / "ngram_embedding.py"), "exec"), namespace)
++    return types.SimpleNamespace(**namespace)
++
++
++ne = _embedding_helpers()
++
++
++# ---------------------------------------------------------------------------
++# Synthetic checkpoint: FP8 shards over several files, unaligned data starts
++# ---------------------------------------------------------------------------
++
++PARTS = 7
++VOCAB = 60_001  # shard size ceil(60001 / 7) = 8572, the last one 8569 rows
++SHARD = -(-VOCAB // PARTS)
++
++
++def _rows_bytes(rows: np.ndarray) -> np.ndarray:
++    rows = rows.astype(np.int64)
++    return ((rows[:, None] * 1_000_003 + np.arange(ROW)[None, :] * 7919) % 251).astype(np.uint8)
++
++
++def _write_safetensors(path: Path, tensors: list[tuple[str, str, list[int], bytes]],
++                       pad: int) -> None:
++    header, pos, blobs = {}, 0, []
++    for name, dtype, shape, raw in tensors:
++        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [pos, pos + len(raw)]}
++        pos += len(raw)
++        blobs.append(raw)
++    js = json.dumps(header).encode() + b" " * pad  # pad: unaligned data start
++    with open(path, "wb") as handle:
++        handle.write(len(js).to_bytes(8, "little"))
++        handle.write(js)
++        for raw in blobs:
++            handle.write(raw)
++
++
++def _synthetic_checkpoint(name: str = "fp8ckpt") -> Path:
++    folder = TMP / name
++    marker = folder / "model.safetensors.index.json"
++    if marker.exists():
++        return folder
++    folder.mkdir(parents=True, exist_ok=True)
++
++    def shard(i: int):
++        first = i * SHARD
++        rows = min(SHARD, VOCAB - first)
++        raw = _rows_bytes(np.arange(first, first + rows)).tobytes()
++        return (f"{PFX}ngram_embedding.shard_{i}.weight", "F8_E4M3", [rows, ROW], raw)
++
++    other = ("model.language_model.layers.0.mlp.weight", "BF16", [3, 5], bytes(30))
++    scale = (f"{PFX}ngram_embedding.weight_scale", "BF16", [1],
++             torch.tensor([0.0123], dtype=torch.bfloat16).view(torch.uint8).numpy().tobytes())
++    foreign_scale = ("model.language_model.layers.3.mlp.weight_scale", "BF16", [1], bytes(2))
++    layout = [
++        (f"{PFX}layer_multipliers", "I64", [3], np.array([3, 5, 7], "<i8").tobytes()),
++        (f"{PFX}ngram_heads_offsets", "I64", [2], np.array([0, 30000], "<i8").tobytes()),
++        (f"{PFX}ngram_heads_vocab_sizes", "I64", [2], np.array([30000, 30001], "<i8").tobytes()),
++    ]
++    files = {
++        "model-00001.safetensors": ([other] + layout + [foreign_scale], 5),
++        "model-plefp8-00000.safetensors": ([shard(0), other, shard(1), shard(2)], 1),
++        "model-plefp8-00001.safetensors": ([shard(3), shard(4)], 4093),
++        "model-plefp8-00002.safetensors": ([shard(5), scale, shard(6)], 77),
++    }
++    weight_map = {}
++    for file, (tensors, pad) in files.items():
++        _write_safetensors(folder / file, tensors, pad)
++        for t in tensors:
++            weight_map[t[0]] = file
++    marker.write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
++    return folder
++
++
++def _keep(name: str) -> bool:
++    return ".ple_embedding." in name
++
++
++def _store(folder: Path, **kwargs):
++    locations = pn.fp8_ple_locations(str(folder), _keep)
++    segments = pn.fp8_ple_segments(locations, VOCAB, ROW, PARTS)
++    first = segments[0]
++    return pn.PleNvmeRowStore(first[0], first[1], ROW, VOCAB, segments=segments, **kwargs), segments
++
++
++def _probe_rows(segments, rng, count=900) -> np.ndarray:
++    ends = [v for _, _, f, r in segments for v in (f, f + 1, f + r - 2, f + r - 1)]
++    straddle = []
++    for _, start, first, rows in segments:
++        local = np.arange(rows)
++        hit = local[((start + ROW * local) % 4096) > 4096 - ROW][:8]
++        straddle.extend((first + hit).tolist())
++    return np.unique(np.concatenate([
++        rng.integers(0, VOCAB, size=count), np.array(ends + straddle, np.int64)]))
++
++
++# ---------------------------------------------------------------------------
++# Locations and segments
++# ---------------------------------------------------------------------------
++
++
++def test_locations_filter_and_segments_line_up():
++    folder = _synthetic_checkpoint()
++    locations = pn.fp8_ple_locations(str(folder), _keep)
++    assert not any("mlp" in name for name in locations)
++    assert len(locations) == PARTS + 1 + 3
++    segments = pn.fp8_ple_segments(locations, VOCAB, ROW, PARTS)
++    assert [s[2] for s in segments] == [i * SHARD for i in range(PARTS)]
++    assert sum(s[3] for s in segments) == VOCAB
++    assert len({s[0] for s in segments}) == 3
++    # Unaligned data starts in every shard file (the case 0013 never had).
++    assert any(s[1] % 4096 for s in segments)
++    # Index file and directory give the same answer.
++    again = pn.fp8_ple_locations(str(folder / "model.safetensors.index.json"), _keep)
++    assert again == locations
++
++
++def test_segments_refuse_bad_layouts():
++    folder = _synthetic_checkpoint()
++    locations = pn.fp8_ple_locations(str(folder), _keep)
++    shard3 = f"{PFX}ngram_embedding.shard_3.weight"
++    missing = {k: v for k, v in locations.items() if k != shard3}
++    with pytest.raises(ValueError, match="shards 0..6"):
++        pn.fp8_ple_segments(missing, VOCAB, ROW, PARTS)
++    wrong_dtype = dict(locations)
++    file, start, _, shape = wrong_dtype[shard3]
++    wrong_dtype[shard3] = (file, start, "BF16", shape)
++    with pytest.raises(ValueError, match="expected F8_E4M3"):
++        pn.fp8_ple_segments(wrong_dtype, VOCAB, ROW, PARTS)
++    wrong_rows = dict(locations)
++    wrong_rows[shard3] = (file, start, "F8_E4M3", [shape[0] - 1, ROW])
++    with pytest.raises(ValueError, match="rows, expected"):
++        pn.fp8_ple_segments(wrong_rows, VOCAB, ROW, PARTS)
++    with pytest.raises(ValueError, match=r"expected \[\*, 128\]"):
++        pn.fp8_ple_segments(locations, VOCAB, 128, PARTS)
++    with pytest.raises(ValueError, match="shards"):
++        pn.fp8_ple_segments(locations, VOCAB, ROW, PARTS + 1)
++
++
++def test_store_refuses_gaps_and_short_files():
++    folder = _synthetic_checkpoint()
++    _, segments = _store(folder)
++    gap = list(segments)
++    file, start, first, rows = gap[2]
++    gap[2] = (file, start, first + 1, rows - 1)
++    with pytest.raises(ValueError, match="without gaps"):
++        pn.PleNvmeRowStore(file, start, ROW, VOCAB, segments=gap)
++    long = list(segments)
++    file, start, first, rows = long[-1]
++    long[-1] = (file, start + 10_000_000, first, rows)
++    with pytest.raises(ValueError, match="past the file"):
++        pn.PleNvmeRowStore(file, start, ROW, VOCAB, segments=long)
++    with pytest.raises(ValueError, match="cover"):
++        pn.PleNvmeRowStore(file, start, ROW, VOCAB + 1, segments=segments)
++
++
++# ---------------------------------------------------------------------------
++# Reads
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("reader,kwargs", [
++    ("py", {"io_threads": 1}), ("py", {"io_threads": 8}),
++    ("native", {"io_threads": 1}), ("native", {"io_threads": 16}),
++    ("uring", {"queue_depth": 1}), ("uring", {"queue_depth": 32}),
++])
++def test_multi_file_rows_exact(reader, kwargs):
++    folder = _synthetic_checkpoint()
++    store, segments = _store(folder, reader=reader, max_batch_rows=128, **kwargs)
++    try:
++        rows = _probe_rows(segments, np.random.default_rng(5))
++        assert np.array_equal(store.read_rows(rows), _rows_bytes(rows))
++        # Unsorted, repeated ids read the same.
++        shuffled = np.random.default_rng(6).permutation(np.concatenate([rows, rows[:50]]))
++        assert np.array_equal(store.read_rows(shuffled), _rows_bytes(shuffled))
++        assert store.native_retries == 0
++    finally:
++        store.close()
++
++
++def test_clone_reads_the_same_with_its_own_fds():
++    folder = _synthetic_checkpoint()
++    store, segments = _store(folder, reader="native", io_threads=4)
++    twin = store.clone(max_batch_rows=64)
++    try:
++        assert set(twin._fds).isdisjoint(store._fds)
++        assert twin.segments == store.segments and twin.reader == "native"
++        rows = _probe_rows(segments, np.random.default_rng(8), 300)
++        assert np.array_equal(twin.read_rows(rows), store.read_rows(rows))
++    finally:
++        twin.close()
++        store.close()
++
++
++def test_retry_uses_the_rows_own_file():
++    folder = _synthetic_checkpoint()
++    store, segments = _store(folder, io_threads=1)
++    real = store._preadv
++    seen = []
++    failed = set()
++
++    def flaky(fd, views, offset):
++        seen.append(fd)
++        if (fd, offset) not in failed:
++            failed.add((fd, offset))
++            raise OSError(errno.EIO, "injected")
++        return real(fd, views, offset)
++
++    store._preadv = flaky
++    try:
++        rows = np.array([s[2] + 3 for s in segments], np.int64)  # one row per shard
++        assert np.array_equal(store.read_rows(rows), _rows_bytes(rows))
++        want_fds = store.locate(rows)[0].tolist()
++        assert seen == [fd for fd in want_fds for _ in range(2)]
++        assert len(set(want_fds)) == 3
++        store._preadv = lambda fd, views, offset: (_ for _ in ()).throw(
++            OSError(errno.EIO, "dead"))
++        with pytest.raises(RuntimeError, match=r"model-plefp8-00001\.safetensors"):
++            store.read_rows(np.array([segments[3][2]], np.int64))
++    finally:
++        store._preadv = real
++        store.close()
++
++
++def test_native_multi_file_failures_go_through_retry_path():
++    """Every native read fails (EBADF): each one is redone by the Python
++    retry path, rows still exact."""
++    folder = _synthetic_checkpoint()
++    for reader in ("native", "uring"):
++        store, segments = _store(folder, reader=reader, io_threads=4)
++        real_seg_fd = store._seg_fd.copy()
++        real = store._preadv
++        try:
++            rows = _probe_rows(segments, np.random.default_rng(9), 200)
++            true_fds = iter(store.locate(rows)[0].tolist())
++            bad = os.open(os.devnull, os.O_RDONLY)
++            os.close(bad)
++            store._seg_fd[:] = bad
++            # The retries run in row order (one batch): give each its real fd.
++            store._preadv = lambda fd, views, offset: real(next(true_fds), views, offset)
++            out = store.read_rows(rows)
++            assert store.native_retries == rows.shape[0]
++            assert np.array_equal(out, _rows_bytes(rows))
++        finally:
++            store._seg_fd[:] = real_seg_fd
++            store._preadv = real
++            store.close()
++
++
++# ---------------------------------------------------------------------------
++# The cache / gather path with 160-byte FP8 rows
++# ---------------------------------------------------------------------------
++
++
++def test_server_cache_slots_equal_table_rows_two_ranks():
++    """Two ranks over the multi-file store: what the gather would read from
++    each rank's cache, summed as int8 (the all-reduce), equals the table rows
++    of the step's n-gram ids, step after step (with evictions)."""
++    folder = _synthetic_checkpoint()
++    sizes = np.array([29_989, 30_011], np.int64)
++    offsets = np.array([0, 29_989], np.int64)
++    multipliers = np.array([1_000_003, 999_983], np.int64)  # ngram_size 2
++    tp, per = 2, -(-VOCAB // 2)
++    servers, stores = [], []
++    for rank in range(tp):
++        lo, hi = rank * per, min(VOCAB, (rank + 1) * per)
++        store, _ = _store(folder, reader="native", io_threads=4)
++        stores.append(store)
++        capacity = 900
++        cache = pn.PleRowCache(hi - lo, capacity, ROW, slab=np.zeros((capacity, ROW), np.uint8))
++        servers.append(pn.PleNvmeServer(
++            tp_start=lo, tp_end=hi, multipliers=multipliers, sizes=sizes, offsets=offsets,
++            eos_token_id=7, heads_per_ngram=2, cache=cache, store=store,
++            stats=pn.PleNvmeStats(rank, 60, False),
++        ))
++    rng = np.random.default_rng(11)
++    staging = np.empty(400 * 2, np.int64)
++    try:
++        for step in range(60):
++            num_reqs = int(rng.integers(1, 4))
++            lens = rng.integers(1, 60, size=num_reqs)
++            real = int(lens.sum())
++            tokens = rng.integers(0, 50_000, size=real)
++            qsl = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64)
++            ctx = rng.integers(0, 50_000, size=(num_reqs, 1))
++            padded = real + int(rng.integers(0, 5))
++            ids = servers[0].hash(tokens, qsl, ctx)
++            reduced = np.zeros((padded * 2, ROW), np.int16)
++            for server in servers:
++                slots = server.resolve(tokens, qsl, ctx, padded, staging)[: padded * 2]
++                got = np.zeros((padded * 2, ROW), np.uint8)
++                hit = slots >= 0
++                got[hit] = server.cache.slab[slots[hit]]
++                reduced += got.view(np.int8).astype(np.int16)
++            want = np.zeros((padded * 2, ROW), np.uint8)
++            want[: real * 2] = _rows_bytes(ids.reshape(-1))
++            assert np.array_equal(reduced.astype(np.int8).view(np.uint8), want), f"step {step}"
++        assert sum(s.stats.total_reads for s in servers) > 900  # evictions happened
++    finally:
++        for store in stores:
++            store.close()
++
++
++def test_fp8_nan_rows():
++    rows = np.zeros((5, ROW), np.uint8)
++    rows[1, 7] = 0x7F
++    rows[3, 159] = 0xFF
++    rows[4, 0] = 0x7E  # the largest finite code: not NaN
++    assert pn.fp8_nan_rows(rows).tolist() == [1, 3]
++
++
++# ---------------------------------------------------------------------------
++# 0007/0050 mmap helpers (directory mode) agree with the row store
++# ---------------------------------------------------------------------------
++
++
++def test_mmap_any_directory_matches_store():
++    folder = _synthetic_checkpoint()
++    for path in (str(folder), str(folder / "model.safetensors.index.json")):
++        tensors = ne._b70_mmap_safetensors_any(path)
++        assert not any("mlp" in name for name in tensors)
++        segments_mm, scale, _ = ne._b70_ple_fp8_segments(tensors, VOCAB, ROW, PARTS)
++        assert float(scale[0]) == pytest.approx(0.0123, rel=1e-2)
++        store, segments = _store(folder)
++        try:
++            assert [s for s, _ in segments_mm] == [s[2] for s in segments]
++            rows = _probe_rows(segments, np.random.default_rng(13), 300)
++            starts = np.array([s for s, _ in segments_mm])
++            seg_of = np.searchsorted(starts, rows, side="right") - 1
++            want = np.stack([
++                segments_mm[k][1].view(torch.uint8)[r - starts[k]].numpy()
++                for r, k in zip(rows.tolist(), seg_of.tolist())
++            ])
++            assert np.array_equal(store.read_rows(rows), want)
++        finally:
++            store.close()
++
++
++def test_mmap_any_refuses_two_ple_tables():
++    folder = TMP / "fp8ckpt-two"
++    folder.mkdir(parents=True, exist_ok=True)
++    raw = _rows_bytes(np.arange(4)).tobytes()
++    _write_safetensors(folder / "a.safetensors", [
++        (f"{PFX}ngram_embedding.shard_0.weight", "F8_E4M3", [4, ROW], raw),
++        ("mtp.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight", "F8_E4M3",
++         [4, ROW], raw),
++    ], 3)
++    (folder / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
++        f"{PFX}ngram_embedding.shard_0.weight": "a.safetensors",
++        "mtp.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight": "a.safetensors",
++    }}))
++    with pytest.raises(ValueError, match="2 prefixes"):
++        ne._b70_mmap_safetensors_any(str(folder))
++
++
++# ---------------------------------------------------------------------------
++# The real checkpoint (skipped when absent)
++# ---------------------------------------------------------------------------
++
++REAL_VOCAB, REAL_PARTS = 320_001_536, 128
++needs_ckpt = pytest.mark.skipif(
++    not os.path.exists(os.path.join(CKPT, "model.safetensors.index.json")),
++    reason=f"no checkpoint at {CKPT}",
++)
++
++
++def _real_store(reader="native"):
++    locations = pn.fp8_ple_locations(CKPT, _keep)
++    segments = pn.fp8_ple_segments(locations, REAL_VOCAB, ROW, REAL_PARTS)
++    first = segments[0]
++    store = pn.PleNvmeRowStore(first[0], first[1], ROW, REAL_VOCAB, segments=segments,
++                               reader=reader, io_threads=16)
++    return store, segments
++
++
++def _buffered_rows(segments, rows: np.ndarray) -> np.ndarray:
++    """Reference: plain buffered pread (no O_DIRECT, no alignment)."""
++    out = np.empty((rows.shape[0], ROW), np.uint8)
++    first = np.array([s[2] for s in segments])
++    fds = {}
++    try:
++        for i, row in enumerate(rows.tolist()):
++            seg = segments[int(np.searchsorted(first, row, side="right") - 1)]
++            fd = fds.get(seg[0])
++            if fd is None:
++                fd = fds[seg[0]] = os.open(seg[0], os.O_RDONLY)
++            out[i] = np.frombuffer(os.pread(fd, ROW, seg[1] + ROW * (row - seg[2])), np.uint8)
++    finally:
++        for fd in fds.values():
++            os.close(fd)
++    return out
++
++
++@needs_ckpt
++def test_real_checkpoint_layout():
++    store, segments = _real_store()
++    try:
++        assert len(segments) == REAL_PARTS
++        assert len({s[0] for s in segments}) == 10
++        assert all(s[3] == 2_500_012 for s in segments)
++    finally:
++        store.close()
++
++
++@needs_ckpt
++@pytest.mark.parametrize("reader", ["native", "uring", "py"])
++def test_real_checkpoint_rows_exact(reader):
++    store, segments = _real_store(reader)
++    try:
++        rng = np.random.default_rng(20261020)
++        count = int(os.environ.get("PLE_FP8_TEST_ROWS", "2000"))
++        ends = [v for _, _, f, r in segments for v in (f, f + r - 1)]
++        rows = np.unique(np.concatenate([rng.integers(0, REAL_VOCAB, count),
++                                         np.array(ends, np.int64)]))
++        got = store.read_rows(rows)
++        assert np.array_equal(got, _buffered_rows(segments, rows))
++        assert pn.fp8_nan_rows(got).size == 0
++    finally:
++        store.close()
++
++
++@needs_ckpt
++@pytest.mark.skipif(not os.path.exists(INT8), reason=f"no INT8 table at {INT8}")
++def test_real_fp8_rows_requantise_to_the_int8_table():
++    """End to end: row g read in place from the shards, re-quantised exactly
++    as tools/build_int8_ple_from_fp8.py does, is byte-equal to row g of the
++    INT8 table 0013 serves today. So the FP8 path serves the same rows in
++    the same order (only without the INT8 rounding)."""
++    store, segments = _real_store()
++    tensors = ne._b70_mmap_safetensors_any(CKPT)
++    _, scale, _ = ne._b70_ple_fp8_segments(tensors, REAL_VOCAB, ROW, REAL_PARTS)
++    data_start, shape, _ = pn.safetensors_tensor_location(INT8, "table")
++    int8 = pn.PleNvmeRowStore(INT8, data_start, 164, shape[0], reader="native")
++    try:
++        rng = np.random.default_rng(7)
++        rows = np.unique(rng.integers(0, REAL_VOCAB, 1500))
++        fp8 = torch.from_numpy(store.read_rows(rows))
++        x = fp8.view(torch.float8_e4m3fn).to(torch.float32) * float(scale[0])
++        s = x.abs().amax(1, keepdim=True) / 127.0
++        q = (x / s.clamp_min(1e-30)).round().clamp_(-127, 127).to(torch.int8)
++        want = torch.empty(rows.shape[0], 164, dtype=torch.uint8)
++        want[:, :ROW] = q.view(torch.uint8)
++        want[:, ROW:] = s.contiguous().view(torch.uint8).reshape(-1, 4)
++        assert np.array_equal(int8.read_rows(rows), want.numpy())
++        # And 0007's LUT dequant of those rows equals the stock cast-multiply.
++        lut = ne._b70_fp8_lut(scale)
++        got = ne._b70_fp8_dequantize_lut(lut, fp8.view(torch.float8_e4m3fn), torch.bfloat16)
++        stock = fp8.view(torch.float8_e4m3fn).to(torch.bfloat16) * scale.to(torch.bfloat16)
++        assert torch.equal(got, stock)
++    finally:
++        int8.close()
++        store.close()
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main(["--noconftest", "-q", __file__, *sys.argv[1:]]))
+-- 
+2.53.0
+

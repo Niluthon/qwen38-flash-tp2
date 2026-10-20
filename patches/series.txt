@@ -57,3 +57,4 @@ B70-0046                                             0046-b70-moe-route-trace.pa
 B70-0047                                             0047-b70-moe-decode-aware-ranking.patch                  0047-b70-moe-decode-aware-ranking-tests.patch
 B70-0048                                             0048-b70-moe-decode-op-and-fp8-draft-head.patch          -
 B70-0049                                             0049-b70-moe-decode-op-cpu-pool-pinning.patch           -
+B70-0050                                             0050-b70-ple-fp8-nvme-in-place.patch                    0050-b70-ple-fp8-nvme-tests.patch

@@ -4,10 +4,14 @@
 #   docker compose run --rm prepare
 #
 # Every step is skipped when its result is already there, so it is safe to run again (an interrupted download
-# resumes). Needs ~185 GB free on the models volume and an internet connection; ~1-3 h depending on the link.
+# resumes). Needs ~130 GB free on the models volume (~185 GB with BUILD_INT8_PLE=1) and an internet connection;
+# ~1-3 h depending on the link.
 #
 #   1. albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE @ $REVISION   -> /models/qwen38-w4a16              (~129 GB)
-#   2. INT8 PLE table built from its FP8 shards, then verified -> /models/qwen38-w4a16-int8ple       (~52.5 GB)
+#   2. only with BUILD_INT8_PLE=1: INT8 PLE table built from its FP8 shards, then verified
+#                                                               -> /models/qwen38-w4a16-int8ple       (~52.5 GB)
+#      The engine serves the FP8 shards in place (patch 0050) and does not need it; it is the fallback table
+#      (B70_PLE_INT8=1 + B70_PLE_INT8_NVME=1, docs/ple-nvme.md).
 #   3. serve snapshots (symlinks + config.json) for the target -> /models/qwen38-w4a16-snapshot
 #      and for the MTP draft                                    -> /models/qwen38-w4a16-mtp-snapshot
 #
@@ -48,7 +52,9 @@ fi
 
 step "2/3 INT8 PLE table -> $PLE"
 T=$PLE/ple_ngram_int8_rowscale.safetensors
-if [ -f "$T.ok" ]; then
+if [ "${BUILD_INT8_PLE:-0}" != 1 ]; then
+  echo "skipped: the engine reads the FP8 shards in place (0050); BUILD_INT8_PLE=1 builds the INT8 fallback table"
+elif [ -f "$T.ok" ]; then
   echo "already built"
 elif [ -f "$T" ]; then
   echo "found a table without its .ok marker: verifying it instead of rebuilding"
@@ -68,5 +74,6 @@ step "3/3 serve snapshots"
   || "$PY" -I "$TOOLS/fp8ple_snapshot.py" --keep-quant "$CKPT/runtime/mtp-int4-g32" "$CONFIG" "$M/qwen38-w4a16-mtp-snapshot"
 
 owner=$(stat -c %u:%g "$M")
-chown -R "$owner" "$CKPT" "$PLE" "$M/qwen38-w4a16-snapshot" "$M/qwen38-w4a16-mtp-snapshot" 2>/dev/null || true
+[ -d "$PLE" ] || PLE=
+chown -R "$owner" "$CKPT" ${PLE:+"$PLE"} "$M/qwen38-w4a16-snapshot" "$M/qwen38-w4a16-mtp-snapshot" 2>/dev/null || true
 step "done; start the engine with: docker compose up -d"

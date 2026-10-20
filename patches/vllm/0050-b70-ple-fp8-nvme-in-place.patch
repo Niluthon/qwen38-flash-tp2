@@ -1,0 +1,835 @@
+From fcb70305faca8f7999ad427ea7513231bb54e259 Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 02:48:58 +0000
+Subject: [PATCH] B70-0050: read the checkpoint's FP8 PLE shards from NVMe in
+ place
+
+B70_PLE_FP8_NVME=1 (with B70_PLE_FP8=1) serves the PLE n-gram table straight from the checkpoint's FP8 shards
+(128 tensors in 10 .safetensors files, 160 B rows, one global scale) through 0013's host hook and pinned row
+cache, so the 52.5 GB INT8 copy from tools/build_int8_ple_from_fp8.py is no longer needed. B70_PLE_FP8_PATH may
+now be a checkpoint directory or its model.safetensors.index.json (only the ple_embedding tensors are mapped).
+
+- ple_nvme: PleNvmeRowStore takes segments (file, data start, first row, rows): one fd per file, per-read fds in
+  the native pool and io_uring readers (NULL = the single-file path, unchanged); clone() for the lookahead.
+  fp8_ple_locations / fp8_ple_segments resolve the shards in place; fp8_nan_rows for the boot check.
+- ngram_embedding: _b70_fp8_nvme_load (reader bytes == mmap bytes on 4,096 rows + every shard's ends, NaN-free
+  sample of the rank's rows), FP8 rows gathered as bytes, dequantised by 0007's LUT after the all-reduce.
+  B70_PLE_INT8_NVME_SYNC_ONLY works for the FP8 table too. All B70_PLE_INT8_NVME_* tuning switches apply.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../qwen4_exp/nvidia/ngram_embedding.py       | 214 +++++++++++-
+ vllm/models/qwen4_exp/nvidia/ple_nvme.py      | 317 +++++++++++++++---
+ 2 files changed, 472 insertions(+), 59 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index e7d6489..09eeefa 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -129,6 +129,57 @@ def _ple_int8_nvme_sync_only() -> bool:
+     return os.environ.get("B70_PLE_INT8_NVME_SYNC_ONLY", "0") == "1"
+ 
+ 
++def _ple_fp8_nvme_enabled() -> bool:
++    """B70 0050 gate: serve the checkpoint's FP8 PLE shards from NVMe in place.
++
++    Default OFF. On (requires B70_PLE_FP8=1): B70_PLE_FP8_PATH (a checkpoint
++    directory, its model.safetensors.index.json, or one .safetensors) is read
++    with O_DIRECT through 0013's row cache and host hook; no pinned table and
++    no INT8 copy. The B70_PLE_INT8_NVME_* tuning switches apply.
++    """
++    return os.environ.get("B70_PLE_FP8_NVME", "0") == "1"
++
++
++def _b70_ple_tensor_filter(path: str):
++    """Name filter for B70_PLE_FP8_PATH (0050): a directory or index.json
++    lists the whole checkpoint, so keep only the PLE embedding's tensors; a
++    single .safetensors file is the table file itself (all names)."""
++    if os.path.isdir(path) or path.endswith(".json"):
++        return lambda name: ".ple_embedding." in name
++    return None
++
++
++def _b70_mmap_safetensors_any(path: str) -> dict[str, torch.Tensor]:
++    """_b70_mmap_safetensors over one file, an index.json or a directory (0050).
++
++    In directory / index mode only the PLE embedding's tensors are kept,
++    from every file that holds one, and they must all share one prefix (one
++    PLE table). Keys are the full checkpoint names, which 0007's resolvers
++    already accept (``...shard_<i>.weight``, ``...weight_scale``, layout).
++    """
++    from .ple_nvme import safetensors_files_for
++
++    keep = _b70_ple_tensor_filter(path)
++    if keep is None:
++        return _b70_mmap_safetensors(path)
++    files = safetensors_files_for(path, keep)
++    if not files:
++        raise ValueError(f"{path}: no PLE embedding tensors in the index")
++    prefixes = {
++        name.split(".ple_embedding.", 1)[0] for names in files.values() for name in names
++    }
++    if len(prefixes) != 1:
++        raise ValueError(f"{path}: PLE tensors under {len(prefixes)} prefixes {sorted(prefixes)}")
++    tensors: dict[str, torch.Tensor] = {}
++    for file, names in files.items():
++        mapped = _b70_mmap_safetensors(file)
++        for name in names:
++            if name not in mapped:
++                raise ValueError(f"{file}: the index lists {name}, the file does not map it")
++            tensors[name] = mapped[name]
++    return tensors
++
++
+ # B70 0008: bytes of the per-row float32 scale packed after the int8 values.
+ _B70_PLE_INT8_SCALE_BYTES = 4
+ _B70_PLE_INT8_FORMAT = "lumnus-ple-int8-rowscale/v1"
+@@ -1311,6 +1362,9 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+             if state.sync_only:
+                 self._lookup(ids.view(num_tokens_padded, heads), output=output)
+                 return
++            if output.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++                # B70 0050: FP8 rows move as bytes (no float8 kernels), as 0007.
++                output = output.view(torch.uint8)
+             output.zero_()
+             if count:
+                 _lookup_ple_embedding_from_pinned_kernel[(count,)](
+@@ -1459,7 +1513,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             raise RuntimeError(
+                 f"B70_PLE_FP8=1 but PLE storage dtype is {embedding.weight.dtype}"
+             )
+-        tensors = _b70_mmap_safetensors(path)
++        tensors = _b70_mmap_safetensors_any(path)
+         segments, scale, layout = _b70_ple_fp8_segments(
+             tensors,
+             embedding.org_vocab_size,
+@@ -1508,10 +1562,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+                     f"{max_rel_err} (wrong file, row order or scale?)"
+                 )
+             del reference, reference_file
+-        logger.info(
+-            "PLE FP8 direct-pinned load (B70_PLE_FP8=1) starting: %s", _host_memory_note()
+-        )
+-        embedding._materialize_pinned_xpu_slabs(source=segments)
++        nvme = _ple_fp8_nvme_enabled()
++        sync_only = nvme and _ple_int8_nvme_sync_only()
++        if nvme and embedding.etp_data_parallel_size > 1:
++            raise RuntimeError(
++                "B70_PLE_FP8_NVME=1 does not support ETP spanning DP "
++                f"(etp_data_parallel_size={embedding.etp_data_parallel_size})"
++            )
+         with torch.no_grad():
+             embedding.weight_scale.data.copy_(
+                 scale.to(
+@@ -1519,6 +1576,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+                     dtype=embedding.weight_scale.dtype,
+                 ).reshape(embedding.weight_scale.shape)
+             )
++        if nvme and not sync_only:
++            # B70 0050: no pinned table; rows come from the shards on NVMe.
++            return self._b70_fp8_nvme_load(path, segments, scale, layout)
++        logger.info(
++            "PLE FP8 direct-pinned load (B70_PLE_FP8=1) starting: %s", _host_memory_note()
++        )
++        embedding._materialize_pinned_xpu_slabs(source=segments)
+         logger.info(
+             "Loaded FP8 PLE table from %s (%s): tp rows [%d, %d) of %d, "
+             "scale=%g, storage=pinned-host FP8 slabs; %s",
+@@ -1530,6 +1594,123 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             float(scale[0]),
+             _host_memory_note(),
+         )
++        if sync_only:
++            # B70 0013 diagnostic for the FP8 table: the hook, rows from RAM.
++            self._b70_nvme_setup(path, None, store=None, sync_only=True)
++        return True
++
++    def _b70_fp8_nvme_load(
++        self,
++        path: str,
++        segments: list[tuple[int, torch.Tensor]],
++        scale: torch.Tensor,
++        layout: str,
++    ) -> bool:
++        """Boot the NVMe path for the checkpoint's FP8 shards (B70 0050).
++
++        The shards are read in place: the row store gets one segment per
++        shard tensor (its file, absolute data offset, first global row), so
++        nothing is copied or re-quantised at prepare time. Boot checks,
++        before any pinned memory is allocated:
++          * the reader's bytes equal the mmap's (``segments``, resolved and
++            validated by 0007) on 4,096 random rows of the whole table plus
++            the first and last row of every shard (tests the per-file offset
++            math, the unaligned data starts and page-crossing rows);
++          * no NaN code (E4M3fn 0x7F / 0xFF) in a random sample of this
++            rank's rows (B70_PLE_INT8_NVME_BOOT_SAMPLE, default 65,536);
++          * 0007's BF16 cross-check already ran (when PLE_TABLE_PATH is set).
++        """
++        import numpy as np
++
++        from .ple_nvme import (
++            PleNvmeRowStore,
++            fp8_nan_rows,
++            fp8_ple_locations,
++            fp8_ple_segments,
++        )
++
++        embedding = self.ngram_embedding
++        dim = embedding.embedding_dim
++        storage = embedding._b70_storage_dim
++        if storage != dim:
++            raise RuntimeError(f"FP8 PLE storage width {storage} != embedding dim {dim}")
++        vocab = embedding.org_vocab_size
++        locations = fp8_ple_locations(path, _b70_ple_tensor_filter(path))
++        file_segments = fp8_ple_segments(locations, vocab, dim, self.split_ngram_parts)
++        if [s[2] for s in file_segments] != [s[0] for s in segments]:
++            raise RuntimeError(
++                f"FP8 PLE NVMe: file segments {len(file_segments)} do not line up with the "
++                f"mmap's {len(segments)}"
++            )
++        io_threads = int(os.environ.get("B70_PLE_INT8_NVME_IO_THREADS", "16"))
++        reader = os.environ.get("B70_PLE_INT8_NVME_READER", "py")
++        try:
++            store = PleNvmeRowStore(
++                file_segments[0][0], file_segments[0][1], storage, vocab,
++                io_threads=io_threads, reader=reader, segments=file_segments,
++            )
++        except OSError as exc:
++            raise RuntimeError(
++                f"B70_PLE_FP8_NVME=1: cannot open the FP8 PLE shards of {path} with "
++                f"O_DIRECT: {exc}"
++            ) from exc
++        files = sorted({s[0] for s in file_segments})
++        logger.info(
++            "PLE FP8 NVMe load (B70_PLE_FP8_NVME=1) starting: %s, %d shards in %d files, "
++            "%d I/O threads, reader %s; %s",
++            path, len(file_segments), len(files), io_threads, reader, _host_memory_note(),
++        )
++        # Reader bytes == mmap bytes (whole table sample + every shard's ends).
++        generator = torch.Generator().manual_seed(20260928)
++        sample = torch.randint(0, vocab, (4096,), generator=generator).numpy()
++        ends = np.array(
++            [v for _, _, first, rows in file_segments for v in (first, first + rows - 1)],
++            dtype=np.int64,
++        )
++        rows = np.unique(np.concatenate([sample, ends]))
++        starts = np.array([s for s, _ in segments], dtype=np.int64)
++        seg_of = np.searchsorted(starts, rows, side="right") - 1
++        want = np.empty((rows.shape[0], storage), dtype=np.uint8)
++        for index in np.unique(seg_of).tolist():
++            pick = np.nonzero(seg_of == index)[0]
++            local = torch.from_numpy(rows[pick] - starts[index])
++            want[pick] = segments[index][1].view(torch.uint8).index_select(0, local).numpy()
++        got = store.read_rows(rows)
++        if not np.array_equal(got, want):
++            bad = int((got != want).any(axis=1).sum())
++            store.close()
++            raise ValueError(
++                f"FP8 PLE NVMe reader rows differ from the mmap of {path} ({bad} of "
++                f"{rows.shape[0]} rows; offset math or wrong file)"
++            )
++        # NaN codes in a sample of this rank's rows.
++        tp_start = embedding.shard_indices.org_vocab_start_index
++        tp_end = embedding.shard_indices.org_vocab_end_index
++        count = int(os.environ.get("B70_PLE_INT8_NVME_BOOT_SAMPLE", "65536"))
++        if count > 0 and tp_end > tp_start:
++            generator = torch.Generator().manual_seed(20260929 + tp_start)
++            own = torch.unique(
++                torch.randint(tp_start, tp_end, (count,), generator=generator)
++            ).numpy()
++            nan = fp8_nan_rows(store.read_rows(own))
++            if nan.size:
++                store.close()
++                raise ValueError(
++                    f"FP8 PLE table {path}: NaN codes in {nan.size} of this rank's "
++                    f"{own.shape[0]} sampled rows (first: row {int(own[nan[0]])})"
++                )
++        for file in files:
++            _b70_drop_page_cache(file)
++        # No pinned table: drop the (never written) pageable shard.
++        embedding.weight.data = torch.empty(0, storage, dtype=embedding.weight.dtype)
++        self._b70_nvme_setup(path, None, store=store, sync_only=False)
++        logger.info(
++            "Serving FP8 PLE table from NVMe in place, %s (%s): tp rows [%d, %d) of %d, "
++            "%d B/row, scale=%g; boot: %d rows byte-equal to the mmap, %d own rows "
++            "NaN-free; %s",
++            path, layout, tp_start, tp_end, vocab, storage, float(scale[0]),
++            rows.shape[0], count, _host_memory_note(),
++        )
+         return True
+ 
+     def _load_ple_int8_table(self) -> bool:
+@@ -1780,14 +1961,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         )
+         return True
+ 
+-    def _b70_nvme_setup(self, path: str, table: torch.Tensor, *, store,
++    def _b70_nvme_setup(self, path: str, table: torch.Tensor | None, *, store,
+                         sync_only: bool) -> None:
+-        """Cache, server and host-hash self-test for the 0013 hook."""
++        """Cache, server and host-hash self-test for the 0013 hook.
++
++        Shared by the INT8 (0013) and FP8 (0050) tables: everything is sized
++        by the storage row width (164 or 160 B); ``table`` is unused.
++        """
+         from vllm.distributed import get_tp_group
+ 
+         from .ple_nvme import (
+             PleLookahead,
+-            PleNvmeRowStore,
+             PleNvmeServer,
+             PleNvmeStats,
+             PleRowCache,
+@@ -1864,11 +2048,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             else:
+                 # Its own fd, bounce buffers and reader: the store is used by
+                 # one thread at a time. Bounded to one step of own rows.
+-                la_store = PleNvmeRowStore(
+-                    store.path, store.data_start, store.row_bytes, store.num_rows,
+-                    io_threads=store.io_threads, reader=store.reader,
+-                    queue_depth=store.queue_depth, max_batch_rows=256,
+-                )
++                la_store = store.clone(max_batch_rows=256)
+                 lookahead = PleLookahead(
+                     server, la_store, sub_batch=256,
+                     max_rows=max_tokens * max(1, own.shape[0]),
+@@ -1880,8 +2060,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+                 )
+         device = embedding._prefetch_buffer.device
+         # Dummy/profile/capture runs finalize this buffer without a hook;
+-        # give them zero rows instead of uninitialised bytes.
+-        embedding._prefetch_buffer.zero_()
++        # give them zero rows instead of uninitialised bytes (as bytes: the
++        # buffer is float8 for the 0050 FP8 table).
++        embedding._prefetch_buffer.view(torch.uint8).zero_()
+         host_ids = torch.empty(max_tokens * heads, dtype=torch.int64, pin_memory=True)
+         logger.info(
+             "PLE NVMe pinned allocation: id staging %d B, is_pinned=%s",
+@@ -2177,6 +2358,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         if _is_xpu() and _ple_int8_nvme_enabled() and not b70_ple_int8:
+             # B70 0013: the NVMe path serves the 0008 INT8 table only.
+             raise RuntimeError("B70_PLE_INT8_NVME=1 requires B70_PLE_INT8=1")
++        if _is_xpu() and _ple_fp8_nvme_enabled() and not b70_ple_fp8:
++            # B70 0050: the FP8 NVMe path serves the 0007 FP8 table.
++            raise RuntimeError("B70_PLE_FP8_NVME=1 requires B70_PLE_FP8=1")
+         embedding_quant_method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(
+             quant_config,
+             embedding_prefix,
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_nvme.py b/vllm/models/qwen4_exp/nvidia/ple_nvme.py
+index 8ab1e42..d617734 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_nvme.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_nvme.py
+@@ -61,6 +61,16 @@ Env contract (read in ngram_embedding.py, documented here):
+   B70_PLE_INT8_NVME_LOOKAHEAD_TOKENS
+                                     tokens predicted per step (default: the
+                                     scheduler's max_num_batched_tokens)
++
++0050: the same host path serves the checkpoint's own FP8 PLE table in
++place (B70_PLE_FP8=1 + B70_PLE_FP8_NVME=1, B70_PLE_FP8_PATH = the checkpoint
++directory, its index.json or one .safetensors). The table is 128 shard
++tensors in 10 files with unaligned data offsets, so the row store takes
++``segments`` (file, data start, first row, rows) and reads each row from its
++own file; rows are 160 B (no per-row scale: one global scale, applied after
++the gather by 0007's LUT dequant). Every B70_PLE_INT8_NVME_* tuning switch
++above (cache size, threads, reader, stats, lookahead, boot sample) applies
++to the FP8 path too; B70_PLE_INT8_NVME / _PATH do not.
+ """
+ 
+ from __future__ import annotations
+@@ -242,6 +252,7 @@ typedef struct {
+     int64_t slot;
+     int32_t *res;
+     int64_t *lat;
++    const int32_t *fds; /* 0050: per-read fd (multi-file tables), NULL = fd */
+ } ple_job;
+ 
+ static void run_job(ple_job *job, int64_t *next) {
+@@ -249,7 +260,8 @@ static void run_job(ple_job *job, int64_t *next) {
+         int64_t i = __atomic_fetch_add(next, 1, __ATOMIC_RELAXED);
+         if (i >= job->n) return;
+         int64_t t0 = now_ns();
+-        ssize_t r = pread(job->fd, job->bounce + i * job->slot, (size_t)job->len[i],
++        int fd = job->fds ? job->fds[i] : job->fd;
++        ssize_t r = pread(fd, job->bounce + i * job->slot, (size_t)job->len[i],
+                           (off_t)job->off[i]);
+         job->res[i] = r < 0 ? -errno : (int32_t)r;
+         job->lat[i] = now_ns() - t0;
+@@ -332,13 +344,13 @@ void ple_pool_destroy(void *handle) {
+ /* One call = one batch; not reentrant (one pool per reader, one caller). */
+ int ple_pool_read(void *handle, int fd, int64_t n, const int64_t *off,
+                   const int32_t *len, uint8_t *bounce, int64_t slot, int32_t *res,
+-                  int64_t *lat) {
++                  int64_t *lat, const int32_t *fds) {
+     ple_pool *p = (ple_pool *)handle;
+     if (n <= 0) return 0;
+     int helpers = p->nhelpers;
+     if ((int64_t)helpers > n - 1) helpers = (int)(n - 1);
+     pthread_mutex_lock(&p->mu);
+-    p->job = (ple_job){fd, n, off, len, bounce, slot, res, lat};
++    p->job = (ple_job){fd, n, off, len, bounce, slot, res, lat, fds};
+     p->next = 0;
+     p->active = helpers;
+     for (int i = 0; i < helpers; i++) {
+@@ -431,7 +443,7 @@ void ple_uring_destroy(void *handle) {
+ /* 0 on success (per-read results in res), -errno if the ring itself failed. */
+ int ple_uring_read(void *handle, int fd, int64_t n, const int64_t *off,
+                    const int32_t *len, uint8_t *bounce, int64_t slot, int qd,
+-                   int32_t *res, int64_t *lat) {
++                   int32_t *res, int64_t *lat, const int32_t *fds) {
+     ple_ring *r = (ple_ring *)handle;
+     if (qd < 1) qd = 1;
+     if ((unsigned)qd > r->sq_entries) qd = (int)r->sq_entries;
+@@ -447,7 +459,7 @@ int ple_uring_read(void *handle, int fd, int64_t n, const int64_t *off,
+             struct io_uring_sqe *sqe = &r->sqes[idx];
+             memset(sqe, 0, sizeof(*sqe));
+             sqe->opcode = IORING_OP_READ;
+-            sqe->fd = fd;
++            sqe->fd = fds ? fds[submitted] : fd;
+             sqe->addr = (uint64_t)(uintptr_t)(bounce + submitted * slot);
+             sqe->len = (uint32_t)len[submitted];
+             sqe->off = (uint64_t)off[submitted];
+@@ -536,13 +548,13 @@ def _native_lib() -> ctypes.CDLL:
+         lib.ple_pool_create.restype = vp
+         lib.ple_pool_destroy.argtypes = [vp]
+         lib.ple_pool_destroy.restype = None
+-        lib.ple_pool_read.argtypes = [vp, i32, i64, vp, vp, vp, i64, vp, vp]
++        lib.ple_pool_read.argtypes = [vp, i32, i64, vp, vp, vp, i64, vp, vp, vp]
+         lib.ple_pool_read.restype = i32
+         lib.ple_uring_create.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_int)]
+         lib.ple_uring_create.restype = vp
+         lib.ple_uring_destroy.argtypes = [vp]
+         lib.ple_uring_destroy.restype = None
+-        lib.ple_uring_read.argtypes = [vp, i32, i64, vp, vp, vp, i64, i32, vp, vp]
++        lib.ple_uring_read.argtypes = [vp, i32, i64, vp, vp, vp, i64, i32, vp, vp, vp]
+         lib.ple_uring_read.restype = i32
+         _NATIVE_LIB = lib
+         logger.info("PLE NVMe native reader loaded from %s", path)
+@@ -567,14 +579,22 @@ def safetensors_tensor_location(path: str, name: str) -> tuple[int, list[int], s
+ 
+ 
+ class PleNvmeRowStore:
+-    """Read 164-byte table rows from the file with O_DIRECT (one fd per rank).
+-
+-    Row g is at ``data_start + row_bytes * g``. Each row is one 4 KiB read,
+-    or 8 KiB when it crosses a page boundary. Reads go into page-aligned
+-    anonymous-mmap bounce slots (8 KiB each) and are split into contiguous
+-    batches over ``io_threads`` workers, each looping ``os.preadv`` (which
+-    releases the GIL). A failed or short read is retried 3 times (1/10/100
+-    ms), then raises; nothing is ever zero-filled.
++    """Read fixed-size table rows from the file(s) with O_DIRECT.
++
++    Row g is at ``data_start + row_bytes * g`` of ``path``. Each row is one
++    4 KiB read, or 8 KiB when it crosses a page boundary. Reads go into
++    page-aligned anonymous-mmap bounce slots (8 KiB each) and are split into
++    contiguous batches over ``io_threads`` workers, each looping
++    ``os.preadv`` (which releases the GIL). A failed or short read is retried
++    3 times (1/10/100 ms), then raises; nothing is ever zero-filled.
++
++    ``segments`` (0050): the table is split over several files, e.g. the
++    checkpoint's FP8 PLE shards (128 tensors in 10 .safetensors files, data
++    at arbitrary, unaligned offsets). A list of ``(path, data_start,
++    first_row, rows)`` covering [0, num_rows) without gaps, in row order;
++    row g of segment s is at ``data_start + row_bytes * (g - first_row)`` of
++    its file. Each distinct file is opened once. ``path`` / ``data_start``
++    are then those of the first segment and only kept for logging.
+ 
+     ``reader`` (0013b): "py" is the above; "native" replaces the Python
+     workers by a C pthread pool (``io_threads`` threads, one ctypes call per
+@@ -596,27 +616,67 @@ class PleNvmeRowStore:
+         direct: bool = True,
+         reader: str = "py",
+         queue_depth: int | None = None,
++        segments: list[tuple[str, int, int, int]] | None = None,
+     ) -> None:
+         if reader not in READERS:
+             raise ValueError(f"PLE NVMe reader {reader!r} not in {READERS}")
+         self.reader = reader
+-        self.path = path
+-        self.data_start = int(data_start)
+         self.row_bytes = int(row_bytes)
+         self.num_rows = int(num_rows)
++        if self.row_bytes > PAGE:
++            raise ValueError(f"PLE NVMe rows of {self.row_bytes} B exceed one page")
++        if segments is None:
++            segments = [(path, int(data_start), 0, self.num_rows)]
++        self.segments = [(str(p), int(d), int(f), int(r)) for p, d, f, r in segments]
++        expect = 0
++        for seg_path, _, first, rows in self.segments:
++            if first != expect or rows <= 0:
++                raise ValueError(
++                    f"PLE NVMe segments must cover [0, {self.num_rows}) in order without "
++                    f"gaps: {seg_path} starts at row {first} (expected {expect}), {rows} rows"
++                )
++            expect = first + rows
++        if expect != self.num_rows:
++            raise ValueError(
++                f"PLE NVMe segments cover {expect} rows, the table has {self.num_rows}"
++            )
++        self.path = self.segments[0][0]
++        self.data_start = self.segments[0][1]
+         self.io_threads = max(1, int(io_threads))
+         self.max_batch_rows = max(1, int(max_batch_rows))
+-        flags = os.O_RDONLY | (os.O_DIRECT if direct else 0)
+-        self.fd = os.open(path, flags)
+         self.direct = direct
++        flags = os.O_RDONLY | (os.O_DIRECT if direct else 0)
++        self._fds: list[int] = []
++        fd_of: dict[str, int] = {}
++        seg_fd, seg_first, seg_base = [], [], []
++        try:
++            for seg_path, start, first, rows in self.segments:
++                if seg_path not in fd_of:
++                    fd_of[seg_path] = os.open(seg_path, flags)
++                    self._fds.append(fd_of[seg_path])
++                fd = fd_of[seg_path]
++                size = os.fstat(fd).st_size
++                end = start + self.row_bytes * rows
++                if end > size:
++                    raise ValueError(
++                        f"{seg_path}: {rows} rows x {self.row_bytes} B from byte "
++                        f"{start} end at {end}, past the file ({size} B)"
++                    )
++                seg_fd.append(fd)
++                seg_first.append(first)
++                # byte(g) = base + row_bytes * g for g in this segment
++                seg_base.append(start - self.row_bytes * first)
++        except BaseException:
++            for fd in self._fds:
++                os.close(fd)
++            self._fds = []
++            raise
++        self.fd = self._fds[0]
+         self.file_size = os.fstat(self.fd).st_size
+-        end = self.data_start + self.row_bytes * self.num_rows
+-        if end > self.file_size:
+-            os.close(self.fd)
+-            raise ValueError(
+-                f"{path}: {self.num_rows} rows x {self.row_bytes} B from byte "
+-                f"{self.data_start} end at {end}, past the file ({self.file_size} B)"
+-            )
++        self._multi = len(self.segments) > 1
++        self._seg_fd = np.asarray(seg_fd, dtype=np.int32)
++        self._seg_first = np.asarray(seg_first, dtype=np.int64)
++        self._seg_base = np.asarray(seg_base, dtype=np.int64)
+         self._bounce = mmap.mmap(-1, self.max_batch_rows * READ_SLOT)
+         self._bounce_view = memoryview(self._bounce)
+         self._bounce_np = np.frombuffer(self._bounce, dtype=np.uint8).reshape(
+@@ -635,6 +695,7 @@ class PleNvmeRowStore:
+         self.queue_depth = max(1, int(queue_depth or self.io_threads))
+         # fd the native call reads through (tests point it elsewhere to make
+         # every native read fail and exercise the Python retry path).
++        # Single-file stores only; multi-file stores pass one fd per read.
+         self._native_fd = self.fd
+         self.native_retries = 0
+         if reader != "py":
+@@ -654,7 +715,9 @@ class PleNvmeRowStore:
+                         raise OSError(err.value, f"io_uring_setup({entries}) failed: "
+                                                  f"{os.strerror(err.value)}")
+             except BaseException:
+-                os.close(self.fd)
++                for fd in self._fds:
++                    os.close(fd)
++                self._fds = []
+                 self.fd = -1
+                 raise
+             self._lib = lib
+@@ -663,6 +726,17 @@ class PleNvmeRowStore:
+             self._lat_ns = np.zeros(self.max_batch_rows, dtype=np.int64)
+             self._bounce_addr = self._bounce_np.ctypes.data
+ 
++    def clone(self, **overrides) -> "PleNvmeRowStore":
++        """A new store over the same table: own fds, bounce buffers, reader."""
++        kwargs = dict(
++            io_threads=self.io_threads, max_batch_rows=self.max_batch_rows,
++            direct=self.direct, reader=self.reader, queue_depth=self.queue_depth,
++            segments=self.segments,
++        )
++        kwargs.update(overrides)
++        return PleNvmeRowStore(self.path, self.data_start, self.row_bytes, self.num_rows,
++                               **kwargs)
++
+     def close(self) -> None:
+         if self._pool is not None:
+             self._pool.shutdown(wait=True)
+@@ -673,16 +747,24 @@ class PleNvmeRowStore:
+             else:
+                 self._lib.ple_uring_destroy(self._handle)
+             self._handle = None
+-        if self.fd >= 0:
+-            os.close(self.fd)
+-            self.fd = -1
+-
+-    def _read_one(self, slot: int, row: int, offset: int, length: int, need: int) -> None:
++        for fd in self._fds:
++            os.close(fd)
++        self._fds = []
++        self.fd = -1
++
++    def locate(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        """(fd [n] int32, absolute byte offset [n] int64) of global ``rows``."""
++        seg = np.searchsorted(self._seg_first, rows, side="right") - 1
++        return self._seg_fd[seg], self._seg_base[seg] + rows * self.row_bytes
++
++    def _read_one(self, slot: int, row: int, offset: int, length: int, need: int,
++                  fd: int | None = None) -> None:
++        fd = self.fd if fd is None else fd
+         view = self._bounce_view[slot * READ_SLOT : slot * READ_SLOT + length]
+         last_error: str = ""
+         for attempt in range(len(RETRY_BACKOFF_S) + 1):
+             try:
+-                got = self._preadv(self.fd, [view], offset)
++                got = self._preadv(fd, [view], offset)
+                 if got >= need:
+                     return
+                 last_error = f"short read {got} < {need} B"
+@@ -692,36 +774,46 @@ class PleNvmeRowStore:
+                 time.sleep(RETRY_BACKOFF_S[attempt])
+         raise RuntimeError(
+             f"PLE NVMe read failed after {len(RETRY_BACKOFF_S)} retries: row {row}, "
+-            f"file offset {offset}, length {length}: {last_error} ({self.path})"
++            f"file offset {offset}, length {length}: {last_error} "
++            f"({self._path_of_fd(fd)})"
+         )
+ 
++    def _path_of_fd(self, fd: int) -> str:
++        for seg_path, seg_fd in zip((s[0] for s in self.segments), self._seg_fd.tolist()):
++            if seg_fd == fd:
++                return seg_path
++        return self.path
++
+     def _read_range(
+         self, lo: int, hi: int, rows: np.ndarray, offsets: np.ndarray,
+-        lengths: np.ndarray, needs: np.ndarray,
++        lengths: np.ndarray, needs: np.ndarray, fds: np.ndarray,
+     ) -> None:
+         lat = self._lat
+         for i in range(lo, hi):
+             t0 = time.perf_counter()
+-            self._read_one(i, int(rows[i]), int(offsets[i]), int(lengths[i]), int(needs[i]))
++            self._read_one(i, int(rows[i]), int(offsets[i]), int(lengths[i]), int(needs[i]),
++                           int(fds[i]))
+             lat[i] = time.perf_counter() - t0
+ 
+     def _read_native(self, count: int, rows: np.ndarray, offsets: np.ndarray,
+-                     lengths: np.ndarray, needs: np.ndarray) -> None:
++                     lengths: np.ndarray, needs: np.ndarray, fds: np.ndarray) -> None:
+         off = np.ascontiguousarray(offsets, dtype=np.int64)
+         length = np.ascontiguousarray(lengths, dtype=np.int32)
++        fd_arr = np.ascontiguousarray(fds, dtype=np.int32) if self._multi else None
++        fd_ptr = None if fd_arr is None else fd_arr.ctypes.data
+         res = self._res[:count]
+         lat_ns = self._lat_ns[:count]
+         if self.reader == "native":
+             rc = self._lib.ple_pool_read(
+                 self._handle, self._native_fd, count, off.ctypes.data,
+                 length.ctypes.data, self._bounce_addr, READ_SLOT,
+-                res.ctypes.data, lat_ns.ctypes.data,
++                res.ctypes.data, lat_ns.ctypes.data, fd_ptr,
+             )
+         else:
+             rc = self._lib.ple_uring_read(
+                 self._handle, self._native_fd, count, off.ctypes.data,
+                 length.ctypes.data, self._bounce_addr, READ_SLOT, self.queue_depth,
+-                res.ctypes.data, lat_ns.ctypes.data,
++                res.ctypes.data, lat_ns.ctypes.data, fd_ptr,
+             )
+         if rc < 0:
+             # The ring itself failed (not one read): nothing is trusted.
+@@ -734,7 +826,8 @@ class PleNvmeRowStore:
+         for i in bad.tolist():
+             self.native_retries += 1
+             t0 = time.perf_counter()
+-            self._read_one(i, int(rows[i]), int(offsets[i]), int(lengths[i]), int(needs[i]))
++            self._read_one(i, int(rows[i]), int(offsets[i]), int(lengths[i]), int(needs[i]),
++                           int(fds[i]))
+             self._lat[i] += time.perf_counter() - t0
+ 
+     def read_rows(self, rows: np.ndarray, out: np.ndarray | None = None,
+@@ -755,22 +848,22 @@ class PleNvmeRowStore:
+             hi = min(n, lo + self.max_batch_rows)
+             part = rows[lo:hi]
+             count = hi - lo
+-            byte = self.data_start + part * self.row_bytes
++            fds, byte = self.locate(part)
+             page = byte & ~np.int64(PAGE - 1)
+             inner = byte - page
+             lengths = np.where(inner + self.row_bytes > PAGE, READ_SLOT, PAGE).astype(np.int64)
+             needs = inner + self.row_bytes
+             workers = min(self.io_threads, count)
+             if self._handle is not None:
+-                self._read_native(count, part, page, lengths, needs)
++                self._read_native(count, part, page, lengths, needs, fds)
+             elif workers <= 1 or self._pool is None:
+-                self._read_range(0, count, part, page, lengths, needs)
++                self._read_range(0, count, part, page, lengths, needs, fds)
+             else:
+                 bounds = np.linspace(0, count, workers + 1).astype(np.int64)
+                 futures = [
+                     self._pool.submit(
+                         self._read_range, int(bounds[w]), int(bounds[w + 1]),
+-                        part, page, lengths, needs,
++                        part, page, lengths, needs, fds,
+                     )
+                     for w in range(workers)
+                     if bounds[w + 1] > bounds[w]
+@@ -784,6 +877,137 @@ class PleNvmeRowStore:
+         return out
+ 
+ 
++# --------------------------------------------------------------------------
++# FP8 PLE shards of a checkpoint, located in place (0050)
++# --------------------------------------------------------------------------
++
++FP8_PLE_ROW_BYTES = 160
++_FP8_SHARD_RE = r"(?:^|\.)shard_(\d+)\.weight$"
++
++
++def _safetensors_header(path: str) -> tuple[int, dict]:
++    import json
++
++    with open(path, "rb") as handle:
++        header_len = int.from_bytes(handle.read(8), "little")
++        size = os.fstat(handle.fileno()).st_size
++        if header_len <= 0 or 8 + header_len > size:
++            raise ValueError(f"{path}: not a safetensors file (header {header_len})")
++        return 8 + header_len, json.loads(handle.read(header_len))
++
++
++def safetensors_files_for(path: str, keep=None) -> dict[str, list[str]]:
++    """{file: [tensor names]} for ``path`` = a .safetensors file, a
++    ``*.safetensors.index.json`` or a checkpoint directory with one.
++
++    ``keep(name) -> bool`` filters the names (the files listed are those with
++    at least one kept name); a single file lists all of its tensors.
++    """
++    import json
++
++    if os.path.isdir(path):
++        path = os.path.join(path, "model.safetensors.index.json")
++    if path.endswith(".json"):
++        with open(path) as handle:
++            weight_map = json.load(handle)["weight_map"]
++        folder = os.path.dirname(path)
++        out: dict[str, list[str]] = {}
++        for name, file in weight_map.items():
++            if keep is None or keep(name):
++                out.setdefault(os.path.join(folder, file), []).append(name)
++        return {k: sorted(v) for k, v in sorted(out.items())}
++    _, header = _safetensors_header(path)
++    names = [k for k in header if k != "__metadata__" and (keep is None or keep(k))]
++    return {path: sorted(names)}
++
++
++def fp8_ple_locations(path: str, keep=None) -> dict[str, tuple[str, int, str, list[int]]]:
++    """name -> (file, absolute byte offset, dtype, shape) for the PLE tensors."""
++    out: dict[str, tuple[str, int, str, list[int]]] = {}
++    for file, names in safetensors_files_for(path, keep).items():
++        data_start, header = _safetensors_header(file)
++        size = os.path.getsize(file)
++        for name in names:
++            if name not in header:
++                raise ValueError(f"{file}: the index lists {name}, the file does not have it")
++            info = header[name]
++            begin, end = (int(v) for v in info["data_offsets"])
++            if begin < 0 or end < begin or data_start + end > size:
++                raise ValueError(f"{file}: tensor {name} offsets [{begin}, {end}) outside the file")
++            if name in out:
++                raise ValueError(f"PLE tensor {name} appears in {out[name][0]} and {file}")
++            out[name] = (file, data_start + begin, str(info["dtype"]),
++                         [int(v) for v in info["shape"]])
++    return out
++
++
++def fp8_ple_segments(
++    locations: dict[str, tuple[str, int, str, list[int]]],
++    org_vocab_size: int,
++    embedding_dim: int,
++    split_ngram_parts: int,
++) -> list[tuple[str, int, int, int]]:
++    """Row-store segments (file, data_start, first_row, rows) of the FP8 table.
++
++    Same layouts as 0007's ``_b70_ple_fp8_segments``: one ``table`` tensor
++    [>= org_vocab_size, dim], or the checkpoint's ``...shard_<i>.weight``
++    tensors (ceil(org_vocab_size / parts) rows each, the last one shorter),
++    all F8_E4M3 [*, dim]. Anything else raises. A ``table`` longer than
++    org_vocab_size is cut to org_vocab_size rows.
++    """
++    import re
++
++    def check(name: str, rows: int | None) -> tuple[str, int, int]:
++        file, start, dtype, shape = locations[name]
++        if dtype != "F8_E4M3":
++            raise ValueError(f"FP8 PLE tensor {name} is {dtype}, expected F8_E4M3")
++        if len(shape) != 2 or shape[1] != embedding_dim:
++            raise ValueError(
++                f"FP8 PLE tensor {name} has shape {shape}, expected [*, {embedding_dim}]"
++            )
++        if rows is not None and shape[0] != rows:
++            raise ValueError(f"FP8 PLE tensor {name} has {shape[0]} rows, expected {rows}")
++        return file, start, shape[0]
++
++    if "table" in locations:
++        file, start, rows = check("table", None)
++        if rows < org_vocab_size:
++            raise ValueError(f"FP8 PLE table has {rows} rows, expected >= {org_vocab_size}")
++        return [(file, start, 0, int(org_vocab_size))]
++    shard_re = re.compile(_FP8_SHARD_RE)
++    shards: dict[int, str] = {}
++    for name in locations:
++        match = shard_re.search(name)
++        if match:
++            index = int(match.group(1))
++            if index in shards:
++                raise ValueError(f"FP8 PLE shard {index} appears twice ({shards[index]}, {name})")
++            shards[index] = name
++    shard_size = (org_vocab_size + split_ngram_parts - 1) // split_ngram_parts
++    expected = [
++        i for i in range(split_ngram_parts)
++        if min(shard_size, org_vocab_size - i * shard_size) > 0
++    ]
++    if sorted(shards) != expected:
++        raise ValueError(
++            f"FP8 PLE files need 'table' or shards {expected[0]}..{expected[-1]} "
++            f"(split_ngram_parts={split_ngram_parts}); found {len(shards)} shard keys"
++        )
++    segments = []
++    for index in expected:
++        first = index * shard_size
++        rows = min(shard_size, org_vocab_size - first)
++        file, start, _ = check(shards[index], rows)
++        segments.append((file, start, first, rows))
++    return segments
++
++
++def fp8_nan_rows(rows: np.ndarray) -> np.ndarray:
++    """Indices of uint8 [n, d] FP8 E4M3 (fn) rows holding a NaN code
++    (0x7F / 0xFF; E4M3fn has no infinities)."""
++    return np.nonzero(((rows & 0x7F) == 0x7F).any(axis=1))[0]
++
++
+ # --------------------------------------------------------------------------
+ # Row cache
+ # --------------------------------------------------------------------------
+@@ -1367,6 +1591,7 @@ def cache_rows_per_rank(total_gib: float, tp_size: int, row_bytes: int) -> int:
+ 
+ 
+ __all__ = [
++    "FP8_PLE_ROW_BYTES",
+     "READERS",
+     "PleLookahead",
+     "PleNvmeRowStore",
+@@ -1376,7 +1601,11 @@ __all__ = [
+     "cache_rows_per_rank",
+     "host_ngram_ids",
+     "current_chunk_keys",
++    "fp8_nan_rows",
++    "fp8_ple_locations",
++    "fp8_ple_segments",
+     "owned_heads",
+     "plan_next_chunks",
++    "safetensors_files_for",
+     "safetensors_tensor_location",
+ ]
+-- 
+2.53.0
+

@@ -43,7 +43,7 @@ nano .env                                  # e.g. MODELS=/mnt/nvme/models
 # c. build the image: vLLM of release 0.30.0-b70.2 + two-card patches + kernels + shim, all checked (~20 GB image)
 docker compose build
 
-# d. download and prepare the weights, once: ~129 GB download, then ~4 min to build the 52 GB INT8 PLE table
+# d. download and prepare the weights, once: ~129 GB download, then the serve snapshots (seconds)
 docker compose run --rm prepare
 
 # e. start the engine (~5 minutes until it serves)
@@ -115,7 +115,7 @@ After anything that changes memory use, check the KV cache the engine reports at
 | path in `MODELS` | what | made by |
 |---|---|---|
 | `qwen38-w4a16/` | the checkpoint [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE), **all** files incl. `runtime/` (MTP draft, expert rankings) | download |
-| `qwen38-w4a16-int8ple/ple_ngram_int8_rowscale.safetensors` | the INT8 PLE table | built from the checkpoint |
+| `qwen38-w4a16-int8ple/ple_ngram_int8_rowscale.safetensors` | optional: the INT8 PLE table, only for the INT8 fallback (the engine reads the checkpoint's FP8 PLE shards in place, patch 0050) | `BUILD_INT8_PLE=1 docker compose run --rm prepare` |
 | `qwen38-w4a16-snapshot/`, `qwen38-w4a16-mtp-snapshot/` | what the engine loads: symlinks into the checkpoint + `config.json` | made in seconds |
 
 Everything must sit **inside** `MODELS` itself: the container sees only that directory, so a symlink pointing outside
@@ -140,9 +140,11 @@ delete the cache copy), then continue as above:
 cp -rL ~/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/*/ "$MODELS/qwen38-w4a16"
 ```
 
-**You already built the INT8 PLE table** (with `tools/build_int8_ple_from_fp8.py`). Put it at
-`$MODELS/qwen38-w4a16-int8ple/ple_ngram_int8_rowscale.safetensors`; `prepare` verifies it on a sample of rows
-instead of rebuilding it. Copy the `.ok` file next to it too, and even that check is skipped.
+**You already built the INT8 PLE table** (with `tools/build_int8_ple_from_fp8.py`). The engine no longer needs it
+(0050 reads the FP8 shards in the checkpoint); delete it to free 52.5 GB, or keep it for the INT8 fallback
+(docs/ple-nvme.md). With `BUILD_INT8_PLE=1`, `prepare` verifies a table found at
+`$MODELS/qwen38-w4a16-int8ple/ple_ngram_int8_rowscale.safetensors` on a sample of rows instead of rebuilding it
+(with its `.ok` file next to it, even that check is skipped).
 
 **Old snapshots** made from a checkpoint at another path: delete them, `prepare` makes new ones.
 
@@ -178,7 +180,9 @@ for checkpoints whose experts load through vLLM's GPTQ path: **Intel AutoRound (
    `self_attn.indexer.*`, and `config.json` = the dense-QSA serve config with the checkpoint's own quantization block.
    `tools/fp8ple_snapshot.py` (FP8 PLE checkpoints) and `tools/intel_snapshot.py` (BF16 PLE checkpoints) make it;
    they refuse a checkpoint whose config differs in anything else.
-2. **An INT8 PLE table** (`B70_PLE_INT8_PATH`, `B70_PLE_INT8_NVME_PATH`), built from the checkpoint's own PLE table:
+2. **The PLE table.** A checkpoint with FP8 PLE shards needs nothing extra: `B70_PLE_FP8_PATH` = the checkpoint
+   directory, read in place from NVMe (`B70_PLE_FP8=1` + `B70_PLE_FP8_NVME=1`, patch 0050). Otherwise an INT8 PLE
+   table (`B70_PLE_INT8_PATH`, `B70_PLE_INT8_NVME_PATH`), built from the checkpoint's own PLE table:
    `tools/build_int8_ple_from_fp8.py` from FP8 shards, `tools/build_int8_ple.py` from a BF16 `.pt` table.
 3. **Expert rankings** (`B70_MOE_HOTCOLD_RANKINGS`, optional): which experts start in VRAM. Leave it empty if your
    checkpoint has none; the hot set then starts by expert id and patch 0043 moves the busiest experts into VRAM as
