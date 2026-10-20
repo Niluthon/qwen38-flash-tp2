@@ -57,7 +57,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
 `Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
-0040–0050 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-20, after the experiments below): TP 2 + EP 2,
+0040–0050 and 0052 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-20, after the experiments below): TP 2 + EP 2,
 146 hot experts per layer and rank, swapped by what decode reads (0043 + 0047, long-term ranking on the work volume),
 the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch
 for prefill (0042), the fused decode MoE op (0048) with 70 % of the cold experts computed by the CPU pool (0049) and an
@@ -629,6 +629,140 @@ Verdict: works and is exact where it should be; the gain is what the microbench 
 step: 5.6 µs top-k + ~12 µs count per layer) and lands at ~0.5–0.85 ms (≈1.5 %) in bench_det, inside the single-run
 noise. Opt-in, not in the image's patch list: the vLLM side is `kernels/b70-moe-decode/vllm-0051-moe-glue.patch`
 (apply to a dev tree), the library ops ship in `kernels/b70-moe-decode` (a superset: moe_decode is unchanged).
+
+## Round 12 (2026-10-20): where the VRAM goes, and Paiton's 3-bit experts on a B70
+
+### Where each card's VRAM goes (memory probe)
+
+`engine-data/memprobe/sitecustomize.py` (on `PYTHONPATH` with `MEMPROBE=1`, measurement only): device snapshots at
+every worker phase, a 20 ms sampler that logs each growth of non-torch memory with the Python stack, and torch
+allocator snapshots (`MEMPROBE_HISTORY=1`) analysed by `live_blocks.py` / `analyze_snap.py`. Two boots of today's
+default (146 hot, 262,144-token context, util 0.96), same numbers both times. Rank 0 after graph capture, all values GiB:
+
+| item | GiB |
+|---|---|
+| device total (SYCL / sysman) | 31.89 |
+| hot routed experts, int4 (146 × 48; codes 16.04 + scales 0.58) | 16.62 |
+| KV cache | 3.67 |
+| dense projections in FP8 (0045: GDN in/out, attention) | 1.25 |
+| hyper-connection mixers, bf16 | 1.27 |
+| hyper-connection down weight again as two K-halves (`_prepare_kdown_ksplit`, prefill only) | 0.68 |
+| MTP draft layer experts | 0.59 |
+| lm_head shard, bf16 | 0.59 |
+| shared expert, router, PLE projections, other bf16 linears | 0.53 |
+| cold prefetch slots (0042) | 0.52 |
+| FP8 copy of the head for the drafts (`B70_DRAFT_HEAD_FP8`) | 0.30 |
+| swap staging 0.13, rope cache 0.13, rest 0.31 | 0.57 |
+| torch allocator slack (reserved, not allocated) | 0.96 |
+| non-torch (Level Zero / oneCCL / kernels): 1.13 before loading, +0.55 load, +0.26 profile run, +0.85 warm-up and graph capture | 2.77 |
+| free, never used | 1.54 |
+
+- vLLM sizes the KV cache against 30.30 GiB, not 31.89: its XPU `getMemoryInfo` reports 95 % of the device as the
+  total. util 0.96 therefore uses ~91 % of the card, and 1.1–1.5 GiB per card stay free under load too (`xpu-smi`:
+  30.6 of 31.9 GiB used after 35 min of serving).
+- vLLM's "non-torch 2.81 GiB" in the boot log is mostly torch memory: 1.08 allocator slack, 0.84 tensors first
+  allocated in the profile run (vLLM counts as weights only what `load_model` allocates), 0.81 runtime.
+- Rank 1 has 0.19 GiB less non-torch than rank 0 at every point.
+
+What could be freed per card (estimates from the table; nothing of it built yet):
+
+| lever | GiB per card | changes numerics |
+|---|---|---|
+| size the KV cache against the real 31.89 GiB (e.g. `--kv-cache-memory`), keep ~0.4 GiB margin | ~1.0 (measured: not usable, see below) | no |
+| allocator slack: expandable segments or a load order that does not fragment | up to 0.9 (measured: +61K KV tokens, the default now) | no |
+| hyper-connection K-halves: keep one copy (decode path must stay bit-identical) | 0.68 (measured: +46.6K KV tokens, 0052) | no, if exact |
+| prefetch slots shrink with the cold set (2 slots × one layer's cold experts) | ~0.4 at 20 cold | no |
+| hyper-connection mixers in FP8 (as Paiton's trunk) | ~0.63 | yes |
+| target lm_head in FP8, shared with the drafts (drop the bf16 shard) | ~0.59 | yes |
+
+At ~0.114 GiB per hot int4 expert (48 layers), the ~3 GiB without numerics changes are ~26 more hot experts
+(146 → ~172) at today's KV, with no new quantization.
+
+### Levers 1 and 2 measured: KV against the real VRAM, and expandable segments (the default now)
+
+One boot each, today's image; `engine-data/ab/kv_lever.sh` = the `ab.sh` set (bench_det, agent_load × 2, bench_det)
+plus `stress_mixed.py` (2 decodes beside 6K/10K/15K-token prefills) and `burst_check.py 10`, with `xpu-smi` sampled every
+2 s (`vram_watch.sh`); "free at peak" = 32,656 MiB minus the most VRAM in use on card 0 (the tighter card) during the
+run. Runs with the memory probe (`MEMPROBE_SERVE_LOG=10`) also log torch's alloc retries and OOMs: 0 in all of them.
+
+| run | KV tokens | 1 stream ms/step (bench_det #1, 4 prompts) | agents tok/s (2 runs) | card 0 free at peak, MiB | result |
+|---|---|---|---|---|---|
+| S0: default | 271,308 | 34.3 / 31.6 / 32.1 / 31.9 | 118.5 / 133.9 | 569 | reference |
+| S2: `--kv-cache-memory` 3.96 GiB (+0.3) | 293,596 | 33.8 / 31.5 / 32.6 / 31.0 | 117.8 / 128.1 | ~0 | card full under load |
+| S1: `--kv-cache-memory` 4.46 GiB (+0.8) | 330,593 | 34.1 / 31.4 / 32.8 / 31.8 | 119.0 / 136.2 | ~0 | card full under load (a second boot with the probe: 31.89 of 31.89 GiB used, 0 retries), no errors |
+| S3: as S1 + torch capped at 89 % of the card | 330,593 | 34.0 / 31.1 / 32.4 / 31.1 | – | – | crashed at the first agent request: XPU OOM for 118 MiB with 0.6 GiB reserved but fragmented |
+| S4: default + `PYTORCH_ALLOC_CONF=expandable_segments:True` | 332,969 | 34.1 / 31.2 / 32.5 / 31.6 | 122.4 / 128.3 | 576 | same headroom as S0 |
+| **S5: the new default (expandable segments + the old `pinned_max_cached_size_mb:1024`)** | **332,742** | **34.3 / 31.4 / 32.8 / 31.1** | **120.8 / 130.9** | **578** | **same headroom as S0, +22.6 % KV** |
+
+- The 1.1–1.5 GiB that are free at idle are not spare: under agent load and long prefills torch's cache grows by
+  ~0.7 GiB per card (S0: 31,349 → 32,087 MiB on card 0; transient activations ~0.65 GiB above the steady allocation,
+  plus fragmentation), so S0 really has ~0.57 GiB of headroom on card 0. More KV through `--kv-cache-memory` (S1, S2)
+  ran without errors, but with the cards at 100 % any non-torch allocation (Level Zero, oneCCL, oneDNN) could fail;
+  capping torch instead (S3) fails on fragmentation. Not used.
+- Expandable segments (torch 2.13 XPU; XPU graphs capture and replay fine with them, `engine-data/ab/expandable_test.py`)
+  remove the ~1 GiB of load-time slack. vLLM's own profiling then sizes the KV 61.4K tokens larger at the same util
+  and the same peak headroom. Speed is unchanged (bench_det, 4 streams 178–185 tok/s, agents within run-to-run noise).
+  Set in `engines/two-cards/env/tp2-hotcold.env`, together with the existing host-side `pinned_max_cached_size_mb`
+  (one `PYTORCH_ALLOC_CONF`, comma-separated).
+- Remaining levers from the table above: smaller prefetch slots with fewer cold experts, and the two numerics
+  changes. Prefill (`bench2.py` cells) was not re-measured for S4/S5 (see S7 below).
+
+### Lever 3 measured: the hyper-connection K-halves as views (0052, the default now)
+
+0003 runs prefill rows (> 64) of every hyper-connection down GEMM (N = 336 / 320, K = 10240) as two K = 5120 GEMMs
+over contiguous copies of the weight's halves: a second copy of all of them, 0.68 GiB per card. 0052 keeps the halves
+as strided views of the one weight. Card test (`engine-data/ab/hc_ksplit_view_test.py`, both N, M = 65–8192): bitwise
+equal to the copies at every width, deterministic over 20 runs, graph replays bitwise equal (50/50 at M = 256 and
+2048), no hidden copy; the GEMM pair is 0–3 % slower at ≥ 512 rows (≤ 20 µs per call at 8K rows, < 0.3 % of a
+prefill chunk). Decode (the single stock GEMM at ≤ 64 rows) is not touched. `B70_HC_KSPLIT_VIEWS=0` restores the copies.
+
+| run | KV tokens | bench_det #1 ms/step (4 prompts; 4 streams) | bench_det #2 after the agents | agents tok/s | card 0 free at peak, MiB | prefill 3K / 12K / 30K tok/s |
+|---|---|---|---|---|---|---|
+| S5: expandable segments, before 0052 | 332,742 | 34.3 / 31.4 / 32.8 / 31.1; 60.0 | 35.8 / 31.5 / 36.8 / 31.3; 62.0 | 120.8 / 130.9 | 578 | (round 10: 4,021 / 4,143 / 3,973) |
+| S6: 0052 from the dev tree (`PYTHONPATH`) | 379,243 | 34.3 / 31.3 / 33.2 / 30.9; 61.4 | 38.1 / 30.6 / 38.3 / 32.0; 62.4 | 127.2 / 135.6 | 499 | 3,916–4,147 / 4,130–4,159 / 3,955–3,965 |
+| **S7: the built image with 0052, default settings** | **379,356** | **33.9 / 31.4 / 32.6 / 31.3; 61.5** | **38.8 / 31.5 / 38.4 / 32.1; 59.5** | **123.3 / 137.4** | **514** | **4,072 / 4,105 / 3,954** |
+
+KV +46.6K tokens (+14 %; +39.8 % over the 271,308 of this morning with lever 2), speed unchanged: bench_det #2 after
+the agents varies with the hot/cold swap state (S0 had 37.2 / 31.5 / 37.9 / 31.8). Headroom on card 0 at peak is
+~60 MiB lower (more KV at the same util); stress_mixed and 10 bursts without errors. The image build also rebuilt
+`libb70_moe_decode.so` from the current `kernels/b70-moe-decode` (round 11's superset with the opt-in 0051 ops,
+sha256 71f3a7e8…; moe_decode unchanged): S7 runs that library.
+
+### Paiton's W3A8 experts: does all-resident 3-bit pay on a B70? (spike, `kernels/b70-w3-spike`)
+
+All 256 local experts at 3.125 bits per weight need 21.97 GiB per card (Paiton's FORMAT.md, and measured: 48 layers of
+random data in the right shapes). Against today's 16.62 GiB of hot int4 that is +5.35 GiB. With the ~3 GiB above, KV
+falls from 3.67 to ~1.3 GiB (~98K tokens, at the measured ~74K tokens per GiB); with the two numerics levers too
+~2.5 GiB (~188K tokens).
+
+Spike op `b70w3.moe_decode_w3`: the fnq-container-1 expert math (FWHT-128 + fp8 E4M3 per token on the input, 8-level
+codebook {-8,-5,-3,-1,1,3,5,8} with E4M3 scales per 64 and a power of two per matrix, SwiGLU, FWHT-128 + fp8 per
+(slot, slice) on the down input), every expert resident, no cold path. Checked against a torch fp32 reference on the
+real layer 24 (`layers/L24.safetensors` from the release, rank 0's 256 experts; `test_w3_spike.py`): relative error
+1.7·10⁻³ at 1–16 rows, i.e. the bf16 rounding of the output.
+
+MoE time for 48 layers per forward on one B70 (all routed local experts resident, random data, half of the top-10 on
+this rank), ms:
+
+| rows (tokens) | int4 all resident, 0048 op, ms | 3-bit codebook, spike op, ms | today: hot/cold + CPU path, both cards (round 11), ms | 3-bit at 450 GB/s + fixed cost (estimate), ms |
+|---|---|---|---|---|
+| 1 | 2.05 | 3.22 | 2.33–2.79 | ~1.4 |
+| 2 | 3.38 | 4.86 | – | – |
+| 4 | 5.72 | 8.03 | 6.69–7.86 | ~4.4 |
+| 8 | 10.08 | 13.75 | 12.43–13.58 | – |
+| 16 | 17.49 | 24.93 | 24.45–25.74 | ~15 |
+
+Per layer (24 layers, kernels switched off one at a time with `B70W3_SKIP`), µs at 1 / 4 / 16 rows: fixed kernels
+(plan, input FWHT, mid FWHT, gather) 10 / 14 / 30, gate/up 31 / 90 / 293, down 27 / 61 / 184. The gate/up kernel reads
+expert bytes at 215–300 GB/s, the down kernel at ~120–240 GB/s; the int4 op reaches 270–470 GB/s. The 3-bit decode
+costs ~9 ALU operations per weight (extract, level table, convert, FMA) against ~4 for int4, so the SIMT kernel is
+bound by ALU, not memory. Decoding each weight once for all rows (v2) helped at 4–16 rows (−12 to −14 %, but +9 % at
+1 row); a cheaper float-magic level formula was another 7–10 % faster but wrong under `-ffast-math` and was dropped.
+
+Verdict: the format runs on a B70 and the arithmetic matches, but as a SIMT kernel all-resident 3-bit is no faster
+than today's hot/cold path and costs most of the KV. It pays only if the decode moves off the vector ALU (XMX/DPAS
+with bf16 weights decoded once per tile, or a table-based decode at ≤ ~4 operations per weight); the bytes-bound
+column is the ceiling. The VRAM levers above help today's int4 engine without any of that and come first.
 
 ## Excluded or not worth it (as of 2026-10-11)
 

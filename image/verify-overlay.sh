@@ -53,6 +53,7 @@ d5ef338178e824f0d2fb9447cdebda1e8f4e7ec9cd7791994083007ff1ad77c8  vllm/v1/worker
 # b70 series 0006, 0007, 0008, 0009, 0010, 0012, 0013, 0013b, 0014a–f, 0018–0023c, 0026–0029b, 0031, 0032, 0040, applied in that (filename) order on top
 # of 0001–0005. sha256  tag  relative-path-under-vllm/   (both roots)
 B70_FILES='
+7e8555f4a18abb07aa3280e608ab680ba61d8f9ac9daede1a3c0be833f1dc848  B70-0052      vllm/models/qwen4_exp/nvidia/hyperconnection.py
 da982f1e3fec8874c56f0ebd07b1c8c53208d1500d3d3f785e3e8372f022ed77  B70-0050      vllm/models/qwen4_exp/nvidia/ngram_embedding.py
 f0a0de26055e7a346b430431012df3bf1bf4f22f0fe0aebbe8e9aa015976faba  B70-0046      vllm/models/qwen4_exp/nvidia/model_state.py
 9c0248658815190a56a269192d9cb1b376846396dcc96dc00dda39e4b7728648  B70-0050      vllm/models/qwen4_exp/nvidia/ple_nvme.py

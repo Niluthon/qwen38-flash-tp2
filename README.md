@@ -16,7 +16,7 @@ CPU (AVX-512 BF16 makes decode faster, see [CPU](#cpu)).
 ```bash
 git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 cp .env.example .env               # optional: MODELS=/path/on/nvme (default ~/models)
-docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0050 + kernels + shim
+docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0050, 0052 + kernels + shim
 docker compose run --rm prepare    # once: download (~129 GB) and prepare the weights
 docker compose up -d               # serving on port 8000 after ~5 min
 docker compose logs warmup         # wait for "warm-up request OK" before sending long prompts
@@ -32,8 +32,9 @@ settings, weights you already have, your own model, troubleshooting).
 
 ## Speed of the current build
 
-Image `b70-flash-next:tp2` with patches 0001–0050, default settings, no overrides. Host: Ryzen 9 7950X, 61 GiB DDR5,
-2× B70 on PCIe 5.0 x8. Measured 2026-10-20 on an idle engine (docs/two-cards.md, round 10, run P).
+Image `b70-flash-next:tp2` with patches 0001–0050 and 0052, default settings, no overrides. Host: Ryzen 9 7950X, 61 GiB DDR5,
+2× B70 on PCIe 5.0 x8. Measured 2026-10-20 on an idle engine (docs/two-cards.md, round 10, run P; KV pool from round
+12, run S7: expandable segments in the torch allocator and 0052, speed unchanged).
 
 Units used below:
 
@@ -60,7 +61,7 @@ Units used below:
 | decode, 4 requests at once, step time | 62.5 | ms/step |
 | coding agents, 12 sessions at 2 concurrent requests, total (`agent_load.py`, two runs) | 119.3 / 137.1 | tok/s |
 | prefill, one request, 3K / 12K / 30K-token prompt | 4,021 / 4,143 / 3,973 | tok/s (prompt tokens) |
-| KV cache pool, shared by all requests (each card holds half of the attention heads of every token) | 271,195 | tokens |
+| KV cache pool, shared by all requests (each card holds half of the attention heads of every token) | 379,356 | tokens |
 | context length, one request at most | 262,144 | tokens |
 | requests served at once (more are queued) | 4 | requests |
 | boot to serving | 4–5 | min |
@@ -141,7 +142,7 @@ checkpoint's FP8 PLE shards read in place from NVMe with a 2 GiB row cache (0013
 ## What is in the series
 
 The image applies the vLLM release `0.30.0-b70.2` (patches 0001–0032, fork tag `Lumnus/vllm@v0.30.0-b70.2`) and the
-two-card patches 0040–0050 on top.
+two-card patches 0040–0050 and 0052 on top.
 
 | patch | what | switch |
 |---|---|---|
@@ -187,7 +188,7 @@ Every switch with its default and measurements: [docs/switches.md](docs/switches
 | `engines/two-cards/` | `env/tp2-hotcold.env` (defaults), `env/tp2-local.env.example` (your overrides), `args/serve-tp2.args` (`vllm serve` flags), `scripts/` (compose entrypoint, `run-tp2.sh`, `restart-tp2.sh`) |
 | `engines/serve-configs/` | the snapshots' `config.json` (`serve-config-intel-autoround.json` is the one the engine uses) |
 | `image/` | `Dockerfile.tp2` (the image), `verify-overlay.sh` and `verify-tree.py` (hash checks of every patched file) |
-| `patches/vllm/`, `patches/vllm-tests/` | the vLLM series 0001–0050; CPU tests (never applied to the image) |
+| `patches/vllm/`, `patches/vllm-tests/` | the vLLM series 0001–0050 and 0052; CPU tests (never applied to the image) |
 | `patches/vllm-xpu-kernels/` | our kernel series on vllm-xpu-kernels 0.1.14.1 (b70.3) ([docs/kernels.md](docs/kernels.md)) |
 | `patches/series.txt` | which fork commit goes to which file |
 | `kernels/` | standalone SYCL ops (`b70-moe-decode`, built by the image) and diagnostics |

@@ -1,0 +1,450 @@
+// b70_w3_spike.sycl — SPIKE (not shipped): decode MoE over Paiton's 3-bit codebook experts (fnq-container-1, "KMOE
+// contract v2 AMODE 1"), every expert resident in VRAM. Measures what all-resident 3-bit experts cost per decode step
+// on a B70, and checks the arithmetic against a torch reference on a real layer (test_w3_spike.py).
+//
+// Format per routed expert (H = K = 2560, I = 640 = 5 slices of 128):
+//   gu_codes  int32 [E, 5, 2, 128, 240]  3-bit codes of gate (0) / up (1) rows of slice s, K = 2560 rotated by
+//                                        R = blockdiag(H128); element k at bits [3k, 3k+3) of the row's LE stream
+//   gu_scales e4m3  [E, 5, 2, 128, 40]   signed scale per (row, 64 along K)
+//   dn_codes  int32 [E, 5, 2560, 12]     3-bit codes of the 128 down K-columns of slice s (rotated per slice)
+//   dn_scales e4m3  [E, 5, 2560, 2]      signed scale per (output row, 64-K half of the slice)
+//   gu_exp2 / dn_exp2 int8 [E]           per-matrix power of two;  value = level * scale * 2^k
+//   levels {-8, -5, -3, -1, 1, 3, 5, 8} indexed by the code
+// Math per (token x, expert e):
+//   xr = Q8(FWHT128(x)) (fp8 E4M3, one scale per token: max(amax/448, 1/(448*512)), RNE)
+//   per slice s: g, u = xr . Gate_s^T, xr . Up_s^T (fp32);  a_s = silu(g) * u
+//   ar_s = Q8(FWHT128(a_s)) (one scale per (route slot, slice));  y = sum_s ar_s . Down_s^T;  out += w * bf16(y)
+// Kernels: plan (unique local experts + their slots), xprep (FWHT + Q8 of x), up (one sub-group per (expert, slice,
+// 4 gate/up row pairs)), mid (FWHT + Q8 of a per (slot, slice)), down (4 lanes per output row), gather.
+#include <sycl/sycl.hpp>
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <cstdlib>
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+constexpr int SG = 16;
+constexpr int PSTRIDE = 17, PH = 4;
+constexpr int NS = 5, SL = 128;  // slices, slice width
+
+static inline float silu(float v) { return v / (1.f + sycl::native::exp(-v)); }
+
+static inline float e4m3_to_f(uint8_t b) {
+  const uint32_t s = b >> 7, e = (b >> 3) & 15u, m = b & 7u;
+  float v = e ? sycl::bit_cast<float>(((e + 120u) << 23) | (m << 20)) : (float)m * (1.f / 512.f);
+  return s ? -v : v;
+}
+
+// fp32 -> nearest E4M3 value (RNE, saturating at 448), returned as fp32 (exact in bf16)
+static inline float q_e4m3(float v) {
+  float a = sycl::fabs(v);
+  a = sycl::fmin(a, 448.f);
+  const uint32_t bits = sycl::bit_cast<uint32_t>(a);
+  int ex = (int)(bits >> 23) - 127;
+  if (ex < -6) ex = -6;                                    // subnormal step 2^-9
+  const float step = sycl::bit_cast<float>((uint32_t)(ex - 3 + 127) << 23);
+  float q = sycl::rint(a / step) * step;
+  q = sycl::fmin(q, 448.f);
+  return v < 0.f ? -q : q;
+}
+
+static inline float level(uint32_t u) {
+  return (float)(2 * (int)u - 7 + (u == 7u) - (u == 0u));
+}
+
+// code i (0..31) of a 96-bit triplet
+template <int I>
+static inline uint32_t code3(uint32_t w0, uint32_t w1, uint32_t w2) {
+  constexpr int bit = 3 * I, word = bit >> 5, off = bit & 31;
+  const uint32_t a = word == 0 ? w0 : (word == 1 ? w1 : w2);
+  if constexpr (off > 29) {
+    const uint32_t b = word == 0 ? w1 : w2;
+    return ((a >> off) | (b << (32 - off))) & 7u;
+  } else {
+    return (a >> off) & 7u;
+  }
+}
+
+template <int... Is>
+static inline float dot32_impl(uint32_t w0, uint32_t w1, uint32_t w2, const float* xf,
+                               std::integer_sequence<int, Is...>) {
+  return ((level(code3<Is>(w0, w1, w2)) * xf[Is]) + ...);
+}
+static inline float dot32(uint32_t w0, uint32_t w1, uint32_t w2, const float* xf) {
+  return dot32_impl(w0, w1, w2, xf, std::make_integer_sequence<int, 32>{});
+}
+
+static inline void load32(const bf16* p, float* xf) {
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const sycl::vec<uint32_t, 4> raw = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(p + j * 8);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      xf[j * 8 + 2 * i] = sycl::bit_cast<float>(raw[i] << 16);
+      xf[j * 8 + 2 * i + 1] = sycl::bit_cast<float>(raw[i] & 0xffff0000u);
+    }
+  }
+}
+
+static inline void load8(const bf16* p, float (&xf)[8]) {
+  const sycl::vec<uint32_t, 4> raw = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(p);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    xf[2 * i] = sycl::bit_cast<float>(raw[i] << 16);
+    xf[2 * i + 1] = sycl::bit_cast<float>(raw[i] & 0xffff0000u);
+  }
+}
+
+// the 4 chunks of 8 codes (24 bits each) of a 96-bit triplet
+static inline void chunks24(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t (&c)[4]) {
+  c[0] = w0 & 0xffffffu;
+  c[1] = ((w0 >> 24) | (w1 << 8)) & 0xffffffu;
+  c[2] = ((w1 >> 16) | (w2 << 16)) & 0xffffffu;
+  c[3] = w2 >> 8;
+}
+
+// 8 levels of a 24-bit chunk, as fp32. (A 2^23-magic + clamp variant, 4v - 2 clamp(v, -3, 3), was ~8 % faster but
+// gave wrong results under -ffast-math; not pursued.)
+static inline void decode8(uint32_t c, float (&q)[8]) {
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int u = (int)((c >> (3 * i)) & 7u);
+    const int t = 2 * u - 7;
+    q[i] = (float)(u == 0 ? -8 : (u == 7 ? 8 : t));
+  }
+}
+
+static inline float dot8(const float (&q)[8], const float (&x)[8]) {
+  float p = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) p += q[i] * x[i];
+  return p;
+}
+
+// FWHT-128 over a sub-group: lane l holds elements 8l .. 8l+7. Normalised (1/sqrt(128)).
+static inline void fwht128(float (&v)[8], int lane, sycl::sub_group sg) {
+#pragma unroll
+  for (int st = 1; st < 8; st <<= 1)
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      if (!(i & st)) { const float a = v[i], b = v[i + st]; v[i] = a + b; v[i + st] = a - b; }
+#pragma unroll
+  for (int ls = 1; ls < 16; ls <<= 1) {
+    const bool hi = lane & ls;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float o = sycl::permute_group_by_xor(sg, v[i], ls);
+      v[i] = hi ? (o - v[i]) : (v[i] + o);
+    }
+  }
+  constexpr float r = 0.08838834764831845f;  // 1/sqrt(128)
+#pragma unroll
+  for (int i = 0; i < 8; ++i) v[i] *= r;
+}
+
+struct PlanKernel {
+  const int32_t* ids; const int32_t* map; int32_t* plan; int S;
+  void operator()(sycl::nd_item<1> it) const {
+    const int t = it.get_local_id(0);
+    auto grp = it.get_group();
+    int owner = 0, g = -1;
+    if (t < S) {
+      g = ids[t];
+      if (g >= 0 && map[g] >= 0) {
+        owner = 1;
+        for (int s2 = 0; s2 < t; ++s2) if (ids[s2] == g) { owner = 0; break; }
+      }
+    }
+    const int rank = sycl::exclusive_scan_over_group(grp, owner, sycl::plus<int>());
+    const int count = sycl::reduce_over_group(grp, owner, sycl::plus<int>());
+    if (owner) {
+      int32_t* p = plan + PH + rank * PSTRIDE;
+      int nr = 0;
+      for (int s2 = t; s2 < S && nr < 16; ++s2) if (ids[s2] == g) p[1 + nr++] = s2;
+      p[0] = nr;
+    }
+    if (t == 0) plan[0] = count;
+  }
+};
+
+// xprep: one work-group (20 sub-groups) per activation row: FWHT per 128-block, Q8 per token.
+struct XPrepKernel {
+  const bf16* x; bf16* xq; float* xs; int K;
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int m = it.get_group(0), sgi = it.get_local_id(0) / SG, lane = it.get_local_id(0) % SG;
+    auto sg = it.get_sub_group();
+    float v[8];
+    const bf16* src = x + (size_t)m * K + sgi * SL + lane * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = (float)src[i];
+    fwht128(v, lane, sg);
+    float am = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) am = sycl::fmax(am, sycl::fabs(v[i]));
+    am = sycl::reduce_over_group(it.get_group(), am, sycl::maximum<float>());
+    const float sc = sycl::fmax(am / 448.f, 1.f / (448.f * 512.f));
+    bf16* dst = xq + (size_t)m * K + sgi * SL + lane * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) dst[i] = bf16(q_e4m3(v[i] / sc));
+    if (it.get_local_id(0) == 0) xs[m] = sc;
+  }
+};
+
+struct W3 {
+  const uint32_t* gu; const uint8_t* gus; const int8_t* gue; const uint32_t* dn; const uint8_t* dns; const int8_t* dne;
+};
+
+static inline int plan_owner(const int32_t* plan, const int32_t* ids, const int32_t* map, int i,
+                             const int32_t*& slots, int& e) {
+  if (i >= plan[0]) return 0;
+  const int32_t* p = plan + PH + i * PSTRIDE;
+  slots = p + 1;
+  e = map[ids[slots[0]]];
+  return p[0];
+}
+
+// up: sub-group job = (owner, slice s, block of RP gate/up row pairs). Lane handles triplets lane, lane+16, ... of
+// each row (80 triplets of 32 codes per row).
+template <int MMAX, int RP>
+struct UpKernel {
+  const bf16* xq; const float* xs; const int32_t* ids; const int32_t* map; const int32_t* plan; W3 w;
+  float* a; int TOPK, K, n_blocks;  // a [S, 640] fp32
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int job = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
+    auto sg = it.get_sub_group();
+    const int per_e = NS * n_blocks;
+    const int oi = job / per_e, rem = job % per_e, s = rem / n_blocks, nb = rem % n_blocks;
+    const int32_t* all; int e = -1;
+    const int n_all = plan_owner(plan, ids, map, oi, all, e);
+    if (!n_all) return;
+    constexpr int WPR = 240, GPR = 40;  // words, scale groups per row
+    const size_t slice_rows = (size_t)e * NS * 2 * SL + (size_t)s * 2 * SL;  // row index of (e, s, gate, 0)
+    const uint32_t* rows[2 * RP]; const uint8_t* srows[2 * RP];
+#pragma unroll
+    for (int r = 0; r < RP; ++r) {
+      const size_t gr = slice_rows + nb * RP + r, ur = gr + SL;
+      rows[r] = w.gu + gr * WPR;        srows[r] = w.gus + gr * GPR;
+      rows[r + RP] = w.gu + ur * WPR;   srows[r + RP] = w.gus + ur * GPR;
+    }
+    const float e2 = sycl::ldexp(1.f, (int)w.gue[e]);
+    for (int c0 = 0; c0 < n_all; c0 += MMAX) {
+      const int nr = sycl::min(MMAX, n_all - c0);
+      const int32_t* slots = all + c0;
+      float acc[2 * RP][MMAX];
+#pragma unroll
+      for (int r = 0; r < 2 * RP; ++r)
+#pragma unroll
+        for (int m = 0; m < MMAX; ++m) acc[r][m] = 0.f;
+      for (int j = lane; j < 80; j += SG) {
+        uint32_t ch[2 * RP][4]; float sc[2 * RP];
+#pragma unroll
+        for (int r = 0; r < 2 * RP; ++r) {
+          chunks24(rows[r][3 * j], rows[r][3 * j + 1], rows[r][3 * j + 2], ch[r]);
+          sc[r] = e4m3_to_f(srows[r][j >> 1]);
+        }
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          float q[2 * RP][8];
+#pragma unroll
+          for (int r = 0; r < 2 * RP; ++r) decode8(ch[r][c], q[r]);
+#pragma unroll
+          for (int m = 0; m < MMAX; ++m) {
+            if (m >= nr) break;
+            float xf[8];
+            load8(xq + (size_t)(slots[m] / TOPK) * K + 32 * j + 8 * c, xf);
+#pragma unroll
+            for (int r = 0; r < 2 * RP; ++r) acc[r][m] += sc[r] * dot8(q[r], xf);
+          }
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < RP; ++r)
+#pragma unroll
+        for (int m = 0; m < MMAX; ++m) {
+          if (m >= nr) break;
+          const float xsc = xs[slots[m] / TOPK] * e2;
+          const float gv = sycl::reduce_over_group(sg, acc[r][m], sycl::plus<float>()) * xsc;
+          const float uv = sycl::reduce_over_group(sg, acc[r + RP][m], sycl::plus<float>()) * xsc;
+          if (lane == 0) a[(size_t)slots[m] * (NS * SL) + s * SL + nb * RP + r] = silu(gv) * uv;
+        }
+    }
+  }
+};
+
+// mid: one sub-group per (route slot, slice): FWHT-128 of a, Q8 per (slot, slice).
+struct MidKernel {
+  const float* a; const int32_t* ids; const int32_t* map; bf16* hq; float* hs; int S;
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int job = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
+    const int t = job / NS, s = job % NS;
+    if (t >= S) return;
+    const int g = ids[t];
+    if (g < 0 || map[g] < 0) return;
+    auto sg = it.get_sub_group();
+    float v[8];
+    const float* src = a + (size_t)t * NS * SL + s * SL + lane * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = src[i];
+    fwht128(v, lane, sg);
+    float am = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) am = sycl::fmax(am, sycl::fabs(v[i]));
+    am = sycl::reduce_over_group(sg, am, sycl::maximum<float>());
+    const float sc = sycl::fmax(am / 448.f, 1.f / (448.f * 512.f));
+    bf16* dst = hq + (size_t)t * NS * SL + s * SL + lane * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) dst[i] = bf16(q_e4m3(v[i] / sc));
+    if (lane == 0) hs[(size_t)t * NS + s] = sc;
+  }
+};
+
+// down: 4 lanes per output row (lane part p = triplet p of each slice's 12 words), 4 rows per pass, P passes.
+template <int MMAX, int P, typename WT>
+struct DownKernel {
+  const bf16* hq; const float* hs; const WT* tw; const int32_t* ids; const int32_t* map; const int32_t* plan; W3 w;
+  float* y; int K, n_blocks;
+  static constexpr int LPR = 4, RPP = SG / LPR, R = RPP * P;
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int job = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
+    auto sg = it.get_sub_group();
+    const int oi = job / n_blocks, nb = job % n_blocks;
+    const int32_t* all; int e = -1;
+    const int n_all = plan_owner(plan, ids, map, oi, all, e);
+    if (!n_all) return;
+    const int sub = lane / LPR, part = lane % LPR;
+    const float e2 = sycl::ldexp(1.f, (int)w.dne[e]);
+    for (int c0 = 0; c0 < n_all; c0 += MMAX) {
+      const int nr = sycl::min(MMAX, n_all - c0);
+      const int32_t* slots = all + c0;
+      float acc[P][MMAX];
+#pragma unroll
+      for (int p = 0; p < P; ++p)
+#pragma unroll
+        for (int m = 0; m < MMAX; ++m) acc[p][m] = 0.f;
+#pragma unroll
+      for (int s = 0; s < NS; ++s) {
+        float hsc[MMAX];
+#pragma unroll
+        for (int m = 0; m < MMAX; ++m) hsc[m] = m < nr ? hs[(size_t)slots[m] * NS + s] : 0.f;
+#pragma unroll
+        for (int p = 0; p < P; ++p) {
+          const int k = nb * R + p * RPP + sub;
+          const size_t row = ((size_t)e * NS + s) * K + k;
+          const uint32_t* wr = w.dn + row * 12 + 3 * part;
+          uint32_t ch[4];
+          chunks24(wr[0], wr[1], wr[2], ch);
+          const float sc = e4m3_to_f(w.dns[row * 2 + (part >> 1)]);
+          float pm[MMAX];
+#pragma unroll
+          for (int m = 0; m < MMAX; ++m) pm[m] = 0.f;
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            float q[8];
+            decode8(ch[c], q);
+#pragma unroll
+            for (int m = 0; m < MMAX; ++m) {
+              if (m >= nr) break;
+              float xf[8];
+              load8(hq + (size_t)slots[m] * NS * SL + s * SL + 32 * part + 8 * c, xf);
+              pm[m] += dot8(q, xf);
+            }
+          }
+#pragma unroll
+          for (int m = 0; m < MMAX; ++m) acc[p][m] += sc * hsc[m] * pm[m];
+        }
+      }
+#pragma unroll
+      for (int p = 0; p < P; ++p)
+#pragma unroll
+        for (int m = 0; m < MMAX; ++m) {
+          if (m >= nr) break;
+          float v = acc[p][m];
+          v += sycl::permute_group_by_xor(sg, v, 1);
+          v += sycl::permute_group_by_xor(sg, v, 2);
+          if (part == 0) {
+            const int k = nb * R + p * RPP + sub;
+            y[(size_t)slots[m] * K + k] = (float)bf16(v * e2) * (float)tw[slots[m]];
+          }
+        }
+    }
+  }
+};
+
+struct GatherKernel {
+  const float* y; const int32_t* ids; const int32_t* map; bf16* out; int M, TOPK, K;
+  void operator()(sycl::nd_item<1> it) const {
+    const size_t i = it.get_global_id(0);
+    if (i >= (size_t)M * K) return;
+    const int m = i / K, k = i % K;
+    float acc = 0.f;
+    for (int j = 0; j < TOPK; ++j) {
+      const int t = m * TOPK + j, g = ids[t];
+      if (g >= 0 && map[g] >= 0) acc += y[(size_t)t * K + k];
+    }
+    out[i] = bf16(acc);
+  }
+};
+
+template <int MMAX, typename WT>
+static void launch(sycl::queue& q, torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& tw,
+                   const torch::Tensor& ids, const torch::Tensor& map, W3 w) {
+  const int M = x.size(0), K = x.size(1), TOPK = ids.size(1), S = M * TOPK;
+  auto f32 = x.options().dtype(torch::kFloat32);
+  auto xq = torch::empty({M, K}, x.options());
+  auto xs = torch::empty({M}, f32);
+  auto a = torch::empty({S, NS * SL}, f32);
+  auto hq = torch::empty({S, NS * SL}, x.options());
+  auto hs = torch::empty({S, NS}, f32);
+  auto y = torch::empty({S, K}, f32);
+  auto plan = torch::empty({PH + S * PSTRIDE}, ids.options());
+  auto* idp = ids.data_ptr<int32_t>(); auto* mp = map.data_ptr<int32_t>(); auto* pp = plan.data_ptr<int32_t>();
+  auto* xqp = reinterpret_cast<bf16*>(xq.data_ptr()); auto* xsp = xs.data_ptr<float>();
+  auto* ap = a.data_ptr<float>(); auto* hqp = reinterpret_cast<bf16*>(hq.data_ptr()); auto* hsp = hs.data_ptr<float>();
+  auto* yp = y.data_ptr<float>();
+  auto* twp = reinterpret_cast<const WT*>(tw.data_ptr());
+  q.parallel_for(sycl::nd_range<1>(256, 256), PlanKernel{idp, mp, pp, S});
+  q.parallel_for(sycl::nd_range<1>((size_t)M * 20 * SG, 20 * SG),
+                 XPrepKernel{reinterpret_cast<const bf16*>(x.data_ptr()), xqp, xsp, K});
+  constexpr int RP = 2;  // gate/up row pairs per sub-group
+  UpKernel<MMAX, RP> up{xqp, xsp, idp, mp, pp, w, ap, TOPK, K, SL / RP};
+  const size_t up_sg = (size_t)S * NS * (SL / RP);
+  static const int skip = std::getenv("B70W3_SKIP") ? std::atoi(std::getenv("B70W3_SKIP")) : 0;
+  if (!(skip & 1)) q.parallel_for(sycl::nd_range<1>(up_sg * SG, SG * 4), up);
+  q.parallel_for(sycl::nd_range<1>(((size_t)S * NS + 3) / 4 * 4 * SG, SG * 4), MidKernel{ap, idp, mp, hqp, hsp, S});
+  constexpr int P = 4;
+  DownKernel<MMAX, P, WT> down{hqp, hsp, twp, idp, mp, pp, w, yp, K, K / (4 * P)};
+  const size_t dn_sg = (size_t)S * (K / (4 * P));
+  if (!(skip & 2)) q.parallel_for(sycl::nd_range<1>(dn_sg * SG, SG * 4), down);
+  const size_t tot = (size_t)M * K, lg = 256;
+  q.parallel_for(sycl::nd_range<1>((tot + lg - 1) / lg * lg, lg),
+                 GatherKernel{yp, idp, mp, reinterpret_cast<bf16*>(out.data_ptr()), M, TOPK, K});
+}
+
+void moe_decode_w3(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, torch::Tensor topk_ids,
+                   torch::Tensor map, torch::Tensor gu_codes, torch::Tensor gu_scales, torch::Tensor gu_exp2,
+                   torch::Tensor dn_codes, torch::Tensor dn_scales, torch::Tensor dn_exp2) {
+  TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && out.scalar_type() == torch::kBFloat16, "bf16 activations");
+  TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && map.scalar_type() == torch::kInt32, "int32 ids / map");
+  TORCH_CHECK(x.size(1) == 2560 && gu_codes.size(-1) == 240 && dn_codes.size(-1) == 12, "shapes (H 2560, I 640)");
+  TORCH_CHECK(x.is_contiguous() && gu_codes.is_contiguous() && dn_codes.is_contiguous() && gu_scales.is_contiguous()
+              && dn_scales.is_contiguous(), "contiguous");
+  const int M = x.size(0);
+  TORCH_CHECK(M <= 16 && M * topk_ids.size(1) <= 256, "decode: at most 16 rows");
+  auto& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+  W3 w{reinterpret_cast<const uint32_t*>(gu_codes.data_ptr()), reinterpret_cast<const uint8_t*>(gu_scales.data_ptr()),
+       reinterpret_cast<const int8_t*>(gu_exp2.data_ptr()), reinterpret_cast<const uint32_t*>(dn_codes.data_ptr()),
+       reinterpret_cast<const uint8_t*>(dn_scales.data_ptr()), reinterpret_cast<const int8_t*>(dn_exp2.data_ptr())};
+  auto go = [&](auto tag) {
+    constexpr int MM = decltype(tag)::value;
+    if (topk_weights.scalar_type() == torch::kFloat32) launch<MM, float>(q, out, x, topk_weights, topk_ids, map, w);
+    else launch<MM, bf16>(q, out, x, topk_weights, topk_ids, map, w);
+  };
+  if (M <= 2) go(std::integral_constant<int, 2>{});
+  else go(std::integral_constant<int, 4>{});
+}
+
+TORCH_LIBRARY(b70w3, m) {
+  m.def("moe_decode_w3(Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, Tensor map, "
+        "Tensor gu_codes, Tensor gu_scales, Tensor gu_exp2, Tensor dn_codes, Tensor dn_scales, Tensor dn_exp2) -> ()");
+}
+TORCH_LIBRARY_IMPL(b70w3, XPU, m) { m.impl("moe_decode_w3", &moe_decode_w3); }
