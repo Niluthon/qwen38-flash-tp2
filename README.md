@@ -16,7 +16,7 @@ CPU (AVX-512 BF16 makes decode faster, see [CPU](#cpu)).
 ```bash
 git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 cp .env.example .env               # optional: MODELS=/path/on/nvme (default ~/models)
-docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0050 + kernels + shim
+docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0050, 0052, 0053 + kernels + shim
 docker compose run --rm prepare    # once: download (~129 GB) and prepare the weights
 docker compose up -d               # serving on port 8000 after ~5 min
 docker compose logs warmup         # wait for "warm-up request OK" before sending long prompts
@@ -32,8 +32,10 @@ settings, weights you already have, your own model, troubleshooting).
 
 ## Speed of the current build
 
-Image `b70-flash-next:tp2` with patches 0001–0050, default settings, no overrides. Host: Ryzen 9 7950X, 61 GiB DDR5,
-2× B70 on PCIe 5.0 x8. Measured 2026-10-20 on an idle engine (docs/two-cards.md, round 10, run P).
+Image `b70-flash-next:tp2` with patches 0001–0050, 0052 and 0053, default settings, no overrides. Host: Ryzen 9 7950X, 61 GiB DDR5,
+2× B70 on PCIe 5.0 x8. Measured 2026-10-20 on an idle engine (docs/two-cards.md, round 12, run H156: 156 hot experts, with
+expandable segments in the torch allocator, 0052 and 0053; BetterBench on the same build; the CPU on/off table is
+older, see there).
 
 Units used below:
 
@@ -46,35 +48,35 @@ Units used below:
 
 | prompt | tok/s | ms/step | tokens/step |
 |---|---|---|---|
-| explain how a refrigerator works | 71.6 | 36.0 | 2.57 |
-| write a Python function | 106.6 | 32.6 | 3.49 |
-| write a short story | 68.8 | 33.6 | 2.31 |
-| compare TCP and UDP | 90.0 | 33.4 | 3.01 |
-| **mean** | **84.3** | **33.9** | **2.85** |
+| explain how a refrigerator works | 82.2 | 31.8 | 2.61 |
+| write a Python function | 113.6 | 30.4 | 3.47 |
+| write a short story | 70.5 | 31.2 | 2.20 |
+| compare TCP and UDP | 106.3 | 29.2 | 3.10 |
+| **mean** | **93.2** | **30.7** | **2.85** |
 
 **Load, prefill and capacity:**
 
 | measurement | value | unit |
 |---|---|---|
-| decode, 4 requests at once, total of the 4 (same prompts) | 176.8 | tok/s |
-| decode, 4 requests at once, step time | 62.5 | ms/step |
-| coding agents, 12 sessions at 2 concurrent requests, total (`agent_load.py`, two runs) | 119.3 / 137.1 | tok/s |
-| prefill, one request, 3K / 12K / 30K-token prompt | 4,021 / 4,143 / 3,973 | tok/s (prompt tokens) |
-| KV cache pool, shared by all requests (each card holds half of the attention heads of every token) | 271,195 | tokens |
+| decode, 4 requests at once, total of the 4 (same prompts) | 195.6 | tok/s |
+| decode, 4 requests at once, step time | 56.2 | ms/step |
+| coding agents, 12 sessions at 2 concurrent requests, total (`agent_load.py`, two runs) | 126.3 / 128.5 | tok/s |
+| prefill, one request, 3K / 12K / 30K-token prompt | 4,069 / 4,196 / 3,991 | tok/s (prompt tokens) |
+| KV cache pool, shared by all requests (each card holds half of the attention heads of every token) | 317,695 | tokens |
 | context length, one request at most | 262,144 | tokens |
 | requests served at once (more are queued) | 4 | requests |
 | boot to serving | 4–5 | min |
 
-**[BetterBench](https://github.com/GGZ14/BetterBench)** (20 passes per category, temperature 0.7, 2026-10-20, commit
-`816cc78`, i.e. before 0050, which measured speed-neutral):
+**[BetterBench](https://github.com/GGZ14/BetterBench)** (20 passes per category, temperature 0.7, 2026-10-20, the current build:
+0052, 0053, 156 hot experts; in brackets the run of the morning, commit `816cc78`, 146 hot, before 0050/0052/0053):
 
 | measurement | value | unit |
 |---|---|---|
-| decode, 1 request, weighted median over 8 categories | 94.1 | tok/s |
-| time to first token, 1 request, p50 | 281 | ms |
-| gap between streamed updates, p99 (stutter) | 40.8 | ms |
-| decode total at 1 / 2 / 4 / 8 concurrent requests | 81.6 / 121.9 / 166.1 / 165.4 | tok/s |
-| prefill median at 1.5K / 6K / 12K / 24K / 47K-token prompts | 2,368 / 3,883 / 3,921 / 3,863 / 3,689 | tok/s (prompt tokens) |
+| decode, 1 request, weighted median over 8 categories | 99.9 (94.1) | tok/s |
+| time to first token, 1 request, p50 | 253 (281) | ms |
+| gap between streamed updates, p99 (stutter) | 39.6 (40.8) | ms |
+| decode total at 1 / 2 / 4 / 8 concurrent requests | 84.2 / 130.7 / 178.5 / 177.7 (81.6 / 121.9 / 166.1 / 165.4) | tok/s |
+| prefill median at 1.5K / 6K / 12K / 24K / 47K-token prompts | 2,622 / 3,928 / 3,956 / 3,872 / 3,704 (2,368 / 3,883 / 3,921 / 3,863 / 3,689) | tok/s (prompt tokens) |
 
 **CPU path on vs off** (the same image, one boot each, 2026-10-20, `bench_det.py`; off = `B70_MOE_CPU=0` or a CPU
 without AVX-512 BF16, see [CPU](#cpu)):
@@ -87,9 +89,9 @@ without AVX-512 BF16, see [CPU](#cpu)):
 
 Prefill does not use the CPU path (large batches take 0042's prefetch path).
 
-Quality: MMLU 87.2 %, HumanEval 158 / 164, measured in round 4 (FP8 dense layers, before 0047–0050); 0049 and 0050
-passed paired-perplexity checks within ±1 %; MMLU and HumanEval have not been re-run on the current build. Single runs
-vary by ±5–10 % in tok/s.
+Quality: MMLU 87.7 % (3,000 sampled questions), HumanEval 158 / 164, measured 2026-10-20 on the current build's
+numerics (round 12: FP8 target head, 0053; with the BF16 head 87.5 % and 158 / 164). Single runs vary by ±5–10 % in
+tok/s.
 
 ## CPU
 
@@ -131,7 +133,7 @@ Weights: [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/alb
 (Intel AutoRound target tensors, FP8 PLE table, INT4 MTP draft).
 
 Settings (`engines/two-cards/env/tp2-hotcold.env`, `engines/two-cards/args/serve-tp2.args`): tensor parallel 2 + expert
-parallel 2; 146 hot experts per layer and card in VRAM that follow what decode reads (0040, 0043, 0047), the rest
+parallel 2; 156 hot experts per layer and card in VRAM that follow what decode reads (0040, 0043, 0047), the rest
 pinned in host RAM; cold experts prefetched into VRAM for prefill (0042); the fused decode MoE op with the CPU path
 (0048, 0049) and an FP8 draft head; the input embedding in host RAM (0044); FP8 W8A16 dense projections (0045); the
 checkpoint's FP8 PLE shards read in place from NVMe with a 2 GiB row cache (0013 + 0050); MTP k=3; GPU memory 0.96;
@@ -141,7 +143,7 @@ checkpoint's FP8 PLE shards read in place from NVMe with a 2 GiB row cache (0013
 ## What is in the series
 
 The image applies the vLLM release `0.30.0-b70.2` (patches 0001–0032, fork tag `Lumnus/vllm@v0.30.0-b70.2`) and the
-two-card patches 0040–0050 on top.
+two-card patches 0040–0050, 0052 and 0053 on top.
 
 | patch | what | switch |
 |---|---|---|
@@ -187,7 +189,7 @@ Every switch with its default and measurements: [docs/switches.md](docs/switches
 | `engines/two-cards/` | `env/tp2-hotcold.env` (defaults), `env/tp2-local.env.example` (your overrides), `args/serve-tp2.args` (`vllm serve` flags), `scripts/` (compose entrypoint, `run-tp2.sh`, `restart-tp2.sh`) |
 | `engines/serve-configs/` | the snapshots' `config.json` (`serve-config-intel-autoround.json` is the one the engine uses) |
 | `image/` | `Dockerfile.tp2` (the image), `verify-overlay.sh` and `verify-tree.py` (hash checks of every patched file) |
-| `patches/vllm/`, `patches/vllm-tests/` | the vLLM series 0001–0050; CPU tests (never applied to the image) |
+| `patches/vllm/`, `patches/vllm-tests/` | the vLLM series 0001–0050, 0052 and 0053; CPU tests (never applied to the image) |
 | `patches/vllm-xpu-kernels/` | our kernel series on vllm-xpu-kernels 0.1.14.1 (b70.3) ([docs/kernels.md](docs/kernels.md)) |
 | `patches/series.txt` | which fork commit goes to which file |
 | `kernels/` | standalone SYCL ops (`b70-moe-decode`, built by the image) and diagnostics |

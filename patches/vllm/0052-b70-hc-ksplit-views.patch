@@ -1,0 +1,79 @@
+From f18db92a3d96e7ecc175ef7111732d81e018e0b0 Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:41:31 +0000
+Subject: [PATCH] B70-0052: HC down GEMM K-halves as views of the weight (no
+ second copy)
+
+0003's deterministic XPU K-split ran prefill rows (> 64) as two K=5120 GEMMs over contiguous copies of the
+two halves of every hyper-connection down weight, a second copy of all of them: 0.68 GiB per card. The halves
+are now strided views W[:, :K] / W[:, K:] (row stride 2K) of the one weight.
+
+On a B70 (engine-data/ab/hc_ksplit_view_test.py, N = 336 and 320, K = 10240, M = 65..8192): bitwise equal to the
+contiguous halves at every width, run-to-run deterministic (20x), graph-captured replays bitwise equal (50/50 at
+M = 256 and 2048), no hidden weight copy; the GEMM pair is 0-3 % slower at M >= 512 (~10-20 us at 4-8K rows).
+Decode (<= 64 rows, the single stock GEMM) is not touched. B70_HC_KSPLIT_VIEWS=0 restores the copies.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../qwen4_exp/nvidia/hyperconnection.py       | 27 ++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/hyperconnection.py b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+index 08d7fea..99aea34 100644
+--- a/vllm/models/qwen4_exp/nvidia/hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+@@ -22,6 +22,8 @@ Typical usage inside a transformer decoder layer::
+     )
+ """
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -78,6 +80,18 @@ _HC_KSPLIT_MAX_STOCK_WIDTH = 64
+ _HC_KSPLIT_WIDTHS_LOGGED: set[int] = set()
+ 
+ 
++def _hc_ksplit_views() -> bool:
++    """B70 0052 gate: K-halves as strided views of the one down weight.
++
++    Default ON. The halves W[:, :K] and W[:, K:] (row stride 2K) give results
++    bitwise equal to contiguous copies of them at every prefill width, also
++    graph-replayed, with no hidden copy (oneDNN takes the leading dimension),
++    so the second copy of every HC down weight (0.68 GiB per card) is dropped.
++    0 = the contiguous copies of 0003.
++    """
++    return os.environ.get("B70_HC_KSPLIT_VIEWS", "1") != "0"
++
++
+ # ---------------------------------------------------------------------------
+ # Gated-residual variant
+ # ---------------------------------------------------------------------------
+@@ -194,13 +208,20 @@ class GatedResidual(nn.Module):
+             )
+             return
+         self._kdown_k = weight.shape[1] // 2
+-        self._kdown_lo = weight.data[:, : self._kdown_k].contiguous()
+-        self._kdown_hi = weight.data[:, self._kdown_k :].contiguous()
++        views = _hc_ksplit_views()
++        lo = weight.data[:, : self._kdown_k]
++        hi = weight.data[:, self._kdown_k :]
++        # Views share the weight's storage; if the weight is later replaced
++        # (VLLM_XPU_FORCE_N_CONTIG_WEIGHT), they keep the old storage alive:
++        # still correct, just no saving.
++        self._kdown_lo = lo if views else lo.contiguous()
++        self._kdown_hi = hi if views else hi.contiguous()
+         logger.debug(
+-            "HC down GEMM: K-split halves prepared (K=%d -> 2x%d, N=%d)",
++            "HC down GEMM: K-split halves prepared (K=%d -> 2x%d, N=%d, %s)",
+             weight.shape[1],
+             self._kdown_k,
+             weight.shape[0],
++            "views of the weight" if views else "contiguous copies",
+         )
+ 
+     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
+-- 
+2.53.0
+

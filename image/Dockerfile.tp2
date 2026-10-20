@@ -71,7 +71,7 @@ ARG VLLM_REPO=https://github.com/Lumnus/vllm.git
 ARG VLLM_TAG=v0.30.0-b70.2
 ARG VLLM_COMMIT=9d79d28d7e32f33bdbd115c85d116583ce679cb6
 ARG VLLM_BASE=ced6857afa0ea7b2e3f0846a62e1394e90f15607
-ARG TP2_PATCHES="0040 0041 0042 0043 0044 0045 0046 0047 0048 0049 0050"
+ARG TP2_PATCHES="0040 0041 0042 0043 0044 0045 0046 0047 0048 0049 0050 0052 0053"
 RUN --mount=type=bind,source=patches/vllm,target=/tmp/b70-patches \
     --mount=type=bind,source=image,target=/tmp/b70-image \
     set -eu; export LC_ALL=C; \

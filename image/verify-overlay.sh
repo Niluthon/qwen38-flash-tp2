@@ -53,12 +53,13 @@ d5ef338178e824f0d2fb9447cdebda1e8f4e7ec9cd7791994083007ff1ad77c8  vllm/v1/worker
 # b70 series 0006, 0007, 0008, 0009, 0010, 0012, 0013, 0013b, 0014a–f, 0018–0023c, 0026–0029b, 0031, 0032, 0040, applied in that (filename) order on top
 # of 0001–0005. sha256  tag  relative-path-under-vllm/   (both roots)
 B70_FILES='
+7e8555f4a18abb07aa3280e608ab680ba61d8f9ac9daede1a3c0be833f1dc848  B70-0052      vllm/models/qwen4_exp/nvidia/hyperconnection.py
 da982f1e3fec8874c56f0ebd07b1c8c53208d1500d3d3f785e3e8372f022ed77  B70-0050      vllm/models/qwen4_exp/nvidia/ngram_embedding.py
 f0a0de26055e7a346b430431012df3bf1bf4f22f0fe0aebbe8e9aa015976faba  B70-0046      vllm/models/qwen4_exp/nvidia/model_state.py
 9c0248658815190a56a269192d9cb1b376846396dcc96dc00dda39e4b7728648  B70-0050      vllm/models/qwen4_exp/nvidia/ple_nvme.py
 0b02bdb26b340d57869861c0570815bc68d36812a87c1b78a16960f3b20f842a  B70-0023c     vllm/v1/worker/gpu/model_runner.py
 98b50a3b6e780ecdb7deb96a1e9ca3663cc7aba9e4ffe051f97c1b14d3df0fe8  B70-0031      vllm/v1/kv_offload/cpu/gpu_worker.py
-ff413ff88dd8830b5e147983b997f956ebfd446ddf57fdf0d10168fdfd75a5db  B70-0019      vllm/models/qwen4_exp/nvidia/model.py
+95c0093c4ce3d94e39109ed5b215d5c6ebbf4ce07137aca9a62db0e8d3a2efb2  B70-0053      vllm/models/qwen4_exp/nvidia/model.py
 bd5b01d0a8b7c9a1b0dd2ace780aaf969c7c6ad4c458ad9f28568c2e7cf9d7a4  B70-0012      vllm/entrypoints/openai/chat_completion/protocol.py
 0923b00c12102558fbf2b633a24d337486d69acc5decdbab6f1c6d89bb40d6fe  B70-0014f     vllm/distributed/kv_transfer/kv_connector/v1/offloading/b70_offload.py
 1099e97d0b9b842dbe03a665f100f4543811983193b2b7be336aab36b60cd1f9  B70-0014f     vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
@@ -73,7 +74,7 @@ cb5ba467dd0cc0d020289ddccc8fcbf1d62d8c938fd2c35d903f86f8ce247147  B70-0014f     
 e4350b3ee0a706c31a30338065506460d83b421416c86155ecbc49f18c06172a  UPSTREAM      vllm/v1/kv_offload/cpu/policies/arc.py
 b037992a080ddba36111e05466066e4ab347ec7e556cbe7e387cea2967703bab  UPSTREAM      vllm/v1/kv_offload/cpu/policies/lru.py
 a32da0c0d4bebb7694da16d0b78643496c82960ab421fac86a489486ef76b706  B70-0032      vllm/_xpu_ops.py
-1cddb66955924562f94216c974c17e19073a345d8c0142ce8f5ce7b98a6b959a  B70-0048      vllm/models/qwen4_exp/nvidia/mtp.py
+18bc30a05dea2e5d06020e3791ac3260ab63fb032b4d430ea90e634a4a15e9ff  B70-0053      vllm/models/qwen4_exp/nvidia/mtp.py
 5f688e3972a0a7491ecfa786135d2fa0e1a5aa148e97a9ef3cf507cff6dbe171  B70-0021      vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 e2b41b0b066d1d9e18ca0ce4f135df46ebf0ba0084888441dba4d171d1342021  B70-0022      vllm/v1/worker/gpu/model_states/mamba_hybrid.py
 e5014b3e6f2808aa0aca6478e0c650000a0233d16b5abc9cfdf82533b1b749dc  B70-0022      vllm/v1/worker/mamba_utils.py

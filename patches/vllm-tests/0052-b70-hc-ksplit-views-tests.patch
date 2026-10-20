@@ -1,0 +1,103 @@
+From f18db92a3d96e7ecc175ef7111732d81e018e0b0 Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:41:31 +0000
+Subject: [PATCH] B70-0052: HC down GEMM K-halves as views of the weight (no
+ second copy)
+
+0003's deterministic XPU K-split ran prefill rows (> 64) as two K=5120 GEMMs over contiguous copies of the
+two halves of every hyper-connection down weight, a second copy of all of them: 0.68 GiB per card. The halves
+are now strided views W[:, :K] / W[:, K:] (row stride 2K) of the one weight.
+
+On a B70 (engine-data/ab/hc_ksplit_view_test.py, N = 336 and 320, K = 10240, M = 65..8192): bitwise equal to the
+contiguous halves at every width, run-to-run deterministic (20x), graph-captured replays bitwise equal (50/50 at
+M = 256 and 2048), no hidden weight copy; the GEMM pair is 0-3 % slower at M >= 512 (~10-20 us at 4-8K rows).
+Decode (<= 64 rows, the single stock GEMM) is not touched. B70_HC_KSPLIT_VIEWS=0 restores the copies.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../test_b70_hc_ksplit_views.py               | 73 +++++++++++++++++++
+ 1 file changed, 73 insertions(+)
+ create mode 100644 tests/model_executor/test_b70_hc_ksplit_views.py
+
+diff --git a/tests/model_executor/test_b70_hc_ksplit_views.py b/tests/model_executor/test_b70_hc_ksplit_views.py
+new file mode 100644
+index 0000000..bf6978d
+--- /dev/null
++++ b/tests/model_executor/test_b70_hc_ksplit_views.py
+@@ -0,0 +1,73 @@
++"""B70-0052: the HC down GEMM K-halves are views of the one weight (no second copy) unless B70_HC_KSPLIT_VIEWS=0."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.nvidia.hyperconnection import GatedResidual
++
++
++def _fake(use_combine: bool, n: int = 336, k2: int = 10240):
++    weight = torch.nn.Parameter(torch.randn(n, k2).to(torch.bfloat16), requires_grad=False)
++    linear = SimpleNamespace(weight=weight)
++    return SimpleNamespace(
++        _kdown_lo=None,
++        _kdown_hi=None,
++        _kdown_k=0,
++        use_combine=use_combine,
++        input_mix_weight_down_block_inject=linear,
++        input_mix_weight_down=linear,
++    )
++
++
++def _prepare(fake):
++    GatedResidual._prepare_kdown_ksplit(fake)
++    return fake
++
++
++@pytest.mark.parametrize("use_combine,n", [(True, 336), (False, 320)])
++def test_views_by_default(monkeypatch, use_combine, n):
++    monkeypatch.setenv("B70_HC_KSPLIT_VIEWS", "1")
++    monkeypatch.delenv("B70_HC_KSPLIT_VIEWS")
++    f = _prepare(_fake(use_combine, n))
++    w = f.input_mix_weight_down.weight.data
++    k = w.shape[1] // 2
++    assert f._kdown_k == k
++    assert f._kdown_lo.untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
++    assert f._kdown_hi.untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
++    assert f._kdown_lo.data_ptr() == w.data_ptr()
++    assert f._kdown_hi.data_ptr() == w[:, k:].data_ptr()
++    assert f._kdown_lo.stride() == (2 * k, 1) and f._kdown_hi.stride() == (2 * k, 1)
++    assert torch.equal(f._kdown_lo, w[:, :k]) and torch.equal(f._kdown_hi, w[:, k:])
++
++
++def test_copies_when_off(monkeypatch):
++    monkeypatch.setenv("B70_HC_KSPLIT_VIEWS", "0")
++    f = _prepare(_fake(True))
++    w = f.input_mix_weight_down.weight.data
++    k = w.shape[1] // 2
++    assert f._kdown_lo.is_contiguous() and f._kdown_hi.is_contiguous()
++    assert f._kdown_lo.untyped_storage().data_ptr() != w.untyped_storage().data_ptr()
++    assert torch.equal(f._kdown_lo, w[:, :k]) and torch.equal(f._kdown_hi, w[:, k:])
++
++
++def test_split_matches_full_gemm_shape(monkeypatch):
++    """The two half GEMMs over the views add up to the full GEMM (fp32 on CPU, tolerance for the summation order)."""
++    monkeypatch.delenv("B70_HC_KSPLIT_VIEWS", raising=False)
++    f = _prepare(_fake(True, 336, 1024))
++    w = f.input_mix_weight_down.weight.data.float()
++    x = torch.randn(80, 1024)
++    k = f._kdown_k
++    split = torch.nn.functional.linear(x[:, :k], f._kdown_lo.float()) + torch.nn.functional.linear(
++        x[:, k:], f._kdown_hi.float()
++    )
++    torch.testing.assert_close(split, torch.nn.functional.linear(x, w), rtol=1e-4, atol=1e-3)
++
++
++def test_prepare_is_idempotent(monkeypatch):
++    monkeypatch.delenv("B70_HC_KSPLIT_VIEWS", raising=False)
++    f = _prepare(_fake(True))
++    lo = f._kdown_lo
++    _prepare(f)
++    assert f._kdown_lo is lo
+-- 
+2.53.0
+
