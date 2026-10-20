@@ -10,7 +10,7 @@
 # + vLLM of the release 0.30.0-b70.2: fork tag Lumnus/vllm@v0.30.0-b70.2 (commit asserted; = v0.30.0 + patches
 #   0001–0032), fetched into /workspace/vllm and its vllm/ changes copied into the installed package; the build fails
 #   unless the release changes exactly the files patches/vllm/0001–0032 touch (less the two they restore, UPSTREAM)
-# + the two-card patches 0040–0048 (in no release yet) from patches/vllm/, on top; then every touched file is
+# + the two-card patches 0040–0049 (in no release yet) from patches/vllm/, on top; then every touched file is
 #   sha256-asserted against image/verify-overlay.sh ("final" set) and every touched .py compiled
 # + libb70_moe_decode.so (patch 0048's fused decode MoE op), compiled in stage b70moe from kernels/b70-moe-decode with
 #   icpx 2026.0 from Intel's apt repository
@@ -71,7 +71,7 @@ ARG VLLM_REPO=https://github.com/Lumnus/vllm.git
 ARG VLLM_TAG=v0.30.0-b70.2
 ARG VLLM_COMMIT=9d79d28d7e32f33bdbd115c85d116583ce679cb6
 ARG VLLM_BASE=ced6857afa0ea7b2e3f0846a62e1394e90f15607
-ARG TP2_PATCHES="0040 0041 0042 0043 0044 0045 0046 0047 0048"
+ARG TP2_PATCHES="0040 0041 0042 0043 0044 0045 0046 0047 0048 0049"
 RUN --mount=type=bind,source=patches/vllm,target=/tmp/b70-patches \
     --mount=type=bind,source=image,target=/tmp/b70-image \
     set -eu; export LC_ALL=C; \

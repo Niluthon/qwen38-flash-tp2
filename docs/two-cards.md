@@ -55,7 +55,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
 `Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
-0040–0048 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
+0040–0049 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-11, after the experiments below): TP 2 + EP 2,
 150 hot experts per layer and rank swapped as traffic changes (0043), the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch for prefill (0042), MTP k=3 with the checkpoint's draft,
 `--gpu-memory-utilization 0.95`, 131,072-token context, image input off (`--limit-mm-per-prompt` 0),
 4 slots, 4,096-token batches, INT8 PLE from NVMe with a 2 GiB row cache, no CPU KV tier. It listens on 0.0.0.0:8000.
@@ -343,6 +343,44 @@ which roughly halves the cold time: 4 rows ~226 → ~130 µs per layer (hot-boun
 the CPU and copies their rows to host memory, a per-rank pool pinned to one CCD each, a wait kernel with a timeout
 that falls back to the GPU path, and the CPU's partial sums added in the gather.
 
+## Experiments, round 9 (2026-10-19/20): the CPU computes part of the cold experts (0049)
+
+One-card microbench (48 layers in a graph, cold share 0.08), CPU path with 8 threads on one CCD:
+
+| rows | GPU only | CPU + GPU, 30 % | 70 % | 100 % |
+|---|---|---|---|---|
+| 1 | 66 µs | 63 | 48 | 45 |
+| 4 | 226 | 190 | 142 | 143 |
+| 8 | 353 | 262 | 204 | 211 |
+| 16 | 638 | 477 | 343 | 359 |
+
+70 % is the default (100 % leaves the GPU's PCIe link idle and the pool becomes the bound). Errors vs the stock
+path are the same as the GPU-only op (max rel ~1e-2, bf16 level); zero GPU-wait timeouts. With the pool stalled
+300 ms and a 100 ms bound, the fallback recomputed the experts on the GPU, reported the timeout and switched the
+CPU path off: results stayed correct and the graphs did not hang.
+
+Two cards, one boot each (the same harness as rounds 6–8; L = the image with 0048's op, M = the op + CPU path at
+70 %, one pool per rank pinned to its own CCD):
+
+| run | 1 stream fresh (ms/step) | 4 streams fresh | agent #1 / #2 | 1 stream after agents (ms/step) | 4 streams after agents |
+|---|---|---|---|---|---|
+| L: GPU only | 41.1 / 37.4 / 41.5 / 38.3 | 146.6 (77.0 ms) | 103.9 / 120.1 | 46.8 / 36.8 / 46.0 / 38.5 | 149.5 (73.2 ms) |
+| **M: + CPU path** | **34.6 / 31.8 / 34.4 / 31.6** | **170.1 (62.6 ms)** | **119.4 / 129.8** | 35.6 / 30.8 / 36.2 / 30.4 | **179.2 (60.5 ms)** |
+
+1 stream −16 % step time, 4 streams −19 %, agents +8–15 %, acceptance unchanged, decode cold share unchanged, zero
+timeouts in the engine logs. Paired perplexity on four fixed texts (CPU on vs off): +0.4 / −0.6 / +0.3 / +1.2 % —
+within run-to-run noise; the CPU path rounds at the same points as the GPU one.
+
+The handshake: per layer the plan kernel copies the CPU's experts' activation rows and route weights into a host
+mailbox (its own counter makes every graph replay's request unique), the GPU runs the hot and the other cold
+experts, one wait work-group polls the done flag with uncached loads (the only load that sees the CPU's store
+inside a captured graph; ~3 µs, bounded), and the gather sums the CPU's results. A timeout sets a device flag,
+the wait work-group computes the experts itself, and the plan switches the path off from the next call.
+
+Not tried: overlap the next layer's CPU work behind the current one (the mailbox scheme is per layer; the CPU is
+busy ~100–150 µs of a ~260 µs layer), and per-layer lookahead needs the next layer's routing, which decode cannot
+know. 0043's swaps still move cold experts between RAM tiers; the CPU pool reads whatever is pinned.
+
 ## Excluded or not worth it (as of 2026-10-11)
 
 | item | why |
@@ -432,8 +470,8 @@ Not done yet, and worth doing before relying on it:
 2. ~~Bigger prefill chunks~~ and ~~overlap the cold path in prefill~~: done as 0042 (prefetch into VRAM slots).
 3. ~~Overlap the cold path at decode~~: the fused op (0048) with the plan kernel and cold workers (round 8) runs at
    82–91 % of the PCIe bound; what is left needs fewer bytes over PCIe (item 4, or more hot experts).
-4. **CPU compute for cold experts at decode**: spike done (round 8). The CPU kernel reaches 58–64 GB/s and the
-   in-graph handshake works; next is building it into the op (estimate +10–15 % at 1 stream, +20–25 % at 4).
+4. ~~CPU compute for cold experts at decode~~: built as 0049 and on by default (round 9): 1 stream −16 % step time,
+   4 streams −19 %, agents +8–15 %; the timeout fallback keeps the graphs safe.
 5. **Read the FP8 PLE shards in place** instead of a 52.5 GB INT8 copy: the 0013 reader would need multi-file row
    offsets and an FP8 dequant path (0007 has one).
 6. **Put B70-0040 on the fork's release branch** so `make-tree.sh` for a release includes it.

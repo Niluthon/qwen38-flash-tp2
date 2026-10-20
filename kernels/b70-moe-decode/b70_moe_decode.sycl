@@ -1,30 +1,58 @@
 // b70_moe_decode.sycl — decode-size (M <= 16 rows) INT4 W4A16 MoE for Arc Pro B70, hot (VRAM) + cold (pinned host,
-// UVA) experts in one pass.
+// UVA) experts in one pass, optionally with part of the cold experts computed by the CPU.
 //
 // Why: at decode the stock path (vllm-xpu-kernels XpuFusedMoe, called twice: hot, then cold) costs ~56 us per call
 // before it reads a single expert byte (6 kernels; the grouped GEMM's fixed cost), i.e. ~2 x 48 x 56 us per forward.
-// This op runs three kernels for hot and cold together:
+// This op runs these kernels for hot and cold together:
+//   plan:   the batch's local experts (cold first) and their route slots; with the CPU path, hands some cold experts
+//           (and their activation rows) to a host thread pool through a mailbox in host memory
 //   up:     h[t, n]  = silu(x[m] . Wg[e, n]) * (x[m] . Wu[e, n])        (one sub-group per (expert, row block))
 //   down:   y[t, k]  = w[t] * (h[t] . W2[e, k])                           (same split)
-//   gather: out[m,k] = sum over the row's local routes j (fixed order) of y[m*TOPK + j, k]
+//   wait:   (CPU path only) until the host pool is done; on a timeout it computes the CPU's experts itself
+//   gather: out[m,k] = sum over the row's local routes j (fixed order) of y[m*TOPK + j, k] (the CPU's y for its slots)
 // t = route slot (m * TOPK + j). Each local expert is processed once per layer by the sub-groups of its first slot;
 // those cover every row routed to it, 4 rows per pass, so its weights are read from memory once (important for cold
-// experts: PCIe); further passes hit the cache. A one-work-group plan kernel lists the batch's local experts, cold
-// first; 128 "cold worker" sub-groups loop over the cold experts' row blocks while every other sub-group takes one hot
-// block, so the PCIe-bound cold reads run beside the hot ones without taking most of the GPU's thread slots.
-// Measured on one B70 (48 layers in an XPU graph, cold share 0.08, test_moe_decode.py): stock vs this op per layer
-//   1 row 150 -> 65 us, 4 rows 391 -> 226 us, 8 rows 603 -> 353 us, 16 rows 1068 -> 638 us (82-91 % of the time the
-//   cold bytes alone need over PCIe at the 26 GB/s this op reaches; the link's ceiling is 28.7 GB/s).
-// Intermediate roundings follow the stock path (gemm1 out bf16, silu_and_mul -> bf16, gemm2 out bf16, gather fp32).
+// experts: PCIe); further passes hit the cache. 128 "cold worker" sub-groups loop over the GPU's cold experts' row
+// blocks while every other sub-group takes one hot block, so the PCIe-bound cold reads run beside the hot ones
+// without taking most of the GPU's thread slots.
+// Measured on one B70 (48 layers in an XPU graph, cold share 0.08, test_moe_decode.py), GPU only: stock vs this op per
+// layer 1 row 150 -> 65 us, 4 rows 391 -> 226 us, 8 rows 603 -> 353 us, 16 rows 1068 -> 638 us (82-91 % of the time
+// the cold bytes alone need over PCIe at the 26 GB/s this op reaches; the link's ceiling is 28.7 GB/s).
+// Intermediate roundings follow the stock path (gemm1 out bf16, silu_and_mul -> bf16, gemm2 out bf16, gather fp32);
+// the CPU path rounds at the same points.
+//
+// CPU path (B70_MOE_CPU=1): the cold experts live in pinned host RAM, which the GPU reads over PCIe (~26 GB/s per
+// card) while RAM serves ~100 GB/s in total; the CPU cores add up to ~44 GB/s next to both cards. The plan kernel gives
+// the last B70_MOE_CPU_PCT % of a layer's cold experts to a per-process pool (B70_MOE_CPU_THREADS threads pinned from
+// core B70_MOE_CPU_FIRST_CORE, default 8 x device index: one CCD per card on a 7950X), writes their rows, route
+// weights and a request number to the mailbox, and the GPU goes on with the hot and the other cold experts. The wait
+// kernel polls the done flag with uncached loads (the only GPU load that sees the CPU's store inside a captured graph)
+// and the gather reads the CPU's results with uncached loads too.
 //
 // Layouts (vllm int_wna16._process_weights_xpu + implement_zp, the same for hot and cold):
 //   w13 [E, 2N, K/2] uint8, two signed (two's complement) int4 per byte, low nibble = even k; rows [0,N) gate, [N,2N) up
 //   s13 [E, 2N, K/G] bf16;  w2 [E, K, N/2] uint8;  s2 [E, K, N/G] bf16;  G = 128
 //   hot_map / cold_map [E_global] int32: slot of a global expert in the hot / cold tensors, -1 if not there.
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 #include <torch/all.h>
 #include <torch/library.h>
 #include <c10/xpu/XPUStream.h>
+
+#include <immintrin.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/prctl.h>
+
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 constexpr int SG = 16;   // sub-group size
@@ -36,15 +64,47 @@ struct Weights {
   const uint8_t* w13; const bf16* s13; const uint8_t* w2; const bf16* s2;
 };
 
-// Plan (one work-group): the local experts of this batch, cold ones first, each with the route slots that use it.
-//   plan[0] = count, plan[1] = cold count; owner i: plan[2 + i * PSTRIDE] = number of slots nr, then the nr slots.
-// Cold experts first, so their PCIe reads start with the first wave of work-groups and the hot experts' VRAM reads
-// fill the GPU around them; the grid's trailing work-groups (past the count) exit at once.
-constexpr int PSTRIDE = 17;
+// ---- mailbox between the GPU and the host pool (host USM; one per device) ------------------------------------------
+constexpr int MAXE = 64;  // CPU experts per call
+struct Mail {
+  uint32_t req;  uint32_t pad0[15];        // request number, written last by the plan kernel
+  uint32_t done; uint32_t pad1[15];        // = req when the pool has written y
+  uint32_t timeouts; uint32_t pad2[15];    // GPU waits that gave up (then the CPU path is switched off)
+  int32_t n, M, TOPK, N, K, rows;          // CPU experts, shapes, bit mask of the activation rows copied
+  uint64_t w13, s13, w2, s2;               // cold weights (host addresses = the UVA views' addresses)
+  int32_t cs[MAXE], nr[MAXE], slots[MAXE][16];
+  float tw[256];                           // route weights of the CPU's slots
+};
+
+// uncached loads: inside a captured graph, every other kind of GPU load kept returning a stale host value
+namespace syclex = sycl::ext::oneapi::experimental;
+namespace intelx = sycl::ext::intel::experimental;
+using uc_props = decltype(syclex::properties(intelx::read_hint<
+    intelx::cache_control<intelx::cache_mode::uncached, syclex::cache_level::L1, syclex::cache_level::L3>>));
+template <typename T> static inline T uc_load(const T* p) {
+  syclex::annotated_ptr<T, uc_props> ap(const_cast<T*>(p));
+  return *ap;
+}
+using sys_ref = sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                                 sycl::access::address_space::global_space>;
+
+// Plan (one work-group): the local experts of this batch and the route slots that use each.
+//   plan[0] = count, [1] = GPU cold experts (n_gc), [2] = all cold (hot experts start here), [3] = CPU experts,
+//   [4] = request number, [5] = wait state (0 no CPU work, 1 CPU done, 2 timed out: GPU computed them);
+//   owner i: plan[PH + i * PSTRIDE] = number of slots nr, then the nr slots (at most one per row);
+//   src[t] = plan[PH + S * PSTRIDE + t]: 0 no local expert, 1 GPU, 2 CPU.
+// Owner order: GPU cold [0, n_gc), CPU cold [n_gc, n_cold), hot [n_cold, count). Cold first, so their PCIe reads
+// start with the first wave of work-groups and the hot experts' VRAM reads fill the GPU around them.
+constexpr int PSTRIDE = 17, PH = 8;
+struct CpuArgs {  // device-side view of the CPU path (all null / 0 = off)
+  Mail* mail; bf16* xh; uint32_t* counter; const int32_t* enabled; int pct, min_rows;
+};
+template <typename WT>
 struct PlanKernel {
-  const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map; int32_t* plan; int S;
+  const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map; int32_t* plan; int S, M, TOPK, N, K;
+  const bf16* x; const WT* tw; Weights coldw; CpuArgs cpu;
   void operator()(sycl::nd_item<1> it) const {
-    const int t = it.get_local_id(0);
+    const int t = it.get_local_id(0), nt = it.get_local_range(0);
     auto grp = it.get_group();
     int owner = 0, cold = 0, g = -1;
     if (t < S) {
@@ -63,21 +123,61 @@ struct PlanKernel {
     const int cold_rank = sycl::exclusive_scan_over_group(grp, cold, sycl::plus<int>());
     const int hot_rank = sycl::exclusive_scan_over_group(grp, hot, sycl::plus<int>());
     const int count = sycl::reduce_over_group(grp, owner, sycl::plus<int>());
+    int n_cpu = 0;
+    if (cpu.mail && M >= cpu.min_rows && cpu.enabled[0])
+      n_cpu = sycl::min(MAXE, (n_cold * cpu.pct + 50) / 100);
+    const int n_gc = n_cold - n_cpu;
+    const bool mine = cold && cold_rank >= n_gc;  // a CPU expert
+    int32_t* src = plan + PH + S * PSTRIDE;
+    if (t < S) src[t] = 0;
+    sycl::group_barrier(grp);
+    uint32_t rows = 0;
     if (owner) {
-      int32_t* p = plan + 2 + (cold ? cold_rank : n_cold + hot_rank) * PSTRIDE;
+      const int oi = cold ? cold_rank : n_cold + hot_rank;
+      int32_t* p = plan + PH + oi * PSTRIDE;
       int nr = 0;
-      for (int s2 = t; s2 < S && nr < 16; ++s2) if (ids[s2] == g) p[1 + nr++] = s2;
+      for (int s2 = t; s2 < S && nr < 16; ++s2)
+        if (ids[s2] == g) { p[1 + nr++] = s2; src[s2] = mine ? 2 : 1; rows |= 1u << (s2 / TOPK); }
       p[0] = nr;
+      if (mine) {  // the CPU's copy of this expert's job
+        Mail* m = cpu.mail;
+        const int ci = cold_rank - n_gc;
+        m->cs[ci] = cold_map[g]; m->nr[ci] = nr;
+        for (int j = 0; j < nr; ++j) { m->slots[ci][j] = p[1 + j]; m->tw[p[1 + j]] = (float)tw[p[1 + j]]; }
+      }
     }
-    if (t == 0) { plan[0] = count; plan[1] = n_cold; }
+    if (!mine) rows = 0;
+    if (t == 0) { plan[0] = count; plan[1] = n_gc; plan[2] = n_cold; plan[3] = n_cpu; plan[5] = 0; }
+    if (n_cpu == 0) return;  // uniform over the work-group
+    rows = sycl::reduce_over_group(grp, rows, sycl::bit_or<uint32_t>());
+    // the activation rows the CPU needs, 16 B per thread per step
+    const int vec_per_row = K * 2 / 16;
+    for (int r = 0; r < M; ++r) {
+      if (!(rows >> r & 1u)) continue;
+      const sycl::uint4* s = reinterpret_cast<const sycl::uint4*>(x + (size_t)r * K);
+      sycl::uint4* d = reinterpret_cast<sycl::uint4*>(cpu.xh + (size_t)r * K);
+      for (int v = t; v < vec_per_row; v += nt) d[v] = s[v];
+    }
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+    sycl::group_barrier(grp);
+    if (t == 0) {
+      Mail* m = cpu.mail;
+      m->n = n_cpu; m->M = M; m->TOPK = TOPK; m->N = N; m->K = K; m->rows = (int32_t)rows;
+      m->w13 = (uint64_t)coldw.w13; m->s13 = (uint64_t)coldw.s13; m->w2 = (uint64_t)coldw.w2; m->s2 = (uint64_t)coldw.s2;
+      const uint32_t c = cpu.counter[0] + 1;
+      cpu.counter[0] = c;
+      plan[4] = (int32_t)c;
+      sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+      sys_ref(m->req).store(c, sycl::memory_order::release);
+    }
   }
 };
 
-// The owner of work-group index i: its slots, and its slot in the hot or cold weights. 0 = nothing to do.
+// The owner of index i: its slots, and its slot in the hot or cold weights. 0 = nothing to do.
 static inline int plan_owner(const int32_t* plan, const int32_t* ids, const int32_t* hot_map, const int32_t* cold_map,
                              int i, const int32_t*& slots, int& hs, int& cs) {
   if (i >= plan[0]) return 0;
-  const int32_t* p = plan + 2 + i * PSTRIDE;
+  const int32_t* p = plan + PH + i * PSTRIDE;
   slots = p + 1;
   const int g = ids[slots[0]];
   hs = hot_map[g]; cs = cold_map[g];
@@ -134,19 +234,18 @@ template <int MMAX, int R, int VW>
 struct UpKernel {
   const bf16* x; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map; const int32_t* plan;
   Weights hot, cold; bf16* h; int M, TOPK, N, K, n_blocks, cw;
-  // Sub-groups [0, cw) are cold workers: they loop over every (cold expert, row block) job, so few thread slots wait
-  // on PCIe while the rest of the GPU streams hot experts from VRAM; sub-group cw + j takes hot job j. cw = 0: one
-  // job per sub-group, cold first.
+  // Sub-groups [0, cw) are cold workers: they loop over every (GPU cold expert, row block) job, so few thread slots
+  // wait on PCIe while the rest of the GPU streams hot experts from VRAM; sub-group cw + j takes hot job j.
   [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
     const int w = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
     auto sgp = it.get_sub_group();
-    const int n_cold = plan[1];
     if (w < cw) {
-      for (int job = w; job < n_cold * n_blocks; job += cw) run(job / n_blocks, job % n_blocks, lane, sgp);
+      const int n_gc = plan[1];
+      for (int job = w; job < n_gc * n_blocks; job += cw) run(job / n_blocks, job % n_blocks, lane, sgp);
       return;
     }
     const int job = w - cw;
-    run((cw ? n_cold : 0) + job / n_blocks, job % n_blocks, lane, sgp);
+    run(plan[2] + job / n_blocks, job % n_blocks, lane, sgp);
   }
   void run(int oi, int nb, int lane, sycl::sub_group sgp) const {
     const int32_t* all; int hs = -1, cs = -1;
@@ -197,19 +296,16 @@ struct DownKernel {
   const bf16* h; const WT* tw; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map;
   const int32_t* plan; Weights hot, cold; float* y; int M, TOPK, N, K, n_blocks, cw;
   static constexpr int LPR = 4, RPP = SG / LPR, R = RPP * P;  // lanes per row, rows per pass, rows per sub-group
-  // Sub-groups [0, cw) are cold workers: they loop over every (cold expert, row block) job, so few thread slots wait
-  // on PCIe while the rest of the GPU streams hot experts from VRAM; sub-group cw + j takes hot job j. cw = 0: one
-  // job per sub-group, cold first.
   [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
     const int w = it.get_global_id(0) / SG, lane = it.get_global_id(0) % SG;
     auto sgp = it.get_sub_group();
-    const int n_cold = plan[1];
     if (w < cw) {
-      for (int job = w; job < n_cold * n_blocks; job += cw) run(job / n_blocks, job % n_blocks, lane, sgp);
+      const int n_gc = plan[1];
+      for (int job = w; job < n_gc * n_blocks; job += cw) run(job / n_blocks, job % n_blocks, lane, sgp);
       return;
     }
     const int job = w - cw;
-    run((cw ? n_cold : 0) + job / n_blocks, job % n_blocks, lane, sgp);
+    run(plan[2] + job / n_blocks, job % n_blocks, lane, sgp);
   }
   void run(int oi, int nb, int lane, sycl::sub_group sgp) const {
     const int32_t* all; int hs = -1, cs = -1;
@@ -280,24 +376,297 @@ struct DownKernel {
   }
 };
 
+// Wait (one work-group of WAIT_SG sub-groups): lane 0 of sub-group 0 polls the done flag (uncached, bounded); on a
+// timeout the work-group computes the CPU's experts itself (up, barrier, down), records it, and switches the CPU
+// path off for later calls (the plan reads the enabled word).
+constexpr int WAIT_SG = 64;
+template <int MMAX, typename WT>
+struct WaitKernel {
+  UpKernel<MMAX, 4, 4> up; DownKernel<MMAX, 4, WT> down; int32_t* plan; Mail* mail; int32_t* enabled;
+  uint32_t polls;
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int n_cpu = plan[3];
+    if (n_cpu == 0) return;  // uniform
+    const int t = it.get_local_id(0);
+    auto grp = it.get_group();
+    int timed_out = 0;
+    if (t == 0) {
+      const uint32_t c = (uint32_t)plan[4];
+      timed_out = 1;
+      for (uint32_t i = 0; i < polls; ++i) {
+        if (uc_load(&mail->done) == c) { timed_out = 0; break; }
+        // keeps the compiler from hoisting the (non-atomic) uncached load out of the loop
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+      }
+      if (timed_out) {
+        enabled[0] = 0;
+        sys_ref(mail->timeouts).fetch_add(1u);
+      }
+      plan[5] = timed_out ? 2 : 1;
+    }
+    timed_out = sycl::group_broadcast(grp, timed_out, 0);
+    if (!timed_out) return;
+    const int sg = t / SG, lane = t % SG;
+    auto sgp = it.get_sub_group();
+    const int n_gc = plan[1];
+    for (int job = sg; job < n_cpu * up.n_blocks; job += WAIT_SG)
+      up.run(n_gc + job / up.n_blocks, job % up.n_blocks, lane, sgp);
+    sycl::group_barrier(grp);
+    for (int job = sg; job < n_cpu * down.n_blocks; job += WAIT_SG)
+      down.run(n_gc + job / down.n_blocks, job % down.n_blocks, lane, sgp);
+  }
+};
+
 struct GatherKernel {
-  const float* y; const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map; bf16* out;
-  int M, TOPK, K;
+  const float* y; const float* yh; const int32_t* plan; bf16* out; int M, TOPK, K, S;
   void operator()(sycl::nd_item<1> it) const {
     const int i = it.get_global_id(0);
     if (i >= M * K) return;
     const int m = i / K, k = i % K;
+    const int32_t* src = plan + PH + S * PSTRIDE;
+    const bool cpu_ok = plan[5] == 1;
     float acc = 0.f;
     for (int j = 0; j < TOPK; ++j) {
-      const int t = m * TOPK + j, g = ids[t];
-      if (g < 0 || (hot_map[g] < 0 && cold_map[g] < 0)) continue;
-      acc += y[(size_t)t * K + k];
+      const int t = m * TOPK + j, sv = src[t];
+      if (sv == 0) continue;
+      acc += (sv == 2 && cpu_ok) ? uc_load(yh + (size_t)t * K + k) : y[(size_t)t * K + k];
     }
     out[i] = bf16(acc);
   }
 };
 
-// One sub-group per (route slot, row block); 4 sub-groups per work-group (measured: slightly faster than 1).
+// ---- host pool ------------------------------------------------------------------------------------------------------
+static inline uint16_t f2bf(float f) {  // round to nearest even (as the GPU's bf16 conversion)
+  uint32_t u; std::memcpy(&u, &f, 4);
+  u += 0x7fff + ((u >> 16) & 1);
+  return (uint16_t)(u >> 16);
+}
+static inline float bf2f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; }
+
+// out[m][r] for rows [r0, r1) of a [rows, kin/2] int4 matrix with bf16 scales [rows, kin/128]; act: M rows of kin bf16
+template <int M>
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
+static void cpu_rows(const uint8_t* w, const uint16_t* s, int kin, int r0, int r1, const uint16_t* const* act,
+                     float* const* out) {
+  const __m512i lut = _mm512_set_epi16(  // bf16 of the signed nibble, index = nibble (lanes 16..31 unused)
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      (short)0xbf80, (short)0xc000, (short)0xc040, (short)0xc080, (short)0xc0a0, (short)0xc0c0, (short)0xc0e0,
+      (short)0xc100, 0x40e0, 0x40c0, 0x40a0, 0x4080, 0x4040, 0x4000, 0x3f80, 0x0000);
+  const __m512i m4 = _mm512_set1_epi32(0x000f000f);
+  const int groups = kin / GS;
+  for (int r = r0; r < r1; ++r) {
+    const uint8_t* wr = w + (size_t)r * (kin / 2);
+    __m512 tot[M];
+    for (int m = 0; m < M; ++m) tot[m] = _mm512_setzero_ps();
+    for (int g = 0; g < groups; ++g) {
+      __m512 acc[M];
+      for (int m = 0; m < M; ++m) acc[m] = _mm512_setzero_ps();
+      for (int c = 0; c < 4; ++c) {  // 16 bytes = 32 weights = 16 (even, odd) pairs
+        const __m512i d = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(wr + g * 64 + c * 16)));
+        const __m512i idx = _mm512_and_si512(_mm512_or_si512(d, _mm512_slli_epi32(d, 12)), m4);
+        const __m512bh wp = (__m512bh)_mm512_permutexvar_epi16(idx, lut);
+        const int k0 = g * GS + c * 32;
+        for (int m = 0; m < M; ++m)
+          acc[m] = _mm512_dpbf16_ps(acc[m], wp, (__m512bh)_mm512_loadu_si512((const void*)(act[m] + k0)));
+      }
+      const __m512 sc = _mm512_set1_ps(bf2f(s[(size_t)r * groups + g]));
+      for (int m = 0; m < M; ++m) tot[m] = _mm512_fmadd_ps(acc[m], sc, tot[m]);
+    }
+    for (int m = 0; m < M; ++m) out[m][r] = _mm512_reduce_add_ps(tot[m]);
+  }
+}
+
+static void cpu_rows_any(int nr, const uint8_t* w, const uint16_t* s, int kin, int r0, int r1,
+                         const uint16_t* const* act, float* const* out) {
+  for (int c = 0; c < nr; c += 4) {
+    const int k = std::min(4, nr - c);
+    switch (k) {
+      case 1: cpu_rows<1>(w, s, kin, r0, r1, act + c, out + c); break;
+      case 2: cpu_rows<2>(w, s, kin, r0, r1, act + c, out + c); break;
+      case 3: cpu_rows<3>(w, s, kin, r0, r1, act + c, out + c); break;
+      default: cpu_rows<4>(w, s, kin, r0, r1, act + c, out + c); break;
+    }
+  }
+}
+
+static int env_int(const char* name, int dflt) {
+  const char* v = std::getenv(name);
+  return v && *v ? std::atoi(v) : dflt;
+}
+
+struct CpuPath {
+  int dev = 0, T = 8, first_core = 0, stall_us = 0, debug = 0;
+  Mail* mail = nullptr; bf16* xh = nullptr; float* yh = nullptr;      // host USM
+  uint32_t* counter = nullptr; int32_t* enabled = nullptr;            // device
+  std::vector<float> gu, yd; std::vector<uint16_t> hh;                // scratch [MAXE][16][...]
+  std::vector<std::thread> th;
+  std::atomic<uint32_t> gen{0}; std::atomic<int> arrived{0};
+  int phase = 0;
+  std::atomic<long> served{0};
+
+  static void pin(int core) {
+    cpu_set_t set; CPU_ZERO(&set); CPU_SET(core, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+  }
+  static void idle_wait(std::chrono::steady_clock::time_point& last) {
+    if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(20))
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    else
+      _mm_pause();
+  }
+
+  // phase work for thread tid: 0 = up, 1 = silu * up, 2 = down
+  void work(int tid) {
+    Mail* m = mail;
+    const int n = m->n, N = m->N, K = m->K, TOPK = m->TOPK;
+    const uint8_t* W13 = (const uint8_t*)m->w13; const uint16_t* S13 = (const uint16_t*)m->s13;
+    const uint8_t* W2 = (const uint8_t*)m->w2; const uint16_t* S2 = (const uint16_t*)m->s2;
+    const uint16_t* xr = (const uint16_t*)xh;
+    if (phase == 0 || phase == 2) {
+      const int rows_per = phase == 0 ? 2 * N : K, total = n * rows_per;
+      const int a = (int)((long)total * tid / T), b = (int)((long)total * (tid + 1) / T);
+      for (int i = a; i < b;) {
+        const int e = i / rows_per, r0 = i % rows_per, r1 = std::min(rows_per, r0 + (b - i));
+        const int nr = m->nr[e], cs = m->cs[e];
+        const uint16_t* act[16]; float* out[16];
+        if (phase == 0) {
+          for (int j = 0; j < nr; ++j) {
+            act[j] = xr + (size_t)(m->slots[e][j] / TOPK) * K;
+            out[j] = gu.data() + ((size_t)e * 16 + j) * 2 * N;
+          }
+          cpu_rows_any(nr, W13 + (size_t)cs * 2 * N * (K / 2), S13 + (size_t)cs * 2 * N * (K / GS), K, r0, r1,
+                       act, out);
+        } else {
+          for (int j = 0; j < nr; ++j) {
+            act[j] = hh.data() + ((size_t)e * 16 + j) * N;
+            out[j] = yd.data() + ((size_t)e * 16 + j) * K;
+          }
+          cpu_rows_any(nr, W2 + (size_t)cs * K * (N / 2), S2 + (size_t)cs * K * (N / GS), N, r0, r1, act, out);
+          for (int j = 0; j < nr; ++j) {
+            const int slot = m->slots[e][j];
+            const float wgt = m->tw[slot];
+            float* dst = yh + (size_t)slot * K;
+            for (int r = r0; r < r1; ++r) dst[r] = bf2f(f2bf(out[j][r])) * wgt;
+          }
+        }
+        i += r1 - r0;
+      }
+    } else {  // silu(gate) * up for every (expert, row)
+      int pairs = 0;
+      for (int e = 0; e < n; ++e) pairs += m->nr[e];
+      int idx = 0;
+      for (int e = 0; e < n; ++e)
+        for (int j = 0; j < m->nr[e]; ++j, ++idx) {
+          if (idx % T != tid) continue;
+          const float* g = gu.data() + ((size_t)e * 16 + j) * 2 * N;
+          uint16_t* hrow = hh.data() + ((size_t)e * 16 + j) * N;
+          for (int q = 0; q < N; ++q) {
+            const float gv = bf2f(f2bf(g[q])), uv = bf2f(f2bf(g[N + q]));
+            hrow[q] = f2bf(gv / (1.f + std::exp(-gv)) * uv);
+          }
+        }
+      (void)pairs;
+    }
+  }
+
+  void run_phase(int p) {
+    phase = p;
+    arrived.store(0, std::memory_order_relaxed);
+    gen.fetch_add(1, std::memory_order_acq_rel);
+    work(0);
+    while (arrived.load(std::memory_order_acquire) != T - 1) _mm_pause();
+  }
+
+  void worker(int tid) {
+    pin(first_core + tid);
+    uint32_t seen = 0;  // not gen.load(): the first phase may start before this thread does
+    auto last = std::chrono::steady_clock::now();
+    for (;;) {
+      const uint32_t g = gen.load(std::memory_order_acquire);
+      if (g == seen) { idle_wait(last); continue; }
+      seen = g; last = std::chrono::steady_clock::now();
+      work(tid);
+      arrived.fetch_add(1, std::memory_order_acq_rel);
+    }
+  }
+
+  void poller() {
+    pin(first_core);
+    auto* req = reinterpret_cast<std::atomic<uint32_t>*>(&mail->req);
+    auto* done = reinterpret_cast<std::atomic<uint32_t>*>(&mail->done);
+    uint32_t seen = 0;  // the mailbox starts zeroed; the first request may arrive before this thread runs
+    auto last = std::chrono::steady_clock::now();
+    bool warned = false;
+    for (;;) {
+      const uint32_t r = req->load(std::memory_order_acquire);
+      if (r == seen) {
+        idle_wait(last);
+        if (!warned && mail->timeouts) {
+          warned = true;
+          fprintf(stderr, "[b70moe] device %d: a GPU wait for the CPU pool timed out; CPU path off\n", dev);
+        }
+        continue;
+      }
+      seen = r; last = std::chrono::steady_clock::now();
+      if (stall_us) std::this_thread::sleep_for(std::chrono::microseconds(stall_us));
+      run_phase(0);
+      run_phase(1);
+      run_phase(2);
+      if (debug > 0) {
+        --debug;
+        fprintf(stderr, "[b70moe] device %d: request %u: %d experts, %ld us\n", dev, r, mail->n,
+                (long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - last)
+                    .count());
+      }
+      _mm_sfence();
+      done->exchange(r, std::memory_order_seq_cst);  // host USM may be write-combined: a locked op + sfence flush
+      _mm_sfence();
+      served.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  void start(sycl::queue& q, int device, int K, int N) {
+    dev = device;
+    T = std::max(1, env_int("B70_MOE_CPU_THREADS", 8));
+    first_core = env_int("B70_MOE_CPU_FIRST_CORE", 8 * device);
+    stall_us = env_int("B70_MOE_CPU_STALL_US", 0);
+    debug = env_int("B70_MOE_CPU_DEBUG", 0);
+    mail = sycl::malloc_host<Mail>(1, q);
+    xh = sycl::malloc_host<bf16>((size_t)16 * K, q);
+    yh = sycl::malloc_host<float>((size_t)256 * K, q);
+    std::memset((void*)mail, 0, sizeof(Mail));
+    counter = sycl::malloc_device<uint32_t>(1, q);
+    enabled = sycl::malloc_device<int32_t>(1, q);
+    q.memset(counter, 0, 4);
+    q.fill(enabled, (int32_t)1, 1).wait();
+    gu.assign((size_t)MAXE * 16 * 2 * N, 0.f);
+    yd.assign((size_t)MAXE * 16 * K, 0.f);
+    hh.assign((size_t)MAXE * 16 * N, 0);
+    for (int i = 1; i < T; ++i) th.emplace_back([this, i] { worker(i); });
+    th.emplace_back([this] { poller(); });
+    for (auto& t : th) t.detach();
+    fprintf(stderr, "[b70moe] device %d: CPU path on, %d threads from core %d, %d %% of the cold experts, from %d rows\n",
+            dev, T, first_core, env_int("B70_MOE_CPU_PCT", 50), env_int("B70_MOE_CPU_MIN_ROWS", 1));
+  }
+};
+
+static CpuPath* g_paths[16] = {};
+static CpuPath* cpu_path(sycl::queue& q, int device, int K, int N) {
+  static std::mutex mu;
+  CpuPath** paths = g_paths;
+  static const bool on = env_int("B70_MOE_CPU", 0) == 1 && __builtin_cpu_supports("avx512bf16");
+  if (!on || device < 0 || device >= 16) return nullptr;
+  std::lock_guard<std::mutex> lock(mu);
+  if (!paths[device]) {
+    paths[device] = new CpuPath();
+    paths[device]->start(q, device, K, N);
+  }
+  return paths[device];
+}
+
+// ---- launch ---------------------------------------------------------------------------------------------------------
+// One sub-group per (route slot, row block) plus the cold workers; 4 sub-groups per work-group.
 template <typename KER>
 static void launch_wg(sycl::queue& q, const KER& k, int S) {
   const size_t total = (size_t)S * k.n_blocks + k.cw;
@@ -308,7 +677,7 @@ static void launch_wg(sycl::queue& q, const KER& k, int S) {
 template <int MMAX, typename WT>
 static void launch(sycl::queue& q, const torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& tw,
                    const torch::Tensor& ids, const torch::Tensor& hot_map, const torch::Tensor& cold_map,
-                   Weights hot, Weights cold, int N) {
+                   Weights hot, Weights cold, int N, CpuPath* cp) {
   const int M = x.size(0), K = x.size(1), TOPK = ids.size(1), S = M * TOPK;
   auto h = torch::empty({S, N}, x.options());
   auto y = torch::empty({S, K}, x.options().dtype(torch::kFloat32));
@@ -318,16 +687,26 @@ static void launch(sycl::queue& q, const torch::Tensor& out, const torch::Tensor
   auto* hp = reinterpret_cast<bf16*>(h.data_ptr());
   auto* yp = y.data_ptr<float>();
   auto* twp = reinterpret_cast<const WT*>(tw.data_ptr());
-  auto plan = torch::empty({2 + S * PSTRIDE}, ids.options());
+  auto plan = torch::empty({PH + S * PSTRIDE + S}, ids.options());
+  auto* pp = plan.data_ptr<int32_t>();
   // cold workers (sub-groups): 128 measured best (64: cold reads too slow; 512: they crowd out hot experts)
   constexpr int cw = 128;
-  auto* pp = plan.data_ptr<int32_t>();
-  q.parallel_for(sycl::nd_range<1>(256, 256), PlanKernel{idp, hm, cm, pp, S});
-  launch_wg(q, UpKernel<MMAX, 4, 4>{xp, idp, hm, cm, pp, hot, cold, hp, M, TOPK, N, K, N / 2, cw}, S);
-  launch_wg(q, DownKernel<MMAX, 4, WT>{hp, twp, idp, hm, cm, pp, hot, cold, yp, M, TOPK, N, K, K / 16, cw}, S);
+  static const int pct = std::min(100, std::max(0, env_int("B70_MOE_CPU_PCT", 50)));
+  static const int min_rows = env_int("B70_MOE_CPU_MIN_ROWS", 1);
+  static const uint32_t polls = (uint32_t)std::max(1, env_int("B70_MOE_CPU_TIMEOUT_MS", 500)) * 1600u;
+  CpuArgs ca{cp ? cp->mail : nullptr, cp ? cp->xh : nullptr, cp ? cp->counter : nullptr,
+             cp ? cp->enabled : nullptr, pct, min_rows};
+  q.parallel_for(sycl::nd_range<1>(256, 256), PlanKernel<WT>{idp, hm, cm, pp, S, M, TOPK, N, K, xp, twp, cold, ca});
+  UpKernel<MMAX, 4, 4> up{xp, idp, hm, cm, pp, hot, cold, hp, M, TOPK, N, K, N / 2, cw};
+  DownKernel<MMAX, 4, WT> down{hp, twp, idp, hm, cm, pp, hot, cold, yp, M, TOPK, N, K, K / 16, cw};
+  launch_wg(q, up, S);
+  launch_wg(q, down, S);
+  if (cp)
+    q.parallel_for(sycl::nd_range<1>(WAIT_SG * SG, WAIT_SG * SG),
+                   WaitKernel<MMAX, WT>{up, down, pp, cp->mail, cp->enabled, polls});
   const size_t tot = (size_t)M * K, lg = 256;
   q.parallel_for(sycl::nd_range<1>((tot + lg - 1) / lg * lg, lg),
-                 GatherKernel{yp, idp, hm, cm, reinterpret_cast<bf16*>(out.data_ptr()), M, TOPK, K});
+                 GatherKernel{yp, cp ? cp->yh : nullptr, pp, reinterpret_cast<bf16*>(out.data_ptr()), M, TOPK, K, S});
 }
 
 static Weights wts(const torch::Tensor& w13, const torch::Tensor& s13, const torch::Tensor& w2,
@@ -350,14 +729,16 @@ void moe_decode(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, 
   TORCH_CHECK(M <= 16 && M * topk_ids.size(1) <= 256, "decode op: at most 16 rows, 256 route slots");
   TORCH_CHECK(hot_w13.size(2) * 2 == K && K % GS == 0 && N % GS == 0, "shapes");
   TORCH_CHECK((K / 8) % (SG * 4) == 0 && (N / 8) % 16 == 0 && K % 16 == 0 && N % 2 == 0, "row tiling");
-  auto& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+  const int device = x.device().index();
+  auto& q = c10::xpu::getCurrentXPUStream(device).queue();
+  CpuPath* cp = cpu_path(q, device, K, N);
   Weights hot = wts(hot_w13, hot_s13, hot_w2, hot_s2), cold = wts(cold_w13, cold_s13, cold_w2, cold_s2);
   auto go = [&](auto mmax_tag) {
     constexpr int MM = decltype(mmax_tag)::value;
     if (topk_weights.scalar_type() == torch::kFloat32)
-      launch<MM, float>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N);
+      launch<MM, float>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N, cp);
     else
-      launch<MM, bf16>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N);
+      launch<MM, bf16>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N, cp);
   };
   // rows per pass over an expert's weights (an expert routed by more rows takes more passes, from cache):
   // 4 measured best for 4..16 rows (8: 15-20 % slower, register pressure)
@@ -365,9 +746,21 @@ void moe_decode(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, 
   else go(std::integral_constant<int, 4>{});
 }
 
+// CPU path counters for tests and logs: [requests served, GPU waits that timed out] (zeros when the path is off)
+torch::Tensor cpu_stats(int64_t device) {
+  auto t = torch::zeros({2}, torch::kInt64);
+  if (device >= 0 && device < 16 && g_paths[device]) {
+    t[0] = (int64_t)g_paths[device]->served.load();
+    t[1] = (int64_t)g_paths[device]->mail->timeouts;
+  }
+  return t;
+}
+
 TORCH_LIBRARY(b70moe, m) {
   m.def("moe_decode(Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, Tensor hot_map, "
         "Tensor cold_map, Tensor hot_w13, Tensor hot_s13, Tensor hot_w2, Tensor hot_s2, Tensor cold_w13, "
         "Tensor cold_s13, Tensor cold_w2, Tensor cold_s2) -> ()");
+  m.def("cpu_stats(int device) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(b70moe, XPU, m) { m.impl("moe_decode", &moe_decode); }
+TORCH_LIBRARY_IMPL(b70moe, CompositeExplicitAutograd, m) { m.impl("cpu_stats", &cpu_stats); }

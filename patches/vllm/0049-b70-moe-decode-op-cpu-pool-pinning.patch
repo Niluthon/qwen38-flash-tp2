@@ -1,0 +1,37 @@
+From dee5cfbfc4ed1378f54a1e612f097664e17c8dda Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 01:38:47 +0000
+Subject: [PATCH] B70-0049: pin the decode op's CPU pool to the rank's own CCD
+
+B70_MOE_CPU_FIRST_CORE defaults to 8 x the TP rank (each rank's pool on its own 8-core CCD; the other env knobs of
+the CPU path - B70_MOE_CPU_PCT, B70_MOE_CPU_THREADS, B70_MOE_CPU_TIMEOUT_MS - stay in the extension). Set it
+explicitly to override (e.g. other core counts than 16).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/model_executor/layers/fused_moe/b70_hotcold.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index a742d99..ed91cb4 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -242,6 +242,15 @@ def decode_op_max_rows() -> int:
+                 logger.info("B70 decode op: %s, batches of <= %d tokens", lib, rows)
+             except (OSError, RuntimeError) as e:
+                 logger.warning("B70 decode op: cannot load %s (%s); stock path", lib, e)
++        # the op's CPU pool for cold experts pins B70_MOE_CPU_THREADS threads from B70_MOE_CPU_FIRST_CORE; by default
++        # each TP rank takes its own CCD (8 cores) so the two ranks do not share one
++        if (rows and os.environ.get("B70_MOE_CPU") == "1"
++                and "B70_MOE_CPU_FIRST_CORE" not in os.environ):
++            try:
++                from vllm.distributed import get_tensor_model_parallel_rank
++                os.environ["B70_MOE_CPU_FIRST_CORE"] = str(8 * get_tensor_model_parallel_rank())
++            except Exception:  # noqa: BLE001
++                pass
+         _DECODE_OP["max_rows"] = rows
+     return rows
+ 
+-- 
+2.53.0
+

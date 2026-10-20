@@ -75,5 +75,6 @@ for rows in [int(r) for r in __import__("os").environ.get("ROWS", "1,2,4,8,12,16
     uh = sum(len({int(g) for g in i.flatten().tolist() if int(l["hm"][g]) >= 0}) for l, i in zip(layers, ids)) / L
     uc = sum(len({int(g) for g in i.flatten().tolist() if int(l["cm"][g]) >= 0}) for l, i in zip(layers, ids)) / L
     print(f"rows {rows:2d}: hot {uh:4.1f} cold {uc:3.1f} experts/layer | stock {t_stock/L*1e6:6.1f} us/layer | "
-          f"b70moe {t_mine/L*1e6:6.1f} us/layer ({t_stock/t_mine:4.2f}x) | max rel err {err:.2e}, rel L2 {rel_l2:.2e}",
+          f"b70moe {t_mine/L*1e6:6.1f} us/layer ({t_stock/t_mine:4.2f}x) | max rel err {err:.2e}, rel L2 {rel_l2:.2e}"
+          + (f" | cpu served/timeouts {torch.ops.b70moe.cpu_stats(0).tolist()}" if hasattr(torch.ops.b70moe, "cpu_stats") else ""),
           flush=True)

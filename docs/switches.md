@@ -100,6 +100,13 @@ For XPU W4A16 MoE (INT4, `XPUExpertsWNA16`) when VRAM cannot hold every routed e
 | `B70_MOE_DECODE_OP` | unset (off) | 0048 | path to `libb70_moe_decode.so` (`1` = the image's copy next to `b70_hotcold.py`, built in the image's `b70moe` stage; or a self-built one, `kernels/b70-moe-decode/build.sh`): batches of at most `B70_MOE_DECODE_OP_MAX_ROWS` tokens run hot and cold experts in one fused SYCL op (3 kernels, each expert read once) instead of two `XpuFusedMoe` calls. silu without a clamp only; if the library does not load, a warning and the stock path. Two-card default: `1`. |
 | `B70_MOE_DECODE_OP_MAX_ROWS` | `16` | 0048 | largest batch (tokens) for the fused op (at most 16). |
 | `B70_DRAFT_HEAD_FP8` | unset (off) | 0048 | `1` (XPU): the MTP draft passes use an FP8 W8A16 copy of the lm_head shard (1.08 → 0.56 ms per pass); the target verifies with its BF16 head, so outputs are unchanged. +318 MB per card (KV −7,600 tokens at 262K). Two-card default: `1`. |
+| `B70_MOE_CPU` | unset (off) | 0049 | `1`: the decode op gives `B70_MOE_CPU_PCT` % of each layer's cold experts to a host pool that computes them in pinned RAM (AVX-512 BF16, same bf16 roundings) while the GPU does the hot and the other cold experts; the GPU waits per layer on a mailbox in host memory (uncached loads, ~3 µs). Needs the CPU-path kernel (the image builds it) and an AVX-512 BF16 CPU. On a GPU-wait timeout the op computes the experts itself and switches the path off (a stderr line). Two-card default: `1`. |
+| `B70_MOE_CPU_PCT` | `50` | 0049 | percent of a layer's cold experts computed by the CPU pool (70 measured best; 100 was slightly worse at 16 rows). |
+| `B70_MOE_CPU_MIN_ROWS` | `1` | 0049 | batches with fewer tokens than this skip the CPU path. |
+| `B70_MOE_CPU_THREADS` | `8` | 0049 | threads of the per-rank pool (poller included). |
+| `B70_MOE_CPU_FIRST_CORE` | `8 × TP rank` | 0049 | first core the pool pins its threads to: each rank gets its own 8-core CCD on a 16-core host. Set explicitly to override. |
+| `B70_MOE_CPU_TIMEOUT_MS` | `500` | 0049 | GPU wait bound per layer before the timeout fallback. |
+| `B70_MOE_CPU_STALL_US` | `0` | 0049 | tests: stall the pool this long per request, to exercise the timeout fallback. |
 
 ## Input embedding in host RAM (0044)
 

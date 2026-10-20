@@ -56,3 +56,4 @@ B70-0045                                             0045-b70-dense-fp8-w8a16.pa
 B70-0046                                             0046-b70-moe-route-trace.patch                           -
 B70-0047                                             0047-b70-moe-decode-aware-ranking.patch                  0047-b70-moe-decode-aware-ranking-tests.patch
 B70-0048                                             0048-b70-moe-decode-op-and-fp8-draft-head.patch          -
+B70-0049                                             0049-b70-moe-decode-op-cpu-pool-pinning.patch           -
