@@ -1,0 +1,240 @@
+// b70-hc: fused hyper-connection projections for decode (Qwen3.8-Flash-Next GatedResidual), batches <= 16 rows.
+//
+// Stock decode path per HC site (vllm/models/qwen4_exp/nvidia/hyperconnection.py, ops/hc.py), after the
+// combine+RMSNorm kernel has produced xn [M, HC*D]:
+//   down = xn @ Wd^T            oneDNN GEMM, Wd [336, 10240] (320 low-rank rows, 4 injection rows, 12 pad rows) -> bf16
+//   s    = silu(down[:, :320] / HC)                                  Triton -> bf16
+//   gate = s @ Wu^T             oneDNN GEMM, Wu [10240, 320] -> bf16
+//   out  = sum_s sigmoid(gate[:, s*D + i]) * xn[:, s*D + i] / HC    Triton -> bf16 [M, D]
+// Two GEMMs at decode shapes run at ~50 % of the B70's bandwidth (~23 us each in the step trace) and the glue
+// kernels cost ~4 us each. Here:
+//   down(x, w, n_rows, silu_rows, hc) -> (y [M, w.size(0)], act [M, silu_rows])
+//        y: the projection (rows >= n_rows, the padding, are left unwritten); act = bf(silu(bf(y[:, :silu_rows]) / hc))
+//   up_mix(act, w, xn, hc) -> out [M, D]     up GEMV + sigmoid + stream mix; the gate never leaves registers
+// Rounding points match the stock path (bf16 after each GEMM and after silu, fp32 inside); accumulation order inside
+// the dot products differs from oneDNN, so results agree to bf16 rounding, not bit for bit.
+//
+// Tuning variants (env, read once): B70_HC_DOWN_RPW = weight rows per work-group for down (1, 2, 4; default 2).
+#include <sycl/sycl.hpp>
+#include <torch/library.h>
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <cstdlib>
+
+using bf16_t = uint16_t;
+
+static inline float bf2f(uint32_t u16) { return sycl::bit_cast<float>(u16 << 16); }
+static inline uint16_t f2bf(float f) {  // round to nearest even, as torch does
+  uint32_t u = sycl::bit_cast<uint32_t>(f);
+  if ((u & 0x7f800000u) == 0x7f800000u) return (uint16_t)((u >> 16) | ((u & 0xffff) ? 0x40 : 0));  // inf / nan
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+static inline float bfround(float f) { return bf2f(f2bf(f)); }
+static inline void unpack8(const sycl::uint4& v, float* o) {
+  const uint32_t w[4] = {v.x(), v.y(), v.z(), v.w()};
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    o[2 * j] = sycl::bit_cast<float>(w[j] << 16);
+    o[2 * j + 1] = sycl::bit_cast<float>(w[j] & 0xffff0000u);
+  }
+}
+
+// ---- down: y[m, n] = sum_k x[m, k] * w[n, k], n < n_rows ------------------------------------------------------------
+// One work-group (8 sub-groups x 16 lanes) per RPW weight rows; each lane reads 16 B (8 bf16) per weight row per step,
+// 1,024 columns per step across the work-group. Activation rows go in passes of MP (weights re-read from cache).
+constexpr int DOWN_WG = 128, DOWN_SG = 8, DOWN_MP = 16;
+
+template <int RPW>
+struct DownK {
+  const bf16_t* x; const bf16_t* w; bf16_t* y; bf16_t* act;  // act [M, silu_rows]: bf(silu(bf(y) / hc))
+  int M, K, n_rows, ldx, ldy, silu_rows; float hc_f;
+  sycl::local_accessor<float, 1> red;  // [DOWN_SG][RPW * DOWN_MP]
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+    const int li = it.get_local_id(0);
+    const auto sg = it.get_sub_group();
+    const int sgid = li / 16, lane = li % 16;
+    const int n0 = it.get_group(0) * RPW;
+    for (int m0 = 0; m0 < M; m0 += DOWN_MP) {
+      float acc[RPW][DOWN_MP];
+#pragma unroll
+      for (int r = 0; r < RPW; ++r)
+#pragma unroll
+        for (int mm = 0; mm < DOWN_MP; ++mm) acc[r][mm] = 0.f;
+      for (int k = li * 8; k < K; k += DOWN_WG * 8) {
+        float wf[RPW][8];
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+          const int n = n0 + r < n_rows ? n0 + r : n_rows - 1;
+          unpack8(*reinterpret_cast<const sycl::uint4*>(w + (size_t)n * K + k), wf[r]);
+        }
+#pragma unroll
+        for (int mm = 0; mm < DOWN_MP; ++mm) {
+          if (m0 + mm >= M) break;
+          float xf[8];
+          unpack8(*reinterpret_cast<const sycl::uint4*>(x + (size_t)(m0 + mm) * ldx + k), xf);
+#pragma unroll
+          for (int r = 0; r < RPW; ++r) {
+            float s = acc[r][mm];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) s = sycl::fma(wf[r][j], xf[j], s);
+            acc[r][mm] = s;
+          }
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < RPW; ++r)
+#pragma unroll
+        for (int mm = 0; mm < DOWN_MP; ++mm) {
+          const float v = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
+          if (lane == 0) red[sgid * RPW * DOWN_MP + r * DOWN_MP + mm] = v;
+        }
+      sycl::group_barrier(it.get_group());
+      if (li < RPW * DOWN_MP) {
+        const int r = li / DOWN_MP, mm = li % DOWN_MP;
+        float s = 0.f;
+#pragma unroll
+        for (int q = 0; q < DOWN_SG; ++q) s += red[q * RPW * DOWN_MP + li];
+        if (n0 + r < n_rows && m0 + mm < M) {
+          const uint16_t yb = f2bf(s);
+          y[(size_t)(m0 + mm) * ldy + n0 + r] = yb;
+          if (n0 + r < silu_rows) {
+            const float v = bf2f(yb) / hc_f;  // stock (_hc_silu_kernel): x.to(f32) / HC; x * sigmoid(x)
+            act[(size_t)(m0 + mm) * silu_rows + n0 + r] = f2bf(v * (1.f / (1.f + sycl::exp(-v))));
+          }
+        }
+      }
+      sycl::group_barrier(it.get_group());
+    }
+  }
+};
+
+// ---- up_mix ---------------------------------------------------------------------------------------------------------
+// out[m, i] = (sum_{s<4} sigmoid(bf(gate[m, s, i])) * xn[m, s*D + i]) / 4,   gate[m, s, i] = sum_r Wu[s*D + i, r] * a[m, r]
+// with a = bf(silu(bf(down[:, :320]) / 4)), written by down().
+// Work-group = 8 sub-groups x 16 lanes for 16 output columns: lane = column, sub-group = a 40-wide slice of r. The
+// activations of a slice are the same for all 16 lanes (one broadcast load per row and 8 r), each lane streams its
+// 4 weight rows (one per stream) once, and keeps 4 x M partial sums; the 8 slices are summed in local memory, then
+// each work-item finishes (column, row) pairs: bf16 gate, sigmoid, stock-order stream sum.
+constexpr int UP_WG = 128, UP_SG = 8, UP_R = 320, UP_HC = 4, UP_SLICE = UP_R / UP_SG, UP_MAXM = 16;
+
+struct UpMixK {
+  const bf16_t* act; const bf16_t* w; const bf16_t* xn; bf16_t* out;
+  int M, D, ld_act, ld_xn;
+  sycl::local_accessor<float, 1> part;  // [UP_SG][UP_HC][UP_MAXM][16]
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+    const int li = it.get_local_id(0);
+    const int sgid = li / 16, lane = li % 16;
+    const int i0 = it.get_group(0) * 16;
+    const int i = i0 + lane;
+    const int ic = i < D ? i : D - 1;
+    const int r0 = sgid * UP_SLICE;
+    for (int m0 = 0; m0 < M; m0 += UP_MAXM) {
+      const int mc = M - m0 < UP_MAXM ? M - m0 : UP_MAXM;
+      float acc[UP_HC][UP_MAXM];
+#pragma unroll
+      for (int s = 0; s < UP_HC; ++s)
+#pragma unroll
+        for (int mm = 0; mm < UP_MAXM; ++mm) acc[s][mm] = 0.f;
+#pragma unroll
+      for (int c = 0; c < UP_SLICE / 8; ++c) {
+        float wf[UP_HC][8];
+#pragma unroll
+        for (int s = 0; s < UP_HC; ++s)
+          unpack8(*reinterpret_cast<const sycl::uint4*>(w + (size_t)(s * D + ic) * UP_R + r0 + 8 * c), wf[s]);
+#pragma unroll
+        for (int mm = 0; mm < UP_MAXM; ++mm) {
+          if (mm >= mc) break;
+          float af[8];
+          unpack8(*reinterpret_cast<const sycl::uint4*>(act + (size_t)(m0 + mm) * ld_act + r0 + 8 * c), af);
+#pragma unroll
+          for (int s = 0; s < UP_HC; ++s) {
+            float t = acc[s][mm];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) t = sycl::fma(wf[s][j], af[j], t);
+            acc[s][mm] = t;
+          }
+        }
+      }
+#pragma unroll
+      for (int s = 0; s < UP_HC; ++s)
+#pragma unroll
+        for (int mm = 0; mm < UP_MAXM; ++mm)
+          if (mm < mc) part[((sgid * UP_HC + s) * UP_MAXM + mm) * 16 + lane] = acc[s][mm];
+      sycl::group_barrier(it.get_group());
+      for (int p = li; p < mc * 16; p += UP_WG) {
+        const int mm = p / 16, col = p % 16, ii = i0 + col;
+        if (ii < D) {
+          float o = 0.f;
+#pragma unroll
+          for (int s = 0; s < UP_HC; ++s) {
+            float g = 0.f;
+#pragma unroll
+            for (int q = 0; q < UP_SG; ++q) g += part[((q * UP_HC + s) * UP_MAXM + mm) * 16 + col];
+            g = bfround(g);
+            o += (1.f / (1.f + sycl::exp(-g))) * bf2f(xn[(size_t)(m0 + mm) * ld_xn + s * D + ii]);
+          }
+          out[(size_t)(m0 + mm) * D + ii] = f2bf(o / (float)UP_HC);
+        }
+      }
+      sycl::group_barrier(it.get_group());
+    }
+  }
+};
+
+static sycl::queue& q_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+static int env_int(const char* n, int d) { const char* v = std::getenv(n); return v ? std::atoi(v) : d; }
+
+std::tuple<at::Tensor, at::Tensor> down(at::Tensor x, at::Tensor w, int64_t n_rows, int64_t silu_rows, int64_t hc) {
+  TORCH_CHECK(x.is_xpu() && w.is_xpu() && x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16, "bf16 XPU");
+  TORCH_CHECK(x.dim() == 2 && w.dim() == 2 && x.stride(1) == 1 && w.is_contiguous(), "layout");
+  const int M = x.size(0), K = x.size(1), N = w.size(0);
+  TORCH_CHECK(w.size(1) == K && K % (DOWN_WG * 8) == 0 && n_rows > 0 && n_rows <= N && M >= 1 && M <= 64, "shape");
+  TORCH_CHECK(x.stride(0) % 8 == 0, "x row stride must keep 16 B alignment");
+  TORCH_CHECK(silu_rows >= 0 && silu_rows <= n_rows && silu_rows % 8 == 0 && hc > 0, "silu_rows");
+  auto y = at::empty({M, N}, x.options());
+  auto act = at::empty({M, std::max<int64_t>(silu_rows, 8)}, x.options());
+  static const int rpw = env_int("B70_HC_DOWN_RPW", 2);
+  auto& q = q_of(x);
+  auto run = [&](auto tag) {
+    constexpr int R = decltype(tag)::value;
+    const int groups = (int)((n_rows + R - 1) / R);
+    q.submit([&](sycl::handler& h) {
+      sycl::local_accessor<float, 1> red(DOWN_SG * R * DOWN_MP, h);
+      h.parallel_for(sycl::nd_range<1>((size_t)groups * DOWN_WG, DOWN_WG),
+                     DownK<R>{(const bf16_t*)x.data_ptr(), (const bf16_t*)w.data_ptr(), (bf16_t*)y.data_ptr(),
+                              (bf16_t*)act.data_ptr(), M, K, (int)n_rows, (int)x.stride(0), N, (int)silu_rows,
+                              (float)hc, red});
+    });
+  };
+  if (rpw == 1) run(std::integral_constant<int, 1>{});
+  else if (rpw == 4) run(std::integral_constant<int, 4>{});
+  else run(std::integral_constant<int, 2>{});
+  return {y, act};
+}
+
+at::Tensor up_mix(at::Tensor act, at::Tensor w, at::Tensor xn, int64_t hc) {
+  TORCH_CHECK(hc == UP_HC, "hc_count 4 only");
+  TORCH_CHECK(act.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16 && xn.scalar_type() == at::kBFloat16, "bf16");
+  TORCH_CHECK(act.stride(1) == 1 && act.stride(0) % 8 == 0 && w.is_contiguous() && xn.stride(1) == 1, "layout");
+  const int M = act.size(0), R = act.size(1), HD = w.size(0), D = HD / UP_HC;
+  TORCH_CHECK(R == UP_R && w.size(1) == UP_R && xn.size(0) == M && xn.size(1) == HD && M >= 1 && M <= 64, "shape");
+  auto out = at::empty({M, D}, xn.options());
+  const int groups = (D + 15) / 16;
+  q_of(xn).submit([&](sycl::handler& h) {
+    sycl::local_accessor<float, 1> part(UP_SG * UP_HC * UP_MAXM * 16, h);
+    h.parallel_for(sycl::nd_range<1>((size_t)groups * UP_WG, UP_WG),
+                   UpMixK{(const bf16_t*)act.data_ptr(), (const bf16_t*)w.data_ptr(), (const bf16_t*)xn.data_ptr(),
+                          (bf16_t*)out.data_ptr(), M, D, (int)act.stride(0), (int)xn.stride(0), part});
+  });
+  return out;
+}
+
+TORCH_LIBRARY(b70hc, m) {
+  m.def("down(Tensor x, Tensor w, int n_rows, int silu_rows, int hc) -> (Tensor, Tensor)");
+  m.def("up_mix(Tensor act, Tensor w, Tensor xn, int hc) -> Tensor");
+}
+TORCH_LIBRARY_IMPL(b70hc, XPU, m) {
+  m.impl("down", &down);
+  m.impl("up_mix", &up_mix);
+}
