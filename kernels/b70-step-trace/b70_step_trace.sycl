@@ -1,0 +1,146 @@
+// b70-step-trace: timestamps of module boundaries inside captured XPU graphs (decode step breakdown on the real
+// two-card engine).
+//
+// Decode runs as XPU graph replays, which profilers see as one opaque launch, and unitrace hangs the two-card
+// engine. The B70 has no device-scope clock (aspect ext_oneapi_clock_device is missing) and the sub-group clock is
+// per EU, so the timestamps come from the host instead: a mark is a single-work-item kernel that bumps a device
+// counter, writes its 32-bit code into a ring in host USM and then publishes the counter there (system-scope
+// release, the 0049 mailbox pattern). A host thread spins on the counter and stamps every new entry with
+// CLOCK_MONOTONIC. Marks are enqueued on the current stream like any other op, so they are captured into the
+// graphs, and the queue is in order: a mark runs only after everything enqueued before it has finished, so the
+// difference between two stamps is the GPU time of the work between them plus about one launch. The
+// GPU->host write latency (~1 us) is the same for every mark and cancels.
+//
+//   mark(anchor, code)  anchor: any tensor on the device (selects device and stream); code: 32-bit label
+//   drain(anchor, out)  copies up to out.size(0) stamped records [t_ns, code] into out (int64 CPU [M, 2]) -> n
+//   lost(anchor)        records dropped because a ring was full
+//   now()               host CLOCK_MONOTONIC in ns
+// The poller thread of device d is pinned to core B70_STEP_TRACE_CORE_<d> (default 23 + 8 d, an SMT sibling).
+#include <sycl/sycl.hpp>
+#include <torch/library.h>
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <time.h>
+#include <sched.h>
+#include <immintrin.h>
+
+static constexpr uint32_t NLAB = 1u << 16;   // GPU -> host ring (entries in flight before the poller reads them)
+static constexpr uint64_t NREC = 1ull << 22; // stamped records waiting for drain()
+
+struct Mail {
+  uint32_t seq; uint32_t pad[15];
+  uint32_t lab[NLAB];
+};
+struct Rec { int64_t t; int64_t code; };
+
+using sys_ref = sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                                 sycl::access::address_space::global_space>;
+
+static inline int64_t host_ns() {
+  timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+struct Dev {
+  Mail* mail = nullptr;
+  uint32_t* dseq = nullptr;
+  Rec* recs = nullptr;
+  std::atomic<uint64_t> w{0}, r{0}, lost{0};
+  int dev = 0;
+
+  void poll() {
+    const char* e = std::getenv(("B70_STEP_TRACE_CORE_" + std::to_string(dev)).c_str());
+    const int core = e ? std::atoi(e) : 23 + 8 * dev;
+    cpu_set_t s; CPU_ZERO(&s); CPU_SET(core, &s); sched_setaffinity(0, sizeof(s), &s);
+    auto* seq = reinterpret_cast<std::atomic<uint32_t>*>(&mail->seq);
+    uint32_t seen = 0;  // the mailbox starts zeroed
+    for (;;) {
+      const uint32_t now_seq = seq->load(std::memory_order_acquire);
+      if (now_seq == seen) { _mm_pause(); continue; }
+      const int64_t t = host_ns();
+      uint32_t n = now_seq - seen;
+      if (n > NLAB) { lost.fetch_add(n - NLAB, std::memory_order_relaxed); seen = now_seq - NLAB; n = NLAB; }
+      uint64_t wi = w.load(std::memory_order_relaxed);
+      for (uint32_t k = 1; k <= n; ++k) {
+        if (wi - r.load(std::memory_order_acquire) >= NREC) { lost.fetch_add(1, std::memory_order_relaxed); continue; }
+        recs[wi % NREC] = Rec{t, (int64_t)mail->lab[(seen + k) & (NLAB - 1)]};
+        ++wi;
+      }
+      w.store(wi, std::memory_order_release);
+      seen = now_seq;
+    }
+  }
+};
+
+static std::mutex g_mu;
+static Dev* g_dev[16] = {};
+
+static Dev& get(const at::Tensor& anchor) {
+  const int d = anchor.device().index();
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g_dev[d]) {
+    auto& q = c10::xpu::getCurrentXPUStream(d).queue();
+    Dev* x = new Dev();
+    x->dev = d;
+    x->mail = sycl::malloc_host<Mail>(1, q);
+    std::memset((void*)x->mail, 0, sizeof(Mail));
+    x->dseq = sycl::malloc_device<uint32_t>(1, q);
+    q.memset(x->dseq, 0, sizeof(uint32_t)).wait();
+    x->recs = new Rec[NREC];
+    std::thread([x] { x->poll(); }).detach();
+    g_dev[d] = x;
+  }
+  return *g_dev[d];
+}
+
+void mark(at::Tensor anchor, int64_t code) {
+  TORCH_CHECK(anchor.is_xpu(), "anchor must be an XPU tensor");
+  Dev& x = get(anchor);
+  Mail* m = x.mail;
+  uint32_t* ds = x.dseq;
+  const uint32_t c = (uint32_t)code;
+  c10::xpu::getCurrentXPUStream(anchor.device().index()).queue().single_task([=]() {
+    const uint32_t s = ds[0] + 1;
+    ds[0] = s;
+    m->lab[s & (NLAB - 1)] = c;
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+    sys_ref(m->seq).store(s, sycl::memory_order::release);
+  });
+}
+
+int64_t drain(at::Tensor anchor, at::Tensor out) {
+  TORCH_CHECK(out.device().is_cpu() && out.scalar_type() == at::kLong && out.dim() == 2 && out.size(1) == 2 &&
+              out.is_contiguous(), "out: int64 CPU [M, 2]");
+  Dev& x = get(anchor);
+  const uint64_t wi = x.w.load(std::memory_order_acquire), ri = x.r.load(std::memory_order_relaxed);
+  const uint64_t n = std::min<uint64_t>(wi - ri, (uint64_t)out.size(0));
+  int64_t* o = out.data_ptr<int64_t>();
+  for (uint64_t k = 0; k < n; ++k) {
+    const Rec& rc = x.recs[(ri + k) % NREC];
+    o[2 * k] = rc.t; o[2 * k + 1] = rc.code;
+  }
+  x.r.store(ri + n, std::memory_order_release);
+  return (int64_t)n;
+}
+
+int64_t lost(at::Tensor anchor) { return (int64_t)get(anchor).lost.load(); }
+int64_t now_ns() { return host_ns(); }
+
+TORCH_LIBRARY(b70trace, m) {
+  m.def("mark(Tensor anchor, int code) -> ()");
+  m.def("drain(Tensor anchor, Tensor(a!) out) -> int");
+  m.def("lost(Tensor anchor) -> int");
+  m.def("now() -> int");
+}
+TORCH_LIBRARY_IMPL(b70trace, XPU, m) {
+  m.impl("mark", &mark);
+  m.impl("drain", &drain);
+  m.impl("lost", &lost);
+}
+TORCH_LIBRARY_IMPL(b70trace, CompositeExplicitAutograd, m) { m.impl("now", &now_ns); }

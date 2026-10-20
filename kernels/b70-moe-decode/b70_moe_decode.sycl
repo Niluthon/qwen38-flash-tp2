@@ -34,6 +34,7 @@
 //   s13 [E, 2N, K/G] bf16;  w2 [E, K, N/2] uint8;  s2 [E, K, N/G] bf16;  G = 128
 //   hot_map / cold_map [E_global] int32: slot of a global expert in the hot / cold tensors, -1 if not there.
 #include <sycl/sycl.hpp>
+#include <optional>
 #include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 #include <torch/all.h>
 #include <torch/library.h>
@@ -103,12 +104,19 @@ template <typename WT>
 struct PlanKernel {
   const int32_t* ids; const int32_t* hot_map; const int32_t* cold_map; int32_t* plan; int S, M, TOPK, N, K;
   const bf16* x; const WT* tw; Weights coldw; CpuArgs cpu;
+  int64_t* counts; int count_len;  // route counts (B70-0047 decode ranking): counts[id mod count_len] += 1, or null
   void operator()(sycl::nd_item<1> it) const {
     const int t = it.get_local_id(0), nt = it.get_local_range(0);
     auto grp = it.get_group();
     int owner = 0, cold = 0, g = -1;
     if (t < S) {
       g = ids[t];
+      if (counts) {  // = topk_ids.reshape(-1).remainder(count_len) + index_add_ of ones (negative ids: last buckets)
+        int c = g % count_len;
+        if (c < 0) c += count_len;
+        sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>(counts[c]).fetch_add(1);
+      }
       if (g >= 0) {
         const int hs = hot_map[g], cs = cold_map[g];
         if (hs >= 0 || cs >= 0) {
@@ -677,7 +685,7 @@ static void launch_wg(sycl::queue& q, const KER& k, int S) {
 template <int MMAX, typename WT>
 static void launch(sycl::queue& q, const torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& tw,
                    const torch::Tensor& ids, const torch::Tensor& hot_map, const torch::Tensor& cold_map,
-                   Weights hot, Weights cold, int N, CpuPath* cp) {
+                   Weights hot, Weights cold, int N, CpuPath* cp, int64_t* counts, int count_len) {
   const int M = x.size(0), K = x.size(1), TOPK = ids.size(1), S = M * TOPK;
   auto h = torch::empty({S, N}, x.options());
   auto y = torch::empty({S, K}, x.options().dtype(torch::kFloat32));
@@ -696,7 +704,7 @@ static void launch(sycl::queue& q, const torch::Tensor& out, const torch::Tensor
   static const uint32_t polls = (uint32_t)std::max(1, env_int("B70_MOE_CPU_TIMEOUT_MS", 500)) * 1600u;
   CpuArgs ca{cp ? cp->mail : nullptr, cp ? cp->xh : nullptr, cp ? cp->counter : nullptr,
              cp ? cp->enabled : nullptr, pct, min_rows};
-  q.parallel_for(sycl::nd_range<1>(256, 256), PlanKernel<WT>{idp, hm, cm, pp, S, M, TOPK, N, K, xp, twp, cold, ca});
+  q.parallel_for(sycl::nd_range<1>(256, 256), PlanKernel<WT>{idp, hm, cm, pp, S, M, TOPK, N, K, xp, twp, cold, ca, counts, count_len});
   UpKernel<MMAX, 4, 4> up{xp, idp, hm, cm, pp, hot, cold, hp, M, TOPK, N, K, N / 2, cw};
   DownKernel<MMAX, 4, WT> down{hp, twp, idp, hm, cm, pp, hot, cold, yp, M, TOPK, N, K, K / 16, cw};
   launch_wg(q, up, S);
@@ -716,10 +724,11 @@ static Weights wts(const torch::Tensor& w13, const torch::Tensor& s13, const tor
 }
 
 // out [M, K] bf16 (overwritten), x [M, K] bf16, topk_weights [M, TOPK] fp32|bf16, topk_ids [M, TOPK] int32
-void moe_decode(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, torch::Tensor topk_ids,
+static void moe_decode_impl(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, torch::Tensor topk_ids,
                 torch::Tensor hot_map, torch::Tensor cold_map,
                 torch::Tensor hot_w13, torch::Tensor hot_s13, torch::Tensor hot_w2, torch::Tensor hot_s2,
-                torch::Tensor cold_w13, torch::Tensor cold_s13, torch::Tensor cold_w2, torch::Tensor cold_s2) {
+                torch::Tensor cold_w13, torch::Tensor cold_s13, torch::Tensor cold_w2, torch::Tensor cold_s2,
+                int64_t* counts, int count_len) {
   TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && out.scalar_type() == torch::kBFloat16, "bf16 activations");
   TORCH_CHECK(hot_s13.scalar_type() == torch::kBFloat16 && cold_s13.scalar_type() == torch::kBFloat16, "bf16 scales");
   TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32, "int32 topk_ids");
@@ -736,14 +745,143 @@ void moe_decode(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, 
   auto go = [&](auto mmax_tag) {
     constexpr int MM = decltype(mmax_tag)::value;
     if (topk_weights.scalar_type() == torch::kFloat32)
-      launch<MM, float>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N, cp);
+      launch<MM, float>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N, cp, counts, count_len);
     else
-      launch<MM, bf16>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N, cp);
+      launch<MM, bf16>(q, out, x, topk_weights, topk_ids, hot_map, cold_map, hot, cold, N, cp, counts, count_len);
   };
   // rows per pass over an expert's weights (an expert routed by more rows takes more passes, from cache):
   // 4 measured best for 4..16 rows (8: 15-20 % slower, register pressure)
   if (M <= 2) go(std::integral_constant<int, 2>{});
   else go(std::integral_constant<int, 4>{});
+}
+
+void moe_decode(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, torch::Tensor topk_ids,
+                torch::Tensor hot_map, torch::Tensor cold_map,
+                torch::Tensor hot_w13, torch::Tensor hot_s13, torch::Tensor hot_w2, torch::Tensor hot_s2,
+                torch::Tensor cold_w13, torch::Tensor cold_s13, torch::Tensor cold_w2, torch::Tensor cold_s2) {
+  moe_decode_impl(out, x, topk_weights, topk_ids, hot_map, cold_map, hot_w13, hot_s13, hot_w2, hot_s2,
+                  cold_w13, cold_s13, cold_w2, cold_s2, nullptr, 1);
+}
+
+// moe_decode + the B70-0047 route count in the plan kernel (replaces remainder + index_add_: two kernels per layer)
+void moe_decode_counted(torch::Tensor out, torch::Tensor x, torch::Tensor topk_weights, torch::Tensor topk_ids,
+                        torch::Tensor hot_map, torch::Tensor cold_map,
+                        torch::Tensor hot_w13, torch::Tensor hot_s13, torch::Tensor hot_w2, torch::Tensor hot_s2,
+                        torch::Tensor cold_w13, torch::Tensor cold_s13, torch::Tensor cold_w2, torch::Tensor cold_s2,
+                        torch::Tensor counts) {
+  TORCH_CHECK(counts.is_xpu() && counts.scalar_type() == torch::kInt64 && counts.dim() == 1 && counts.is_contiguous()
+              && counts.numel() > 0, "counts: int64 1-D contiguous XPU");
+  moe_decode_impl(out, x, topk_weights, topk_ids, hot_map, cold_map, hot_w13, hot_s13, hot_w2, hot_s2,
+                  cold_w13, cold_s13, cold_w2, cold_s2, counts.data_ptr<int64_t>(), (int)counts.numel());
+}
+
+// ---- top-k softmax for decode (replaces _moe_C.topk_softmax: ~12 us fixed per call on the B70) ----------------------
+// Same semantics as vLLM's topk_softmax (csrc/moe/topk_softmax_kernels.cu): fp32 softmax p = exp(x - max) / sum,
+// k rounds of argmax over p (ties: lower expert index), optional renormalization w = p * (1 / sum of selected p).
+// One work-group of TK_WG work-items per row, TK_EPI = E / TK_WG experts per work-item (contiguous, one 16 B load);
+// group reductions for max / sum / argmax.
+constexpr int TK_WG = 64;
+template <int EPI>
+struct TopkSoftmaxK {
+  const bf16* logits; float* tw; int32_t* ti; int E, TOPK, ld; bool renorm; const bool* is_padding;
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+    auto grp = it.get_group();
+    const int li = it.get_local_id(0), row = it.get_group(0);
+    float v[EPI];
+    const bf16* lr = logits + (size_t)row * ld + li * EPI;
+    int bad = 0, finite_or_neg = 0;  // integer tests on the raw bf16 bits (-ffast-math cannot fold them away)
+#pragma unroll
+    for (int j = 0; j < EPI / 8; ++j) {
+      const sycl::uint4 u = reinterpret_cast<const sycl::uint4*>(lr)[j];
+      const uint32_t w[4] = {u.x(), u.y(), u.z(), u.w()};
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        v[j * 8 + 2 * q] = sycl::bit_cast<float>(w[q] << 16);
+        v[j * 8 + 2 * q + 1] = sycl::bit_cast<float>(w[q] & 0xffff0000u);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const uint32_t b = (w[q] >> (16 * h)) & 0xffffu;
+          bad |= ((b & 0x7f80u) == 0x7f80u) && (b != 0xff80u);  // NaN or +inf
+          finite_or_neg |= b != 0xff80u;                         // anything but -inf
+        }
+      }
+    }
+    // stock (_moe_C.topk_softmax on XPU): a row with a NaN or +inf logit, or only -inf logits, gets ids 0 and NaN
+    // weights. Matching it keeps every id valid (NaN logits occur in the memory-profiling run).
+    bad = sycl::reduce_over_group(grp, bad, sycl::maximum<int>());
+    finite_or_neg = sycl::reduce_over_group(grp, finite_or_neg, sycl::maximum<int>());
+    if (bad || !finite_or_neg) {
+      if (li < TOPK) {
+        reinterpret_cast<uint32_t*>(tw)[(size_t)row * TOPK + li] = 0x7fc00000u;
+        ti[(size_t)row * TOPK + li] = (is_padding && is_padding[row]) ? -1 : 0;
+      }
+      return;
+    }
+    float mx = v[0];
+#pragma unroll
+    for (int e = 1; e < EPI; ++e) mx = sycl::fmax(mx, v[e]);
+    mx = sycl::reduce_over_group(grp, mx, sycl::maximum<float>());
+    float sum = 0.f;
+#pragma unroll
+    for (int e = 0; e < EPI; ++e) { v[e] = sycl::exp(v[e] - mx); sum += v[e]; }
+    sum = sycl::reduce_over_group(grp, sum, sycl::plus<float>());
+    const float rs = 1.f / sum;
+#pragma unroll
+    for (int e = 0; e < EPI; ++e) {
+      v[e] = v[e] * rs;
+    }
+    float sel_sum = 0.f, mine_w = 0.f;
+    int mine_i = 0;
+    for (int k = 0; k < TOPK; ++k) {
+      float bv = v[0]; int be = 0;
+#pragma unroll
+      for (int e = 1; e < EPI; ++e) if (v[e] > bv) { bv = v[e]; be = e; }  // strict >: lowest index wins ties
+      // two reductions per round (a packed 64-bit key is slower here: 11.4 vs 5.8 us per call)
+      const float gv = sycl::reduce_over_group(grp, bv, sycl::maximum<float>());
+      const int cand = bv == gv ? li * EPI + be : 0x7fffffff;
+      const int gi = sycl::reduce_over_group(grp, cand, sycl::minimum<int>());
+      if (gi / EPI == li) {
+#pragma unroll
+        for (int e = 0; e < EPI; ++e) if (e == gi % EPI) v[e] = -1.f;  // removed
+      }
+      sel_sum += gv;
+      if (li == k) { mine_w = gv; mine_i = gi; }
+    }
+    if (li < TOPK) {
+      const float scale = renorm ? 1.f / (sel_sum > 0.f ? sel_sum : 1.f) : 1.f;
+      tw[(size_t)row * TOPK + li] = renorm ? mine_w * scale : mine_w;
+      const int id = (mine_i >= 0 && mine_i < E) ? mine_i : 0;  // last-resort guard: never an invalid expert id
+      ti[(size_t)row * TOPK + li] = (is_padding && is_padding[row]) ? -1 : id;  // stock: padding rows -> -1
+    }
+  }
+};
+
+// topk_weights [M, TOPK] fp32 (out), topk_ids [M, TOPK] int32 (out), gating_output [M, E] bf16
+void topk_softmax(torch::Tensor tw, torch::Tensor ti, torch::Tensor logits, bool renormalize,
+                  std::optional<torch::Tensor> is_padding) {
+  TORCH_CHECK(logits.scalar_type() == torch::kBFloat16 && logits.stride(1) == 1 && logits.stride(0) % 8 == 0, "logits");
+  TORCH_CHECK(tw.scalar_type() == torch::kFloat32 && ti.scalar_type() == torch::kInt32 && tw.is_contiguous() &&
+              ti.is_contiguous(), "outputs");
+  const int M = logits.size(0), E = logits.size(1), TOPK = tw.size(1);
+  TORCH_CHECK(tw.size(0) == M && ti.size(0) == M && ti.size(1) == TOPK && TOPK <= 16 && TOPK <= E, "shapes");
+  if (M == 0) return;
+  const bool* pad = nullptr;
+  if (is_padding.has_value()) {
+    TORCH_CHECK(is_padding->scalar_type() == torch::kBool && is_padding->dim() == 1 && is_padding->size(0) == M &&
+                is_padding->is_contiguous(), "is_padding: bool [M]");
+    pad = is_padding->data_ptr<bool>();
+  }
+  auto& q = c10::xpu::getCurrentXPUStream(logits.device().index()).queue();
+  auto* lp = reinterpret_cast<const bf16*>(logits.data_ptr());
+  auto run = [&](auto tag) {
+    constexpr int EPI = decltype(tag)::value;
+    q.parallel_for(sycl::nd_range<1>((size_t)M * TK_WG, TK_WG),
+                   TopkSoftmaxK<EPI>{lp, tw.data_ptr<float>(), ti.data_ptr<int32_t>(), E, TOPK,
+                                     (int)logits.stride(0), renormalize, pad});
+  };
+  if (E == 512) run(std::integral_constant<int, 8>{});
+  else if (E == 1024) run(std::integral_constant<int, 16>{});
+  else TORCH_CHECK(false, "topk_softmax: E in {512, 1024}");
 }
 
 // CPU path counters for tests and logs: [requests served, GPU waits that timed out] (zeros when the path is off)
@@ -760,7 +898,16 @@ TORCH_LIBRARY(b70moe, m) {
   m.def("moe_decode(Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, Tensor hot_map, "
         "Tensor cold_map, Tensor hot_w13, Tensor hot_s13, Tensor hot_w2, Tensor hot_s2, Tensor cold_w13, "
         "Tensor cold_s13, Tensor cold_w2, Tensor cold_s2) -> ()");
+  m.def("moe_decode_counted(Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, Tensor hot_map, "
+        "Tensor cold_map, Tensor hot_w13, Tensor hot_s13, Tensor hot_w2, Tensor hot_s2, Tensor cold_w13, "
+        "Tensor cold_s13, Tensor cold_w2, Tensor cold_s2, Tensor(b!) counts) -> ()");
+  m.def("topk_softmax(Tensor(a!) topk_weights, Tensor(b!) topk_ids, Tensor gating_output, bool renormalize, "
+        "Tensor? is_padding=None) -> ()");
   m.def("cpu_stats(int device) -> Tensor");
 }
-TORCH_LIBRARY_IMPL(b70moe, XPU, m) { m.impl("moe_decode", &moe_decode); }
+TORCH_LIBRARY_IMPL(b70moe, XPU, m) {
+  m.impl("moe_decode", &moe_decode);
+  m.impl("moe_decode_counted", &moe_decode_counted);
+  m.impl("topk_softmax", &topk_softmax);
+}
 TORCH_LIBRARY_IMPL(b70moe, CompositeExplicitAutograd, m) { m.impl("cpu_stats", &cpu_stats); }

@@ -6,7 +6,8 @@
 # Same engine as `docker compose up -d` (compose.yaml), without compose. Image: image/Dockerfile.tp2 (`docker compose
 # build`; it carries the patched vLLM, the kernels and the residency shim). Environment: engines/two-cards/env/tp2-hotcold.env; flags:
 # engines/two-cards/args/serve-tp2.args (one flag and its value per line). Extra arguments are appended to `vllm serve`;
-# DOCKER_ARGS adds `docker run` options (e.g. DOCKER_ARGS='-e VLLM_LOGGING_LEVEL=DEBUG').
+# DOCKER_ARGS adds `docker run` options (e.g. DOCKER_ARGS='-e VLLM_LOGGING_LEVEL=DEBUG'). B70_MOE_CPU=0 in the shell
+# turns the CPU path for cold experts off (0049; the env file's default is 1).
 #
 # Warm-up (WARMUP=1, the default): once /health answers, one short chat request runs inside the container. Known
 # issue (docs/known-issues.md item 13): with MTP, if the FIRST request after start needs more than one prefill chunk
@@ -41,6 +42,6 @@ mapfile -t args < <(grep -v '^#' "$here/args/serve-tp2.args" | sed '/^$/d' | sed
 exec docker run --rm --name "$NAME" \
   --device /dev/dri --group-add render --group-add video --ipc host --network host --shm-size 16g \
   --ulimit memlock=-1 -w /opt/venv \
-  --env-file "$here/env/tp2-hotcold.env" ${DOCKER_ARGS:-} \
+  --env-file "$here/env/tp2-hotcold.env" ${B70_MOE_CPU:+-e B70_MOE_CPU=$B70_MOE_CPU} ${DOCKER_ARGS:-} \
   -v /dev/dri/by-path:/dev/dri/by-path:ro -v "$MODELS:/models:ro" -v "$WORK:/work" \
   --entrypoint vllm "$IMAGE" serve "$MODEL_DIR" "${args[@]}" "$@"

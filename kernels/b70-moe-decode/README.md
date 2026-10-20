@@ -29,3 +29,15 @@ Measured on one B70, per layer (stock → this op): 1 row 150 → 66 µs, 4 rows
 
 `test_draft_head.py` checks the FP8 draft head of `B70_DRAFT_HEAD_FP8` on the real lm_head shard. Run it with
 `PYTHONPATH` set to a tree with 0048, and the models directory mounted at `/models`.
+
+## MoE glue ops (0051, `B70_MOE_GLUE`)
+
+- `moe_decode_counted(..., counts)`: moe_decode plus the 0047 route count in the plan kernel
+  (`counts[id mod len] += 1` per route slot; replaces remainder + `index_add_`, ~12 µs per layer at 4 rows).
+- `topk_softmax(topk_weights, topk_ids, gating_output, renormalize, is_padding=None)`: the stock `_moe_C` op's
+  semantics (ties to the lower index, padding rows -1, rows with a NaN/+inf logit or only -inf logits: ids 0, NaN
+  weights), 6.3 µs vs 11.9 per call. Row validity is decided on the raw bf16 bits: this library builds with
+  `-ffast-math`, which removes float NaN tests.
+
+`test_glue.py <lib.so>` (one card, engine stopped) checks both against the stock ops and times them; the vLLM side
+is `vllm-0051-moe-glue.patch` (apply to a dev tree; not in the image's patch list).

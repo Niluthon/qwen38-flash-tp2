@@ -1,322 +1,201 @@
-# b70-flash-next
+# qwen38-flash-tp2
 
-Run **Qwen3.8-Flash-Next** (W4A16) with vLLM on **Intel Arc Pro B70** cards. This repository holds the vLLM patch
-series, the kernel build, the engine settings and the measurements; the patched vLLM itself is built from them.
+Run **Qwen3.8-Flash-Next** (W4A16) with vLLM on **two Intel Arc Pro B70** cards (2 × 32 GB) and ~64 GB of host RAM.
+This repository holds the vLLM patch series, the kernel build, the engine settings and the measurements; one Docker
+image is built from them. It is the two-card line of [Lumnus/b70-flash-next](https://github.com/Lumnus/b70-flash-next);
+the one-card and four-card setups are not part of this repository.
 
-## Start here: which setup?
+The engine serves an OpenAI-compatible API (`/v1/chat/completions`, tool calls, reasoning, structured output) on
+port 8000, model name `qwen38-flash-next`.
 
-| your machine | what to use | effort |
-|---|---|---|
-| **2× B70** (32 GB each), ~64 GB RAM, NVMe | [**Two cards: Docker Compose**](#two-cards-docker-compose) — one image, one prepare step, `docker compose up -d`; guide: [HOW-TO-RUN.md](HOW-TO-RUN.md) | builds everything itself, also on a fresh PC |
-| **1× B70**, 96 GB RAM | the same Compose setup with the one-card settings: [engines/one-card/](engines/one-card/README.md) (**settings not tested**) | two lines in `.env` |
-| **4× B70**, any RAM ≥ 64 GB | the same Compose setup with the four-card settings: `ENGINE_ENV=engines/four-cards/env/tp4.env` and `ENGINE_LOCAL_ENV=engines/four-cards/env/tp4-local.env` in `.env`; every expert in VRAM, kernels b70.3 (**settings not tested**) | two lines in `.env` |
-| **4× B70**, 256 GB RAM | [Four cards: the release recipe](#four-cards-the-release-recipe) — source tree + kernel wheel, AWQ weights | manual; how the release is served |
+## How to run
 
-Both serve an OpenAI-compatible API (`/v1/chat/completions`, tool calls, reasoning) on port 8000.
-
-## Two cards: Docker Compose
-
-Serves [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) (Intel AutoRound target + FP8 PLE table) at tensor parallel 2 +
-expert parallel 2 with MTP speculative decoding and a 131,072-token context. Experts that do not fit in VRAM live in
-host RAM, the PLE table is read from NVMe. Measured on our host: decode ~55–57 tok/s at 1 stream, ~90–99 tok/s total
-at 2 streams (code prompts), ~3,950 tok/s prefill, 201,794 KV tokens; MMLU 87.2 %, HumanEval 158 / 164
-([details](#what-the-two-card-engine-runs)).
-
-**→ Full guide: [HOW-TO-RUN.md](HOW-TO-RUN.md)** — machine check, first start, using the API, daily commands,
-settings, reusing weights you already downloaded, bringing your own model, troubleshooting.
-
-In short, on a machine with 2× B70, ~64 GB RAM, ~185 GB free on NVMe and Docker Compose v2.24+:
+Needs: 2× Arc Pro B70 with the `xe` driver, ~64 GB RAM, ~185 GB free on an NVMe disk, Docker Compose v2.24+, an x86-64
+CPU (AVX-512 BF16 makes decode faster, see [CPU](#cpu)).
 
 ```bash
 git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 cp .env.example .env               # optional: MODELS=/path/on/nvme (default ~/models)
-docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0049 + kernels + shim
+docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0050 + kernels + shim
 docker compose run --rm prepare    # once: download (~129 GB) and prepare the weights
-docker compose up -d               # serving on port 8000 after ~5 min; model name qwen38-flash-next
+docker compose up -d               # serving on port 8000 after ~5 min
+docker compose logs warmup         # wait for "warm-up request OK" before sending long prompts
 ```
-
-Already have the weights, or want another quant? [HOW-TO-RUN.md §6](HOW-TO-RUN.md#6-weights-you-already-have) and
-[§7](HOW-TO-RUN.md#7-your-own-model).
-
-### What the two-card engine runs
-
-The settings (all in `engines/two-cards/env/tp2-hotcold.env` and `engines/two-cards/args/serve-tp2.args`): 150 hot experts per layer and rank in
-VRAM that follow the traffic (patches 0040, 0043), the rest pinned in host RAM, cold experts prefetched into VRAM for
-prefill (0042), the input embedding in host RAM (0044), FP8 W8A16 dense projections (0045), the checkpoint's FP8 PLE
-shards read in place from NVMe (0013 + 0050), MTP k=3 with the checkpoint's INT4 draft, 4 sequences, a warm-up request at start (known issues item 13).
-Quality-checked against BF16 dense (MMLU, HumanEval); not yet endurance-tested. Without Compose:
-`engines/two-cards/scripts/run-tp2.sh` / `engines/two-cards/scripts/restart-tp2.sh`. Setup, experiments and numbers:
-[docs/two-cards.md](docs/two-cards.md).
-
-## Four cards: the release recipe
-
-vLLM v0.30.0 for XPU, wu1ff's B70 patch set rebuilt from source patches, a series of patches for host memory,
-long-context reuse, MTP speculative decoding and agent clients, and a vllm-xpu-kernels build with the fixes this model
-needs. This is how the release is served. The sections after this one (validation, endurance, models, the host-RAM
-KV tier) describe this setup.
-
-| | |
-|---|---|
-| model | Qwen3.8-Flash-Next W4A16, **AWQ build recommended** (Intel AutoRound is the documented alternative; [Models](#models)) |
-| GPUs | 4× Intel Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
-| KV cache | GPU pool ~311K tokens + **128 GB in host RAM** (CPU tier) |
-| PLE n-gram table | **INT8, served from NVMe** (8 GB pinned row cache instead of 48.9 GB in RAM) |
-| decoding | MTP speculative decoding, 3 draft tokens; 16 sequences; 262K context; GPU memory fraction 0.88; `--no-async-scheduling`; cudagraph capture sizes at every multiple of 4 up to 64 (plus 256/512/1024) |
-| tested host | AMD EPYC 7402 (24C/48T) on an ASRock Rack ROMED8-2T, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
-| software | torch 2.13.0+xpu, compute-runtime 26.35.39758.10, vllm-xpu-kernels 0.1.14.1+b70.3 |
-
-**Release [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2): the stable set.**
-AWQ serving fully validated; Intel verification in progress. One code branch, the model is a serving parameter. It runs
-from source trees; the vllm-xpu-kernels wheel is attached to the release, and no container image is built for b70.2
-([CHANGELOG](CHANGELOG.md)).
-
-### Quick start (source tree, how we run it)
 
 ```bash
-git clone https://github.com/Lumnus/b70-flash-next && cd b70-flash-next
-scripts/check-series.sh                          # patches/ == the fork branch (clones it into ./vllm-src)
-scripts/make-tree.sh 0.30.0-b70.2 /srv/vllm-b70  # the source tree, hash-checked
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "qwen38-flash-next", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-1. **Environment.** The vLLM v0.30.0 XPU environment (torch 2.13.0+xpu; the `vllm/vllm-openai-xpu:v0.30.0` image's
-   `/opt/venv` is one), with vllm-xpu-kernels **0.1.14.1+b70.3** built from
-   [`Lumnus/vllm-xpu-kernels` tag `v0.1.14.1+b70.3`](https://github.com/Lumnus/vllm-xpu-kernels/tree/v0.1.14.1%2Bb70.3)
-   ([docs/kernels.md](docs/kernels.md)); the wheel is attached to the
-   [release](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2) (sha256 `f104a3e5…d589`). Put the
-   tree first on `PYTHONPATH`. We run compute-runtime 26.35.39758.10.
-2. **Weights (recommended: AWQ).** `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125`, plus devan's
-   `ple_table_qwen4exp.pt`; then
-   `tools/awq_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>`. Build the INT8 PLE table once
-   with `tools/build_int8_ple.py build` ([docs/ple-int8.md](docs/ple-int8.md)).
-   *Alternative (Intel):* Intel @ `4c67bf68` (all files except `model-00016-of-00017.safetensors`), then
-   `tools/intel_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>`.
-3. **Serve.** The model is a parameter: `common.env` + `engines/four-cards/env/s16-kv128-mtp3.env` + one model file,
-   `engines/four-cards/models/awq.env` (recommended) or `engines/four-cards/models/intel-autoround.env`; `vllm serve <snapshot>` with the flags
-   in `engines/four-cards/args/serve-s16-mtp3.args`, `--kv-offloading-size 128`, and the model file's serve config
-   (`engines/serve-configs/serve-config-awq.json` or `engines/serve-configs/serve-config-intel-autoround.json`) as the snapshot's `config.json`
-   ([engines/README.md](engines/README.md)). Same code and flags for both.
-4. **Serving prompt.** The chat template and the default serving prompt are yours to choose. We keep the checkpoint's
-   template and put the serving context (what the model runs on, nothing personal) in a short default system prompt;
-   we may move to an empty engine default and let a gateway add the preamble. None of that is in this repository.
+Stop with `docker compose down`. **Full guide: [HOW-TO-RUN.md](HOW-TO-RUN.md)** (machine check, daily commands,
+settings, weights you already have, your own model, troubleshooting).
 
-The image path (`image/Dockerfile`, `engines/four-cards/scripts/run-example.sh`) is the b70.1 recipe: it pulls only public images by
-digest and fails unless every patched file carries its recorded sha256 (`image/verify-overlay.sh`). For b70.2 it
-still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; see the CHANGELOG.
+## Speed of the current build
 
-## Validation status
+Image `b70-flash-next:tp2` with patches 0001–0050, default settings, no overrides. Host: Ryzen 9 7950X, 61 GiB DDR5,
+2× B70 on PCIe 5.0 x8. Measured 2026-10-20 on an idle engine (docs/two-cards.md, round 10, run P).
 
-| | |
-|---|---|
-| **AWQ** (recommended) | **fully validated** on an earlier branch of the same code: gates, quality, speed, and one engine running **3 days 16 hours** without an error ([Endurance](#endurance)) |
-| the release branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable) | not yet booted on a GPU. It is the union of the two lines we tested, with one copy of each fix. Where it differs from what AWQ ran in code that runs for AWQ, every place is listed in [known issues](docs/known-issues.md) item 12: an import and a type check for Intel's quantization config, an environment read the recipe sets to off, a log-once change, and the directory of the debug flag files |
-| **Intel AutoRound** | **verification in progress**: a multi-day stability run started on 2026-10-07 |
+Units used below:
 
-In day-to-day use of the AWQ engine (an operator observation under real mixed agent load, not a benchmark), aggregate
-generation has peaked at about 500 tok/s and holds at 300+ tok/s sustained; it depends on the jobs.
+- **tok/s** — generated tokens per second. For one request it is what a user sees; for several it is the total of all.
+- **ms/step** — time of one decode step (one forward pass of the model plus 3 MTP draft passes). Lower is faster.
+  It is the stable number for comparing builds (repeats within ~3 %); tok/s also depends on the text.
+- **tokens/step** — tokens accepted per step (1 + accepted MTP drafts, at most 4). tok/s = tokens/step ÷ ms/step × 1000.
 
-## Endurance
+**Decode, one request at a time** (`tools/bench_tp2/bench_det.py`: four fixed prompts, temperature 0):
 
-The recommended setup (AWQ weights, MTP k=3, 16 slots, 128 GiB host-RAM KV tier, kernels b70.3) ran as **one
-continuous engine for 3 days 16 hours** (2026-10-04 00:15 UTC to 2026-10-07 16:30 UTC). It ended only in a planned
-restart (a change of the default serving prompt); nothing failed. Prometheus over the 86 h window:
+| prompt | tok/s | ms/step | tokens/step |
+|---|---|---|---|
+| explain how a refrigerator works | 71.6 | 36.0 | 2.57 |
+| write a Python function | 106.6 | 32.6 | 3.49 |
+| write a short story | 68.8 | 33.6 | 2.31 |
+| compare TCP and UDP | 90.0 | 33.4 | 3.01 |
+| **mean** | **84.3** | **33.9** | **2.85** |
 
-| | |
-|---|---|
-| requests | ~52,500 (51,312 ended on a stop token, 1,179 on the length limit, 1 on the repetition stop) |
-| errors / aborts | **0 / 0** |
-| prompt tokens processed | 566 million |
-| tokens generated | 39.4 million |
-| preemptions | 134 |
-| host-RAM guard stops, GPU errors | none |
+**Load, prefill and capacity:**
 
-The load was real mixed use, not a benchmark: interactive coding agents plus a memory-engine ingest running up to 8
-concurrent LLM calls, with prompts up to ~22K tokens. Host memory stayed flat for the whole run. This is one run on one
-host; it shows the stack holding under that mix, not a guarantee for other workloads.
-
-## Models
-
-Two calibrated 4-bit checkpoints run on this stack; a third, round-to-nearest one is the reference. **We recommend
-AWQ, and it is what we serve.** The order below is AWQ, Intel AutoRound, devan, for four reasons:
-
-1. **Speed is a tie.** Measured side by side, AWQ decodes 2.8 % slower at one short stream (87.9 vs 90.4 tok/s) and 5 %
-   slower at one 16K stream (85.0 vs 89.8), and is level with Intel at 4 to 10 streams (within the ~10 % noise). The
-   benchmarks we ran (MMLU, TruthfulQA, agentic coding, long context) do not separate the two significantly; the two
-   builds sit 0.082 KL apart (top-1 agreement 90.2 %) and give the same answer on 97 % of items.
-2. **No runaway digit loops.** In 150 coding samples AWQ has 0 digit-run repetition stops, Intel has 2 (too few to call
-   a difference).
-3. **A multi-day clean endurance run**, on AWQ ([Endurance](#endurance)). Intel's longest run on the same stack was
-   ~21.5 h on the earlier kernels, ended by guard stops that patch 0029b has since fixed; we have no multi-day Intel run
-   on b70.3.
-4. **More host RAM left free.** On our host (256 GiB) the AWQ engine leaves about 39 GiB MemAvailable in steady
-   state against about 23 GiB with Intel, which is room for a bigger KV tier or other work on the same machine.
-
-Intel's numbers and caveats are stated plainly in its own section: it is a fully working alternative and is slightly
-faster at one stream. All three serve the same INT8 PLE table from NVMe, built from devan's BF16 PLE file
-([docs/ple-int8.md](docs/ple-int8.md)). Details: [docs/weights.md](docs/weights.md),
-[docs/measurements/b70.2.md](docs/measurements/b70.2.md).
-
-Throughput below: single runs on an idle engine, thinking off, 400 (short) or 256 (16K) generated tokens per request;
-"prefill" = prompt tokens over time to first token; differences under ~10 % are noise.
-
-### AWQ — `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125` (recommended; what we serve)
-
-AWQ (llm-compressor, calibrated), int4 routed experts only; the rest BF16.
-
-| | |
-|---|---|
-| decode, 1 stream | **87.9 tok/s with MTP** (85.0 tok/s at a 16K prompt); 54.8 tok/s without MTP (earlier matrix) |
-| decode, 4 streams | 71.5 tok/s per session, 252 tok/s total, with MTP; 50.3 / 193 without MTP |
-| decode, 8 streams | 55.6 tok/s per session, 396 tok/s total, with MTP; 43.9 / 333 without MTP |
-| decode, 10 streams | 47.9 tok/s per session, 422 tok/s total, with MTP; 40.4 / 379 without MTP |
-| prefill | ~3,500 tok/s for one 16K prompt with MTP; 4 × 16K at once: ~3,100 tok/s total with MTP; 48K with MTP: not measured. Without MTP (earlier matrix): ~4,000 for one 16K, ~3,900 for one 48K, ~4,100 total for 4 × 16K |
-| degradation breakpoint | short prompts: none up to 10 streams; 16K prompts with MTP: 85.0 tok/s per session at 1 stream, 24.5 at 4 (2 streams: not measured); without MTP (earlier matrix): 2 → 4 streams (55 → 24), 48K prompts 1 → 2 streams |
-| MTP acceptance length | 2.18–2.35 (kernels b70.3; per draft position 0.69 / 0.42 / 0.24 at one short stream, Intel 0.70 / 0.40 / 0.19 on b70.2); 2.05–2.20 on the b70.2 kernels |
-| coding (10 agentic tasks × 5; effort none / medium / high) | **36 / 47 / 40 of 50 with MTP** (Intel 38 / 45 / 42, p 0.82 / 0.71 / 0.80); 48/50 at medium without MTP, vs devan 39/50 (Fisher p 0.015); 0 repetition stops in 150 |
-| knowledge | MMLU 275/300, TruthfulQA 176/200 (medium, MTP); 276 / 176 without MTP |
-| token-level distance to Intel (both MTP) | KL 0.082, top-1 90.2 %; same answer on 97 % of items |
-| per card | 309,467 GPU KV tokens at memory fraction 0.88; 30.5–31.1 GiB VRAM in use; model weights per card: not measured |
-| endurance | 3 days 16 h in one run, ~52,500 requests, 0 errors, 0 aborts ([Endurance](#endurance)) |
-| host RAM | ~39 GiB MemAvailable left in steady state on our 256 GiB host (Intel ~23 GiB) |
-| download | 180.8 GB |
-
-### Intel AutoRound — `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (alternative; slightly faster at one stream)
-
-AutoRound (tuned rounding and clipping), int4 routed experts; attention, GDN, MTP and the rest BF16.
-
-| | |
-|---|---|
-| decode, 1 stream | **90.4 tok/s with MTP** (89.8 tok/s at a 16K prompt); without MTP: not measured |
-| decode, 4 streams | 67.9 tok/s per session, 250 tok/s total, with MTP |
-| decode, 8 streams | 56.1 tok/s per session, 403 tok/s total, with MTP |
-| decode, 10 streams | 48.8 tok/s per session, 436 tok/s total, with MTP |
-| prefill | ~3,600 tok/s for one 16K prompt with MTP; 4 × 16K at once: ~3,000 tok/s total |
-| degradation breakpoint | short prompts: none up to 10 streams; 16K prompts: 2 → 4 streams (per-session 90 → 23.5 tok/s with MTP); 48K: not measured |
-| MTP acceptance length | 2.20–2.35 |
-| coding (10 agentic tasks × 5; effort none / medium / high) | 38 / 45 / 42 of 50 with MTP (AWQ with MTP 36 / 47 / 40, p 0.82 / 0.71 / 0.80); 2 of 150 samples end in a digit-run repetition stop (AWQ 0) |
-| knowledge | MMLU 280/300, TruthfulQA 178/200 (medium, MTP); AWQ with MTP 275 / 176 (p 0.18 / 0.50) |
-| per card | 20.29 GiB model weights; 311,299 GPU KV tokens at memory fraction 0.88 |
-| host RAM | ~23 GiB MemAvailable left in steady state on our 256 GiB host (AWQ ~39 GiB) |
-| endurance | no multi-day run on b70.3; 21.5 h on the earlier b70.2 kernels, ended by two guard stops that 0029b fixed |
-| setup | needs patch 0028 and `tools/intel_snapshot.py` ([engines/README.md](engines/README.md)) |
-| download | 78.8 GB (the 102.4 GB BF16 PLE shard in the checkpoint is not used) |
-
-### devan — `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d` (reference)
-
-Most likely round-to-nearest; int4 routed experts **and** the full-attention projections. Most of
-[docs/measurements/](docs/measurements/README.md) is measured on it (8 slots, earlier settings).
-
-| | |
-|---|---|
-| decode, 1 stream | ~59 tok/s without MTP; 78.5 tok/s with MTP |
-| decode, 4 streams | ~49 tok/s per session, ~197 tok/s total, without MTP |
-| prefill | **4,711 tok/s at an 18.7K prompt, 3,711 at 98K**, without MTP |
-| coding (same set) | 39/50 (AWQ 48/50, p 0.015); knowledge level with AWQ |
-| token-level distance to Intel | KL 0.20, prose top-1 77 % |
-
-**Benchmark status.** The Intel and AWQ speed rows are not on the same kernels: Intel's are from the b70.2 kernels, AWQ's from b70.3. AWQ's with-MTP speed rows are measured on the b70.3 kernels with B70-0030 (2026-10-04, one run
-each; the first short one-stream cell after boot ran cold at 68.6 tok/s, the repeat gave 87.9); Intel's speed rows are
-from the b70.2 kernels (2026-10-02, same harness), and Intel on b70.3 is not re-benched (b70.3 changes only the
-CPU → GPU KV load path, which these cells do not use). AWQ's without-MTP rows come from an earlier matrix on stock
-kernels. Quality rows: AWQ with MTP (2026-10-03, MTP on both; the engine ran the 64K-KV test definition); the earlier
-48/50 AWQ coding row ran without MTP. The b70.2 gap (Intel +10–18 % at one stream) is ~0–5 % on b70.3, and the
-acceptance per draft position is now similar for both builds (AWQ 0.69 / 0.42 / 0.24, Intel 0.70 / 0.40 / 0.19 at one
-short stream). Gates on AWQ b70.3: sweep 0 bad at 1–10 streams, burst gate 0/90, structured-output gate 36 ok + 18 plain ok. All AWQ
-numbers come from an earlier branch of the same code; how it differs from the release branch:
-[known issues](docs/known-issues.md) item 12.
-
-## The host-RAM KV tier
-
-Agent sessions resend long, growing prompts. The CPU tier keeps their KV cache in 128 GB of pinned host RAM and loads
-it back instead of recomputing it.
-
-| | |
-|---|---|
-| prompt tokens reused from cache, real agent use (7.3 h, 1,955 requests, mean prompt 93K tokens) | **96.6 %** |
-| … of which from host RAM / from the GPU pool / computed | **65 % / 31 % / 3.4 %** |
-| prompt tokens served, mean over that window | 6,899 tok/s (peak 32,553 tok/s over 1 min), against 230 tok/s computed |
-| KV load bandwidth, host RAM → GPU | **19.6–19.9 GB/s** |
-| host memory under KV reload load (two replays of 6 real sessions) | **flat**: +0.058 GiB per rank once, no RAM-guard stop ([B70-K1 test](docs/measurements/b70.2.md)) |
-| the same on the AWQ build (2.7 h, mean prompt 59K tokens) | 95.7 % from cache: GPU pool 54 %, host RAM 42 % |
-| GPU vs RAM split | set by the workload, not the weights: with 6 sessions in flight the GPU pool serves 46–55 % of prompt tokens and RAM the rest; with 3 sessions the GPU pool serves 91 % |
-
-With ~6 agent sessions in flight the GPU pool serves about half of the reusable prefix; the RAM tier serves the
-rest, so a session that comes back after others have filled the GPU pool still gets its prefix in seconds instead of a
-full re-prefill. The engine's working range is ~6 concurrent sessions; beyond that it holds, and everything slows.
-Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
-
-## Two lines
-
-| line | what | state |
+| measurement | value | unit |
 |---|---|---|
-| **stable `0.30.0-b70.N`** | stock vLLM v0.30.0 + this series (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`; b70.1 was [`b70/v0.30.0`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0)), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 | **recommended**; what we serve |
-| edge `main-YYYYMMDD-b70.N` | vLLM main + the series (fork branch [`b70/main`](https://github.com/Lumnus/vllm/tree/b70/main)), torch 2.14, our 0.1.15.4 kernel build | **not recommended**: a progressive decode corruption under concurrency ([known issues](docs/known-issues.md) item 5) |
+| decode, 4 requests at once, total of the 4 (same prompts) | 176.8 | tok/s |
+| decode, 4 requests at once, step time | 62.5 | ms/step |
+| coding agents, 12 sessions at 2 concurrent requests, total (`agent_load.py`, two runs) | 119.3 / 137.1 | tok/s |
+| prefill, one request, 3K / 12K / 30K-token prompt | 4,021 / 4,143 / 3,973 | tok/s (prompt tokens) |
+| KV cache pool, shared by all requests (each card holds half of the attention heads of every token) | 271,195 | tokens |
+| context length, one request at most | 262,144 | tokens |
+| requests served at once (more are queued) | 4 | requests |
+| boot to serving | 4–5 | min |
+
+**[BetterBench](https://github.com/GGZ14/BetterBench)** (20 passes per category, temperature 0.7, 2026-10-20, commit
+`816cc78`, i.e. before 0050, which measured speed-neutral):
+
+| measurement | value | unit |
+|---|---|---|
+| decode, 1 request, weighted median over 8 categories | 94.1 | tok/s |
+| time to first token, 1 request, p50 | 281 | ms |
+| gap between streamed updates, p99 (stutter) | 40.8 | ms |
+| decode total at 1 / 2 / 4 / 8 concurrent requests | 81.6 / 121.9 / 166.1 / 165.4 | tok/s |
+| prefill median at 1.5K / 6K / 12K / 24K / 47K-token prompts | 2,368 / 3,883 / 3,921 / 3,863 / 3,689 | tok/s (prompt tokens) |
+
+**CPU path on vs off** (the same image, one boot each, 2026-10-20, `bench_det.py`; off = `B70_MOE_CPU=0` or a CPU
+without AVX-512 BF16, see [CPU](#cpu)):
+
+| CPU path | 1 request, ms/step (4 prompts) | 1 request, tok/s (4 prompts) | 4 requests, tok/s total | 4 requests, ms/step |
+|---|---|---|---|---|
+| on (default) | 33.9 / 31.4 / 32.1 / 31.6 | 77.7 / 109.0 / 72.0 / 96.0 | 180.2 | 62.1 |
+| off | 40.1 / 35.7 / 38.8 / 36.7 | 67.0 / 97.5 / 57.5 / 79.5 | 142.1 | 75.1 |
+| on vs off | −12 to −17 % | +12 to +25 % | +27 % | −17 % |
+
+Prefill does not use the CPU path (large batches take 0042's prefetch path).
+
+Quality: MMLU 87.2 %, HumanEval 158 / 164, measured in round 4 (FP8 dense layers, before 0047–0050); 0049 and 0050
+passed paired-perplexity checks within ±1 %; MMLU and HumanEval have not been re-run on the current build. Single runs
+vary by ±5–10 % in tok/s.
+
+## CPU
+
+The decode MoE op (0048/0049) lets the CPU compute 70 % of the cold experts each step (`B70_MOE_CPU=1`, on by
+default). That code needs **AVX-512 BF16** (`avx512_bf16` in `/proc/cpuinfo`):
+
+| CPU | CPU path | what happens |
+|---|---|---|
+| AMD Zen 4 / Zen 5 (Ryzen 7000 / 9000, Threadripper 7000 / 9000, EPYC 9004 / 9005) | yes | as measured above (Zen 4) |
+| Intel Xeon 4th gen (Sapphire Rapids) and newer, Xeon 3rd gen Cooper Lake | yes | not tested here |
+| Intel Core 12th gen and newer, Core Ultra (no AVX-512), AMD Zen 3 and older, older Xeons | no | the engine runs; the op checks the CPU at start and keeps every cold expert on the GPU (the "without the CPU path" numbers above) |
+| non-x86 (ARM) | — | the image is x86-64 only |
+
+The library is compiled for generic x86-64; only the CPU-path function uses AVX-512 instructions, and it runs only after
+the start-up check (`__builtin_cpu_supports("avx512bf16")`), so it cannot fault on another CPU. Each card logs its
+state at start: `docker compose logs engine | grep "CPU path"` shows `CPU path on`, `CPU path off (B70_MOE_CPU=0)` or
+`CPU path requested but this CPU has no AVX-512 BF16`.
+
+**Turn it off** (the container then runs with every cold expert on the GPU):
+
+```bash
+echo B70_MOE_CPU=0 >> .env && docker compose up -d     # stays off; remove the line (or set 1) to turn it back on
+B70_MOE_CPU=0 docker compose up -d                     # or for this start only (the shell wins over .env)
+B70_MOE_CPU=0 engines/two-cards/scripts/run-tp2.sh     # without Compose
+```
+
+`B70_MOE_CPU` from `.env` or the shell wins over `engines/two-cards/env/tp2-local.env`, which wins over the defaults in
+`tp2-hotcold.env`.
+
+Core layout matters on other CPUs: each card's pool pins 8 threads, card 0 from core 0, card 1 from core 8
+(`B70_MOE_CPU_FIRST_CORE`, default 8 × rank; one CCD each on a 16-core Ryzen). With fewer than 16 physical cores the
+pools land on SMT siblings or share cores with each other and with vLLM. Measure `B70_MOE_CPU=1` against `=0` with
+`bench_det.py` on such a host, and size the pools to the CPU in `tp2-local.env`, e.g. on a 12-core CPU
+`B70_MOE_CPU_THREADS=6` and `B70_MOE_CPU_FIRST_CORE=0,6` (one first core per card). Details: docs/switches.md.
+
+## What the engine runs
+
+Weights: [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE)
+(Intel AutoRound target tensors, FP8 PLE table, INT4 MTP draft).
+
+Settings (`engines/two-cards/env/tp2-hotcold.env`, `engines/two-cards/args/serve-tp2.args`): tensor parallel 2 + expert
+parallel 2; 146 hot experts per layer and card in VRAM that follow what decode reads (0040, 0043, 0047), the rest
+pinned in host RAM; cold experts prefetched into VRAM for prefill (0042); the fused decode MoE op with the CPU path
+(0048, 0049) and an FP8 draft head; the input embedding in host RAM (0044); FP8 W8A16 dense projections (0045); the
+checkpoint's FP8 PLE shards read in place from NVMe with a 2 GiB row cache (0013 + 0050); MTP k=3; GPU memory 0.96;
+4 sequences; a warm-up request at start (known issues item 13). Without Compose:
+`engines/two-cards/scripts/run-tp2.sh` / `restart-tp2.sh`. Experiments and numbers: [docs/two-cards.md](docs/two-cards.md).
 
 ## What is in the series
+
+The image applies the vLLM release `0.30.0-b70.2` (patches 0001–0032, fork tag `Lumnus/vllm@v0.30.0-b70.2`) and the
+two-card patches 0040–0050 on top.
 
 | patch | what | switch |
 |---|---|---|
 | 0001–0005 | wu1ff's pack (XPU gate, pinned-host PLE, HC K-split, GDN spec fusion, GDN index64 hook) | always on |
-| 0006 | load the PLE table straight into pinned memory (boot host-RAM peak ~191 → ~158 GiB) | `B70_PLE_DIRECT_PINNED=1` |
-| 0007 | PLE table in FP8 (47.7 GiB pinned instead of 95.4) | `B70_PLE_FP8=1` |
-| 0008 | PLE table in INT8 with a per-row scale (48.9 GiB, 4× lower error than FP8) | `B70_PLE_INT8=1` |
+| 0006 | load the PLE table straight into pinned memory | `B70_PLE_DIRECT_PINNED=1` |
+| 0007 | PLE table in FP8 | `B70_PLE_FP8=1` |
+| 0008 | PLE table in INT8 with a per-row scale | `B70_PLE_INT8=1` |
 | 0009 | per-effort thinking budgets; server default presence penalty | `B70_THINKING_BUDGET`, `B70_DEFAULT_PRESENCE_PENALTY` |
 | 0010 | server default repetition stop (bounds the token-1023 NaN loop) | `B70_DEFAULT_REPETITION_DETECTION` |
 | 0012 | accept OpenRouter-style `{"reasoning":{"effort":…}}` | `B70_REASONING_EFFORT_ALIAS=1` |
-| 0013, 0013b | serve the INT8 PLE table from NVMe (~39 GiB host RAM freed) | `B70_PLE_INT8_NVME=1` |
-| 0014a–f | fix hybrid-model KV-offload misses for "same document, new question"; trace; #51787 backport | `B70_OFFLOAD_*` |
-| 0018 | split the pinned CPU KV pool into chunks when one pinned allocation (≥ ~31 GiB) is refused | ungated, acts only then |
-| 0019, 0020 | dense-QSA configs skip `self_attn.indexer` tensors, in the model and in the MTP loaders | ungated |
+| 0013, 0013b | serve the INT8 PLE table from NVMe | `B70_PLE_INT8_NVME=1` |
+| 0014a–f | hybrid-model KV-offload fixes (CPU KV tier; not used on two cards) | `B70_OFFLOAD_*` |
+| 0018 | chunked pinned CPU KV pool (CPU KV tier; not used on two cards) | ungated, acts only then |
+| 0019, 0020 | dense-QSA configs skip `self_attn.indexer` tensors | ungated |
 | 0021 | MTP draft prefill with FULL graphs only on XPU | `B70_MTP_DRAFT_PREFILL_NO_PIECEWISE=1` |
 | 0022 | port of vllm-project/vllm#55506 (Mamba spec-decode block tables by request slot) | ungated |
-| 0023, 0023c/0024t | debug: GDN op mode switch, NaN tracers, a null-block probe | debug, off by default |
-| 0026 | MTP: never schedule a partial draft list on XPU (stock 0.1.14 kernels crash on one) | on by default; `B70_MTP_UNIFORM_DRAFTS=0` |
-| 0027, 0032 | wu1ff's `libgdn_index64.so` optional: without it, the stock (64-bit with our kernels) GDN op | automatic; `B70_GDN_MODE` |
-| 0028 | the PLE embedding accepts Intel's AutoRound (INC) quantization config | ungated, acts only then |
-| 0029, 0029b | prompt logprobs in 128-row chunks (no VRAM spill into host RAM) | on; `B70_PROMPT_LOGPROBS_CHUNK` |
-| 0031 | CPU→GPU KV loads straight from the pinned pool (for kernels without B70-K1) | `B70_OFFLOAD_H2D_DIRECT=1` |
-| 0040 | routed experts split between VRAM (hot) and pinned host RAM (cold), read through UVA; for 2-card hosts | `B70_MOE_HOTCOLD=1`, `B70_MOE_HOT_EXPERTS` (hot experts per layer and rank; two cards: `150`), `B70_MOE_HOTCOLD_RANKINGS` (which experts start hot) |
-| 0041 | route counter: the share of prefill / decode routes served by cold experts, per period; optional dump for re-ranking | `B70_MOE_ROUTE_COUNT=prefill` (or `1`, also in decode graphs), `B70_MOE_ROUTE_COUNT_S`, `B70_MOE_ROUTE_COUNT_PATH` |
-| 0042 | prefill runs the cold experts from two VRAM slots, the next layer's copied while this one computes (prefill ~2,600 → ~3,950 tok/s on two cards) | `B70_MOE_COLD_PREFETCH=1`, `B70_MOE_COLD_PREFETCH_MIN_TOKENS` (default `512`) |
-| 0043 | the hot set follows the traffic: experts swap between VRAM and host RAM by prefill route counts | `B70_MOE_HOTCOLD_SWAP=1`, `B70_MOE_HOTCOLD_SWAP_S` (`5`), `_DECAY` (`0.95`), `_BUDGET` (`8`), `_PRIOR` (`0.01`) |
-| 0044 | the input embedding table in pinned host RAM (0.59 GiB VRAM per card freed for hot experts); new swap defaults | `B70_EMBED_UVA=1` |
-| 0045 | 16-bit dense projections of INC checkpoints as FP8 W8A16 (−0.9 GiB per card; quality-checked on MMLU, HumanEval) | `B70_DENSE_FP8=<regex>` (two cards: the GDN and attention projections) |
-| 0046 | debug: per-step decode route trace for expert-cache studies | `B70_MOE_ROUTE_TRACE=<path>` (with `B70_MOE_ROUTE_COUNT=1`) |
+| 0023, 0023c/0024t | debug: GDN op mode switch, NaN tracers, a null-block probe | off by default |
+| 0026 | MTP: never schedule a partial draft list on XPU | `B70_MTP_UNIFORM_DRAFTS=0` turns it off |
+| 0027, 0032 | wu1ff's `libgdn_index64.so` optional | automatic; `B70_GDN_MODE` |
+| 0028 | the PLE embedding accepts Intel's AutoRound (INC) quantization config | ungated |
+| 0029, 0029b | prompt logprobs in 128-row chunks | `B70_PROMPT_LOGPROBS_CHUNK` |
+| 0031 | CPU→GPU KV loads straight from the pinned pool (CPU KV tier; not used on two cards) | `B70_OFFLOAD_H2D_DIRECT=1` |
+| 0040 | routed experts split between VRAM (hot) and pinned host RAM (cold) | `B70_MOE_HOTCOLD=1`, `B70_MOE_HOT_EXPERTS`, `B70_MOE_HOTCOLD_RANKINGS` |
+| 0041 | route counter per (layer, expert) | `B70_MOE_ROUTE_COUNT` |
+| 0042 | prefill runs cold experts from two prefetched VRAM slots | `B70_MOE_COLD_PREFETCH=1` |
+| 0043 | the hot set follows the traffic (expert swapping) | `B70_MOE_HOTCOLD_SWAP=1` |
+| 0044 | input embedding in pinned host RAM; swap defaults | `B70_EMBED_UVA=1` |
+| 0045 | 16-bit dense projections as FP8 W8A16 | `B70_DENSE_FP8=<regex>` |
+| 0046 | debug: per-step decode route trace | `B70_MOE_ROUTE_TRACE=<path>` |
+| 0047 | rank experts by what decode reads; long-term state on the work volume | `B70_MOE_HOTCOLD_SWAP_SOURCE=decode`, `B70_MOE_HOTCOLD_STATE` |
+| 0048 | fused decode MoE op (SYCL, `kernels/b70-moe-decode`); FP8 draft head | `B70_MOE_DECODE_OP=1`, `B70_DRAFT_HEAD_FP8=1` |
+| 0049 | the CPU computes part of the cold experts at decode | `B70_MOE_CPU=1`, `B70_MOE_CPU_PCT` |
+| 0050 | the PLE table read in place from the checkpoint's FP8 shards on NVMe | `B70_PLE_FP8_NVME=1`, `B70_PLE_FP8_PATH` |
 
-Two cards run 0040, 0042, 0043, 0044 and 0045 on (`engines/two-cards/env/tp2-hotcold.env`). Every switch with its default and
-measurements: [docs/switches.md](docs/switches.md).
+Every switch with its default and measurements: [docs/switches.md](docs/switches.md).
 
 ## Where to find what
 
-| path / repo | what |
+| path | what |
 |---|---|
-| `patches/vllm/`, `patches/vllm-tests/` | the series 0001–0032, exported from the fork branch (one commit per patch on v0.30.0); CPU tests (never applied to the image) |
-| `patches/vllm-xpu-kernels/` | `b70.3/`: our kernel series on vllm-xpu-kernels 0.1.14.1 (the 64-bit GDN conv-state offset, five upstream fixes, B70-K1); `0001-…` at the top: the b70.1 form of the 64-bit fix ([docs/kernels.md](docs/kernels.md)) |
+| `HOW-TO-RUN.md` | step-by-step guide |
+| `compose.yaml`, `.env.example` | the engine with Docker Compose (engine, warm-up, `prepare`) |
+| `engines/two-cards/` | `env/tp2-hotcold.env` (defaults), `env/tp2-local.env.example` (your overrides), `args/serve-tp2.args` (`vllm serve` flags), `scripts/` (compose entrypoint, `run-tp2.sh`, `restart-tp2.sh`) |
+| `engines/serve-configs/` | the snapshots' `config.json` (`serve-config-intel-autoround.json` is the one the engine uses) |
+| `image/` | `Dockerfile.tp2` (the image), `verify-overlay.sh` and `verify-tree.py` (hash checks of every patched file) |
+| `patches/vllm/`, `patches/vllm-tests/` | the vLLM series 0001–0050; CPU tests (never applied to the image) |
+| `patches/vllm-xpu-kernels/` | our kernel series on vllm-xpu-kernels 0.1.14.1 (b70.3) ([docs/kernels.md](docs/kernels.md)) |
 | `patches/series.txt` | which fork commit goes to which file |
-| `scripts/` | `export-series.sh`, `check-series.sh` (patches/ == fork branch), `make-tree.sh` (a verified source tree), `prepare-models-tp2.sh` (two-card weights) |
-| `HOW-TO-RUN.md` | step-by-step guide for the two-card engine |
-| `compose.yaml`, `.env.example` | the two-card engine with Docker Compose (engine, warm-up, `prepare`) |
-| `image/` | `Dockerfile.tp2` (two-card image), `Dockerfile` (four-card b70.1 image), `verify-overlay.sh` and `verify-tree.py` (hash checks), wu1ff's pack files, `derive-serve-config.py` |
-| `engines/` | environments and `vllm serve` flags: four cards `s16-kv128-mtp3` + `models/awq.env` ([engines/README.md](engines/README.md)); two cards `tp2-hotcold.env` + `serve-tp2.args` |
-| `docs/` | [switches](docs/switches.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [known issues](docs/known-issues.md) · [offload fix](docs/offload-fix.md) · [PLE INT8](docs/ple-int8.md) · [PLE on NVMe](docs/ple-nvme.md) · [measurements](docs/measurements/README.md) |
-| `tools/` | `build_int8_ple.py` (INT8 PLE table), `intel_snapshot.py` and `awq_snapshot.py` (snapshots + serve configs), `repro_band.py` (reproduce the offload miss) |
-| [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.30.0-stable` (the release branch from b70.2 on), `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style). `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` are the two working lines that b70.2 consolidates; they are not updated any more |
-| [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels) | `b70/v0.1.14` (tag `v0.1.14.1+b70.3`, what we serve), `b70/v0.1.15` (edge) |
-| [Lumnus/b70-fan-control](https://github.com/Lumnus/b70-fan-control) | sibling repo: a user-space fan table for the B70 |
+| `kernels/` | standalone SYCL ops (`b70-moe-decode`, built by the image) and diagnostics |
+| `scripts/` | `prepare-models-tp2.sh` (weights), `make-tree.sh`, `check-series.sh`, `export-series.sh` |
+| `tools/` | snapshot and PLE-table builders; `bench_tp2/` client benchmarks |
+| `docs/` | [two cards](docs/two-cards.md) · [switches](docs/switches.md) · [known issues](docs/known-issues.md) · [PLE on NVMe](docs/ple-nvme.md) · [PLE INT8](docs/ple-int8.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [offload fix](docs/offload-fix.md) |
 
-`PROVENANCE.md` records where every piece comes from, with hashes. `CHANGELOG.md` lists releases.
-
-## Work in progress (not in the series)
-
-1. **The proper MTP fixes**: padding rows that write no state (so capture sizes no longer have to avoid padding) and
-   the spec + async-scheduling race (so `--no-async-scheduling` can go). Until then the serving flags work around both
-   ([known issues](docs/known-issues.md) item 6).
-2. **A few upstream API fixes on the stable line** (request validation, streaming tool-call finish reasons, logprobs
-   of parser-suppressed chunks): cherry-picked and CPU-tested, not published yet.
-
-## The code lives in the fork
-
-Changes are made on the fork branch, then exported here with `scripts/export-series.sh`; `scripts/check-series.sh`
-fails on any drift.
+`PROVENANCE.md` records where every piece comes from, with hashes. `CHANGELOG.md` lists changes.
 
 ## Credits
 
@@ -325,29 +204,26 @@ This work stands on other people's:
 1. **Lumnus** — [b70-flash-next](https://github.com/Lumnus/b70-flash-next) and the
    [vllm](https://github.com/Lumnus/vllm) fork.
 2. **albucino** — the [`Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE)
-   weights (the two-card build).
+   weights.
 3. **wu1ff — [B70-LLM-Controller](https://github.com/wu1ff/B70-LLM-Controller)** (MIT). The Qwen3.8-Flash-Next B70
    pack: the XPU gate, the pinned-host PLE table, the HC down-GEMM K-split, the GDN spec-metadata fusion, the 64-bit
    GDN conv-state offset fix, the Level Zero peer-residency shim and the dense-QSA serve config. Patches 0001–0005 are
-   wu1ff's changes re-derived as source diffs; two binaries are copied from wu1ff's public image by digest. Thank you.
+   wu1ff's changes re-derived as source diffs; the residency shim is copied from wu1ff's public image by digest.
 4. **Intel** — the [`Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
-   weights (the documented alternative to the AWQ build), made with [AutoRound](https://github.com/intel/auto-round);
+   target tensors, made with [AutoRound](https://github.com/intel/auto-round);
    [vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels), whose upstream fixes #600, #563, #564, #578 and
    #586 are in our kernel build (by Guancheng Fu, Chaojun Zhang, Qiming Zhang and Tony Lin);
    [llm-scaler](https://github.com/intel/llm-scaler) and the XPU work in
    [vLLM #55068](https://github.com/vllm-project/vllm/pull/55068).
-5. **wtdcode** — the [`Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16)
-   weights we serve.
-6. **devan-carlin** — the [`Qwen3.8-Flash-Next-W4A16`](https://huggingface.co/devan-carlin/Qwen3.8-Flash-Next-W4A16)
-   weights, its BF16 PLE table (every INT8 table here is built from it), and the early community vLLM port of
-   the model to XPU (`devan-carlin/vllm@xpu-qwen4exp`).
-7. **TSUMUGI-XE** — [intel/compute-runtime#968](https://github.com/intel/compute-runtime/issues/968), the analysis of
+5. **devan-carlin** — the early community vLLM port of the model to XPU (`devan-carlin/vllm@xpu-qwen4exp`) and the
+   BF16 PLE table.
+6. **TSUMUGI-XE** — [intel/compute-runtime#968](https://github.com/intel/compute-runtime/issues/968), the analysis of
    Level Zero peer residency mirroring device memory into host memory, and the first shim that works around it.
-8. **The Qwen team** — Qwen3.8-Flash-Next itself (license: qwen-community-1.0, see each checkpoint's card).
-9. **[vLLM](https://github.com/vllm-project/vllm)**, on which everything here is built. Patch 0014e is a backport of
+7. **The Qwen team** — Qwen3.8-Flash-Next itself (license: qwen-community-1.0, see each checkpoint's card).
+8. **[vLLM](https://github.com/vllm-project/vllm)**, on which everything here is built. Patch 0014e is a backport of
    vllm-project/vllm#51787; patch 0022 ports vllm-project/vllm#55506.
 
 ## License
 
-Apache-2.0 (LICENSE). wu1ff's files and binaries keep their MIT license; the vLLM and vllm-xpu-kernels patches modify
+Apache-2.0 (LICENSE). wu1ff's binaries keep their MIT license; the vLLM and vllm-xpu-kernels patches modify
 Apache-2.0 code. Model weights are not included and keep their own licenses. See NOTICE.

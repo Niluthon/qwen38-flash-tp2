@@ -4,6 +4,15 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 ## Unreleased — two cards
 
+- **Two cards only.** Removed the one-card and four-card setups: `engines/one-card/`, `engines/four-cards/`,
+  `image/Dockerfile` with `image/files/` and `image/derive-serve-config.py` (the four-card b70.1 image),
+  `tools/awq_snapshot.py`, `docs/measurements/` (four-card release measurements). They remain in
+  Lumnus/b70-flash-next and in git history. README rewritten around the two-card engine, with the speed of the current
+  build and the CPU requirements of the 0049 CPU path (AVX-512 BF16, core pinning).
+- **0049 (revised)**: `B70_MOE_CPU` is logged per rank (on / off by the switch / off because the CPU has no AVX-512
+  BF16, which now also sets it to `0`); `B70_MOE_CPU_FIRST_CORE` takes a comma list, one first core per TP rank.
+  CPU tests `tests/model_executor/test_b70_cpu_path.py` (patches/vllm-tests/0049). Compose and `run-tp2.sh` take
+  `B70_MOE_CPU` from the host (`.env` or the shell), so the CPU path can be switched off without editing env files.
 - **0040**: routed experts split between VRAM (hot) and pinned host RAM (cold) for XPU W4A16 MoE, gated by
   `B70_MOE_HOTCOLD` (off by default; docs/switches.md). Exact against all experts in VRAM. CPU tests
   (`tests/model_executor/test_b70_hotcold.py`) and an XPU equivalence test (`tests/kernels/moe/test_b70_hotcold_xpu.py`).

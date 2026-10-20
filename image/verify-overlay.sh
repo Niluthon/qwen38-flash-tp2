@@ -79,7 +79,7 @@ e2b41b0b066d1d9e18ca0ce4f135df46ebf0ba0084888441dba4d171d1342021  B70-0022      
 e5014b3e6f2808aa0aca6478e0c650000a0233d16b5abc9cfdf82533b1b749dc  B70-0022      vllm/v1/worker/mamba_utils.py
 6e79d4687c38aad5c26cb2eeeada4909ae60008c266993105d4e4c5ed31326ad  B70-0029      vllm/v1/worker/gpu_model_runner.py
 ab17fa440e054fe1414956d80f08b67fa733171020ebe1a67c8a6bdaab29f9d1  B70-0029b     vllm/v1/worker/gpu/sample/prompt_logprob.py
-5ce3b165edbd1316c71a724d1d959e1a42e2765d5cef21dc2d8a5c821955fea5  B70-0049      vllm/model_executor/layers/fused_moe/b70_hotcold.py
+4c8f31efeee1accc66695e73a82e27321cbd048f1a052450b8645b6371f8351c  B70-0049      vllm/model_executor/layers/fused_moe/b70_hotcold.py
 0f8910c7785eb36c4d366c8ad7bf4f0bac5ae5dabbb69aa972f1eba2889755a5  B70-0044      vllm/model_executor/model_loader/base_loader.py
 37d5958f41c7ff7ea4fbf5395ddf24f3c830fb3a612530d1ab0fadb426572038  B70-0045      vllm/model_executor/layers/quantization/inc/inc.py
 d9f4550fd55b7b1dd29f176b9d0a0ad3d1ed2600a9a4bab66f946d6465665dbc  B70-0045      vllm/model_executor/layers/quantization/online/fp8.py

@@ -1,0 +1,171 @@
+From c2dee66ee68320f1f271c1d82eea79ea5301086f Mon Sep 17 00:00:00 2001
+From: lumnus <lumnus@local>
+Date: Tue, 20 Oct 2026 07:37:58 +0000
+Subject: [PATCH] B70-0051: MoE glue at decode in the decode op's library
+ (route count in the plan kernel, b70moe.topk_softmax), B70_MOE_GLUE
+
+---
+ .../layers/fused_moe/b70_hotcold.py           | 37 +++++++++++++++++--
+ .../layers/fused_moe/experts/xpu_moe.py       | 31 +++++++++-------
+ .../fused_moe/router/fused_topk_router.py     | 27 ++++++++++++++
+ 3 files changed, 78 insertions(+), 17 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index ed91cb4..8e93f8a 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -224,6 +224,30 @@ def route_count_enabled() -> bool:
+ 
+ 
+ _DECODE_OP = {"max_rows": None}
++_GLUE = {"on": None}
++
++
++def glue_part(name: str) -> bool:
++    """B70_MOE_GLUE_PARTS (default "count,topk"): which glue pieces run when B70_MOE_GLUE=1."""
++    return glue_enabled() and name in os.environ.get("B70_MOE_GLUE_PARTS", "count,topk").split(",")
++
++
++def glue_enabled() -> bool:
++    """B70 0051: B70_MOE_GLUE=1 moves two pieces of MoE glue at decode into the decode op's library: the 0047 route
++    count goes into the op's plan kernel (moe_decode_counted, replaces remainder + index_add_), and top-k softmax
++    runs as b70moe.topk_softmax (same ids, weights within a few fp32 ulp; replaces _moe_C.topk_softmax, ~12 us fixed
++    per call). Needs the decode op (B70_MOE_DECODE_OP)."""
++    on = _GLUE["on"]
++    if on is None:
++        on = (os.environ.get("B70_MOE_GLUE") == "1" and decode_op_max_rows() > 0
++              and hasattr(torch.ops.b70moe, "moe_decode_counted") and hasattr(torch.ops.b70moe, "topk_softmax"))
++        if os.environ.get("B70_MOE_GLUE") == "1" and not on:
++            logger.warning("B70 MoE glue: the decode op library has no glue ops; stock path")
++        elif on:
++            logger.info("B70 MoE glue: route count in the decode op, b70moe.topk_softmax for <= %d tokens",
++                        decode_op_max_rows())
++        _GLUE["on"] = on
++    return on
+ 
+ 
+ def decode_op_max_rows() -> int:
+@@ -742,8 +766,9 @@ class HotColdPlan:
+                      topk_weights=topk_weights, topk_ids=topk_ids)
+         _PREFETCH.release_and_prefetch(self)
+ 
+-    def apply_decode_op(self, output, hidden_states, topk_weights, topk_ids) -> bool:
+-        """B70 0048: small batches through the fused hot+cold decode op (b70moe.moe_decode); False = not taken."""
++    def apply_decode_op(self, output, hidden_states, topk_weights, topk_ids, counts_row=None) -> bool:
++        """B70 0048: small batches through the fused hot+cold decode op (b70moe.moe_decode); False = not taken.
++        counts_row (0051): also add this batch's routes to the 0047 count row inside the op."""
+         if hidden_states.shape[0] > decode_op_max_rows() or hidden_states.dtype != torch.bfloat16:
+             return False
+         args = self._decode_args
+@@ -761,8 +786,12 @@ class HotColdPlan:
+                 return False
+             self._decode_args = args
+         ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+-        torch.ops.b70moe.moe_decode(output, hidden_states.contiguous(), topk_weights.contiguous(),
+-                                    ids.contiguous(), *args)
++        if counts_row is not None:
++            torch.ops.b70moe.moe_decode_counted(output, hidden_states.contiguous(), topk_weights.contiguous(),
++                                                ids.contiguous(), *args, counts_row)
++        else:
++            torch.ops.b70moe.moe_decode(output, hidden_states.contiguous(), topk_weights.contiguous(),
++                                        ids.contiguous(), *args)
+         return True
+ 
+     def impls(self, w1, w1_scale, w2, w2_scale, topk, activation, extra):
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index b1b90e6..cda4305 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -322,26 +322,31 @@ class XPUExpertsWNA16(XPUExperts):
+             w1, self.w1_scale, w2, self.w2_scale, topk_ids.size(-1),
+             activation.value, {"gemm1_clamp_limit": self.gemm1_clamp_limit},
+         )
+-        if not (activation.value == "silu" and self.gemm1_clamp_limit is None
+-                and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids)):
+-            hot.apply(output=output, hidden_states=hidden_states,
+-                      topk_weights=topk_weights, topk_ids=topk_ids)
+-            cold_out = torch.empty_like(output)
+-            self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
+-            output.add_(cold_out)
++        from vllm.model_executor.layers.fused_moe import b70_hotcold as _hc
++
++        row = None
+         counts = self.b70_hotcold.route_counts
+         if counts is not None:
+             # row 0: eager batches (prefill, mixed); row 1: captured graphs (decode)
+-            from vllm.model_executor.layers.fused_moe import b70_hotcold as _hc
+-
+             graph = torch.xpu.is_current_stream_capturing()
+             # eager counting starts with the first real batch: the memory-profiling run must not pay for it
+             if (graph and self.b70_hotcold.count_graphs) or (not graph and _hc._LIVE["on"]):
+                 row = counts[1 if graph else 0]
+-                # two kernels (inside the decode graphs too): negative (padding) ids land in the last
+-                # bucket via remainder, and the ones come from a shared static buffer
+-                ids = topk_ids.reshape(-1).remainder(row.shape[0])
+-                row.index_add_(0, ids, _hc.route_ones(ids.numel(), row.device))
++        in_op = row if _hc.glue_part("count") else None  # 0051: the op counts in its plan kernel
++        took_op = (activation.value == "silu" and self.gemm1_clamp_limit is None
++                   and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids,
++                                                        counts_row=in_op))
++        if not took_op:
++            hot.apply(output=output, hidden_states=hidden_states,
++                      topk_weights=topk_weights, topk_ids=topk_ids)
++            cold_out = torch.empty_like(output)
++            self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
++            output.add_(cold_out)
++        if row is not None and not (took_op and in_op is not None):
++            # two kernels (inside the decode graphs too): negative (padding) ids land in the last
++            # bucket via remainder, and the ones come from a shared static buffer
++            ids = topk_ids.reshape(-1).remainder(row.shape[0])
++            row.index_add_(0, ids, _hc.route_ones(ids.numel(), row.device))
+ 
+ 
+ class XPUExpertsMxFp4(XPUExperts):
+diff --git a/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py b/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
+index 28f67b5..b016cb8 100644
+--- a/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
++++ b/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
+@@ -30,6 +30,18 @@ def vllm_topk_softmax(
+     gating_output: torch.Tensor,
+     renormalize: bool = False,
+ ) -> tuple[torch.Tensor, ...]:
++    if _b70_topk_ok(topk_weights, topk_indices, gating_output):
++        # B70 0051: same ids, weights within a few fp32 ulp; token_expert_indices is not written (all callers of
++        # fused_topk discard it)
++        pad = _get_padding_mask(topk_indices.shape[0])
++        torch.ops.b70moe.topk_softmax(
++            topk_weights,
++            topk_indices,
++            gating_output,
++            renormalize,
++            pad,
++        )
++        return topk_weights, topk_indices
+     ops.topk_softmax(
+         topk_weights,
+         topk_indices,
+@@ -42,6 +54,21 @@ def vllm_topk_softmax(
+     return topk_weights, topk_indices
+ 
+ 
++def _b70_topk_ok(topk_weights, topk_indices, gating_output) -> bool:
++    """B70 0051 (B70_MOE_GLUE=1): decode-sized bf16 routing on XPU goes to b70moe.topk_softmax."""
++    if not gating_output.is_xpu:
++        return False
++    from vllm.model_executor.layers.fused_moe.b70_hotcold import decode_op_max_rows, glue_part
++
++    return (glue_part("topk") and gating_output.dtype == torch.bfloat16
++            and gating_output.data_ptr() % 16 == 0
++            and gating_output.shape[0] <= decode_op_max_rows()
++            and gating_output.shape[1] in (512, 1024) and gating_output.stride(1) == 1
++            and gating_output.stride(0) % 8 == 0 and topk_weights.dtype == torch.float32
++            and topk_indices.dtype == torch.int32 and topk_weights.shape[1] <= 16
++            and topk_weights.is_contiguous() and topk_indices.is_contiguous())
++
++
+ def vllm_topk_sigmoid(
+     topk_weights: torch.Tensor,
+     topk_indices: torch.Tensor,
+-- 
+2.53.0
+

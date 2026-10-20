@@ -79,7 +79,7 @@ Each item: symptoms → cause → workaround. Status as of 2026-10-07 (0.30.0-b7
   scheduling (vLLM's default) leaves residual NaN; the leading candidate is a staging-buffer reuse race.
 - **Workaround (what we serve, 0/90 bad bursts).** `--no-async-scheduling`, and cudagraph capture sizes at every multiple
   of 1+k up to `max-num-seqs`×(1+k) (4, 8, …, 64 for k=3 and 16 slots), so a uniform spec-decode step is never padded
-  (`engines/four-cards/args/serve-s16-mtp3.args`). The cost: concurrent long-prompt TTFT ~35–40 % worse than without MTP. The proper
+  (four-card flags `serve-s16-mtp3.args` in [Lumnus/b70-flash-next](https://github.com/Lumnus/b70-flash-next); the two-card `serve-tp2.args` uses capture sizes 1, 2, 4, 8, 12, 16 at 4 slots). The cost: concurrent long-prompt TTFT ~35–40 % worse than without MTP. The proper
   fixes (padding rows that write nothing; the race) are work in progress.
 - **Structured output.** Grammar-trimmed drafts give a row of fewer than 1+k tokens, which the stock 0.1.14 GDN kernel
   rejects (the engine crashes on the first `json_schema` request). Fixed by upstream vllm-xpu-kernels #600, which is in
@@ -100,7 +100,7 @@ Each item: symptoms → cause → workaround. Status as of 2026-10-07 (0.30.0-b7
 
 The checkpoint's int4 group scales are F16; vLLM creates the scale parameters in the model dtype (BF16) and the loader
 casts them. On layer 0 expert 0 the rounding is at most 3.9e-3 relative. No quality difference to AWQ shows on any test
-(docs/measurements/b70.2.md); whether Intel's own accuracy figures were measured with F16 scales is not known to us.
+(four-card measurements, `docs/measurements/b70.2.md` in [Lumnus/b70-flash-next](https://github.com/Lumnus/b70-flash-next)); whether Intel's own accuracy figures were measured with F16 scales is not known to us.
 
 ## 9. Prompt logprobs spill VRAM into host RAM (fixed by 0029b)
 
@@ -125,7 +125,7 @@ mode file) falls back to the `official` variant and, before 0032, logged that wa
 ## 12. The release branch: AWQ validated on an earlier branch of the same code, Intel verification in progress
 
 From 0.30.0-b70.2 there is one release branch, `b70/v0.30.0-stable` (tag `v0.30.0-b70.2`), and the model is a serving
-parameter (`engines/four-cards/env/s16-kv128-mtp3.env` + `engines/four-cards/models/awq.env` or `engines/four-cards/models/intel-autoround.env`). The branch
+parameter (the four-card engine files, kept in [Lumnus/b70-flash-next](https://github.com/Lumnus/b70-flash-next); this repository has only the two-card engine). The branch
 carries the union of the two lines we tested on, with one copy of each fix. It has **not yet been booted on a GPU**.
 
 **AWQ** (`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`, the build we serve and recommend) was validated on an earlier branch of
@@ -135,7 +135,7 @@ boots on the first pass (first token 363 s after start); the K1 load line appear
 alive; host memory is flat under two six-session replays (xe host +0.32 GiB total over the run, ~480 GB and ~355 GB of
 offload loads); 0 tracebacks, 0 `DEVICE_LOST`. It then ran **3 days 16 hours in one engine** (2026-10-04 to 2026-10-07,
 ~52,500 requests, 0 errors, 0 aborts; README, Endurance), ended by a planned restart. Speeds and quality: README and
-[measurements](measurements/b70.2.md).
+the four-card measurements in [Lumnus/b70-flash-next](https://github.com/Lumnus/b70-flash-next).
 
 That earlier branch (0001–0027 as here, and 0029b) differs from the release branch in code that **runs for AWQ** in
 these places, listed plainly:

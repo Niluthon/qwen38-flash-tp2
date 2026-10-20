@@ -1,11 +1,18 @@
 # How to run it (two cards)
 
-A step-by-step guide to serving Qwen3.8-Flash-Next on **2× Intel Arc Pro B70** with Docker Compose. **One card and
-96 GB RAM:** the same steps, plus two lines in `.env` before starting ([engines/one-card/](engines/one-card/README.md);
-**these settings are not tested**). **Four cards:** the same, with `ENGINE_ENV=engines/four-cards/env/tp4.env` and
-`ENGINE_LOCAL_ENV=engines/four-cards/env/tp4-local.env` (**these settings are not tested** either). It covers a fresh
-machine, daily use, reusing weights you already have, and bringing your own model. The four-card setup has its own
-recipe in the [README](README.md#four-cards-the-release-recipe).
+A step-by-step guide to serving Qwen3.8-Flash-Next on **2× Intel Arc Pro B70** with Docker Compose. It covers a fresh
+machine, daily use, reusing weights you already have, and bringing your own model. This repository has only the
+two-card setup. Speed of the current build: [README](README.md#speed-of-the-current-build).
+
+**Short version** (each step is explained below):
+
+```bash
+git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
+docker compose build                 # ~20 GB image, builds everything itself
+docker compose run --rm prepare      # once: ~129 GB download to ~/models (set MODELS in .env to change)
+docker compose up -d                 # ~5 min until it serves on port 8000
+docker compose logs -f warmup        # done when it prints "warm-up request OK"
+```
 
 **Contents:** [1. Check the machine](#1-check-the-machine) · [2. First start](#2-first-start) ·
 [3. Use it](#3-use-it) · [4. Daily use](#4-daily-use) · [5. Change settings](#5-change-settings) ·
@@ -18,6 +25,8 @@ recipe in the [README](README.md#four-cards-the-release-recipe).
 |---|---|---|
 | 2× Arc Pro B70 with the `xe` kernel driver (we run Linux 7.0) | `ls /dev/dri` | `card*` and `renderD*` entries, and a `by-path` directory |
 | ~64 GB RAM | `free -g` | `total` around 62 or more |
+| an x86-64 CPU; **AVX-512 BF16** for the fastest decode (optional) | `grep -o -m1 avx512_bf16 /proc/cpuinfo` | `avx512_bf16` (AMD Zen 4/5, Intel Xeon 4th gen+). Without it the engine runs ~16–19 % slower at decode; see [README, CPU](README.md#cpu) |
+| 16 or more CPU cores for the CPU path's default pinning | `lscpu \| grep '^Core'` | `Core(s) per socket: 16` or more; with fewer, compare `B70_MOE_CPU=1` and `=0` (section 5) |
 | ~185 GB free on an **NVMe** disk, for the weights (the PLE table is read from it while serving) | `df -h /path/for/models` | 185G or more available |
 | ~20 GB free for Docker's image store | `df -h /var/lib/docker` | 20G or more available |
 | Docker Engine with the Compose plugin **v2.24 or newer** | `docker compose version` | `v2.24.0` or higher |
@@ -33,7 +42,7 @@ github.com, huggingface.co); serving runs offline.
 ## 2. First start
 
 ```bash
-# a. get the repository (the two-card work lives here; Lumnus/b70-flash-next is the four-card upstream)
+# a. get the repository
 git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 
 # b. (optional) choose where the weights go; the default is ~/models
@@ -72,7 +81,13 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 - **Thinking** is on by default. Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}`,
   or limit it with `"reasoning_effort": "low"` (or the OpenRouter form `"reasoning": {"effort": "low"}`).
 - **Tool calls** and **structured output** (`response_format` with a JSON schema) work.
-- **Limits**: 131,072-token context, 4 requests at a time (more are queued), text only (no images).
+- **Limits**: 262,144-token context, 4 requests at a time (more are queued), text only (no images).
+- **Speed** on our host (tok/s = generated tokens per second):
+  - one request: ~70–108 tok/s, depending on how well the MTP draft guesses the text (~31–36 ms per decode step);
+  - four requests at once: ~177 tok/s in total (~62 ms per step);
+  - reading the prompt (prefill): ~4,000 prompt tokens/s, so a 30K-token prompt takes ~7.5 s before the first token.
+
+  Tables and method: [README](README.md#speed-of-the-current-build).
 - The port is open on all network interfaces; firewall it if the machine is reachable from outside.
 
 ## 4. Daily use
@@ -93,7 +108,7 @@ Keep tracked files unchanged; put your changes in git-ignored files, then run `d
 
 | file | for | start from |
 |---|---|---|
-| `.env` | host paths (`MODELS`, `ENGINE_DATA`), image name, `HF_TOKEN` | `.env.example` |
+| `.env` | host paths (`MODELS`, `ENGINE_DATA`), image name, `HF_TOKEN`; `B70_MOE_CPU=0` turns the CPU path for cold experts off (wins over the env files) | `.env.example` |
 | `engines/two-cards/env/tp2-local.env` | engine switches (hot experts, PLE cache, chat defaults, ...) and `EXTRA_ARGS`, extra `vllm serve` flags | `engines/two-cards/env/tp2-local.env.example` (each setting explained) |
 | `engines/two-cards/args/serve-tp2.local.args` | the full flag list, when you need to **remove** a flag (`EXTRA_ARGS` can only add or override) | `cp engines/two-cards/args/serve-tp2.args engines/two-cards/args/serve-tp2.local.args`, then `SERVE_ARGS_FILE=/b70-engines/two-cards/args/serve-tp2.local.args` in `engines/two-cards/env/tp2-local.env` |
 
@@ -103,6 +118,9 @@ Examples for `engines/two-cards/env/tp2-local.env`:
 EXTRA_ARGS=--max-model-len 65536                       # shorter context
 EXTRA_ARGS=--port 8080 --served-model-name my-model    # another port / model name
 B70_MOE_HOT_EXPERTS=154                                # more experts in VRAM: a bit faster, less KV cache
+B70_MOE_CPU=0                                          # cold experts on the GPU only (CPUs with < 16 cores: measure both)
+B70_MOE_CPU_THREADS=6                                  # smaller CPU pools, e.g. a 12-core CPU ...
+B70_MOE_CPU_FIRST_CORE=0,6                             # ... with one first core per card
 ```
 
 After anything that changes memory use, check the KV cache the engine reports at start:
@@ -171,7 +189,7 @@ for checkpoints whose experts load through vLLM's GPTQ path: **Intel AutoRound (
 | [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) | **the default**; tested |
 | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` (the target tensors above, with a BF16 PLE table) | should work; **not tested on two cards** (recipe below) |
 | your own AutoRound W4A16 quant of Qwen3.8-Flash-Next | as for Intel's; same quantization format |
-| AWQ / llm-compressor (`compressed-tensors`, e.g. `wtdcode/...-AWQ-W4A16`) | **no**: the expert split does not cover this format and the experts do not fit; four cards only |
+| AWQ / llm-compressor (`compressed-tensors`, e.g. `wtdcode/...-AWQ-W4A16`) | **no**: the expert split does not cover this format and the experts do not fit |
 | other model families | **no**: the settings and patches are for this model; use upstream vLLM |
 
 **What the engine needs from a model**, whatever its source:
@@ -191,7 +209,7 @@ for checkpoints whose experts load through vLLM's GPTQ path: **Intel AutoRound (
    `model` key to use the checkpoint's own MTP layers (in BF16 they take more VRAM, so fewer hot experts or less KV
    cache), or no speculative decoding at all (remove the flag via `serve-tp2.local.args`, section 5; slower).
 
-**Example: Intel's AutoRound checkpoint** (not tested on two cards; the four-card engine runs it). Run the commands
+**Example: Intel's AutoRound checkpoint** (not tested on two cards). Run the commands
 from the repository directory; they work inside the image, on your `MODELS` directory:
 
 ```bash
@@ -222,7 +240,7 @@ EXTRA_ARGS=--speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 
 `docker compose up -d`, then check the start-up log for `B70 hot/cold: 48 layers split`, `PLE NVMe host path ready`
 and the `KV cache size`. If start-up runs out of VRAM, lower `B70_MOE_HOT_EXPERTS` (each expert is 116 MiB per card).
-Intel's checkpoint is described in the [README](README.md#models) and [docs/weights.md](docs/weights.md).
+Intel's checkpoint is described in [docs/weights.md](docs/weights.md).
 
 ## 8. Troubleshooting
 
@@ -236,5 +254,6 @@ Intel's checkpoint is described in the [README](README.md#models) and [docs/weig
 | engine stays `starting` for over 15 min, or exits | read `docker compose logs engine`; check that nothing else uses the cards (the engine takes 95 % of their memory) and that `prepare` finished |
 | `No such file` for a path under `/models` | the weights are not where the engine looks: section 6 |
 | no `/dev/dri`, or `group render not found` | the GPU driver is not loaded on the host; check `ls /dev/dri` and the kernel log |
+| decode slower than in the README: `python3 tools/bench_tp2/bench_det.py` shows ~36–40 ms/step (one request) instead of ~31–36 ms/step, or ~142 instead of ~180 tok/s for 4 requests | check `docker compose logs engine \| grep "CPU path"`: `CPU path on` for both ranks means it runs; `off (B70_MOE_CPU=…)` means it is switched off (`.env`, shell or `tp2-local.env`); `no AVX-512 BF16` means the CPU cannot run it (all cold experts stay on the GPU). On with fewer than 16 cores: size the pools (`B70_MOE_CPU_THREADS`, `B70_MOE_CPU_FIRST_CORE=0,6`, section 5) or compare with `B70_MOE_CPU=0` |
 
 More: [docs/known-issues.md](docs/known-issues.md); details and measurements: [docs/two-cards.md](docs/two-cards.md).
