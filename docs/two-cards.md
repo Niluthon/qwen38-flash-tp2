@@ -57,7 +57,7 @@ during loading (the driver overcommits), and the fragmented remainder cost ~3 Gi
 
 Container: `image/Dockerfile.tp2`: the official v0.30.0 XPU image by digest, the vLLM of release 0.30.0-b70.2 (fork tag
 `Lumnus/vllm@v0.30.0-b70.2`, commit `9d79d28d`, checked against `patches/vllm/` 0001–0032), the two-card patches
-0040–0050 and 0052 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-20, after the experiments below): TP 2 + EP 2,
+0040–0050, 0052 and 0053 on top, kernels 0.1.14.1+b70.3 and wu1ff's residency shim; everything fetched and hash-checked at build time. Settings (2026-10-20, after the experiments below): TP 2 + EP 2,
 146 hot experts per layer and rank, swapped by what decode reads (0043 + 0047, long-term ranking on the work volume),
 the input embedding in pinned host RAM (0044), the 16-bit dense projections as FP8 W8A16 (0045), cold-expert prefetch
 for prefill (0042), the fused decode MoE op (0048) with 70 % of the cold experts computed by the CPU pool (0049) and an
@@ -672,8 +672,8 @@ What could be freed per card (estimates from the table; nothing of it built yet)
 | allocator slack: expandable segments or a load order that does not fragment | up to 0.9 (measured: +61K KV tokens, the default now) | no |
 | hyper-connection K-halves: keep one copy (decode path must stay bit-identical) | 0.68 (measured: +46.6K KV tokens, 0052) | no, if exact |
 | prefetch slots shrink with the cold set (2 slots × one layer's cold experts) | ~0.4 at 20 cold | no |
-| hyper-connection mixers in FP8 (as Paiton's trunk) | ~0.63 | yes |
-| target lm_head in FP8, shared with the drafts (drop the bf16 shard) | ~0.59 | yes |
+| hyper-connection mixers in FP8 (as Paiton's trunk) | ~0.63 (measured: the FP8 kernel is slower, not built) | yes |
+| target lm_head in FP8, shared with the drafts (drop the bf16 shard) | ~0.59 (measured: +21K KV tokens, 0053, quality gate passed) | yes |
 
 At ~0.114 GiB per hot int4 expert (48 layers), the ~3 GiB without numerics changes are ~26 more hot experts
 (146 → ~172) at today's KV, with no new quantization.
@@ -727,6 +727,51 @@ the agents varies with the hot/cold swap state (S0 had 37.2 / 31.5 / 37.9 / 31.8
 ~60 MiB lower (more KV at the same util); stress_mixed and 10 bursts without errors. The image build also rebuilt
 `libb70_moe_decode.so` from the current `kernels/b70-moe-decode` (round 11's superset with the opt-in 0051 ops,
 sha256 71f3a7e8…; moe_decode unchanged): S7 runs that library.
+
+### Levers 4 and 5: FP8 hyper-connection mixers (measured, not built) and the FP8 target head (0053, the default now)
+
+Card microbench (`engine-data/ab/hc_fp8_bench.py`, one B70; FP8 as 0048's head: E4M3, one scale per output row,
+`fp8_gemm_w8a16`; 96 sites with distinct random weights in one XPU graph; error on the real layer-5 weights):
+
+| µs per site | M = 1 | M = 4 | M = 8 | M = 16 | M = 64 | M = 256 | M = 1024 | M = 4096 |
+|---|---|---|---|---|---|---|---|---|
+| BF16 down (10,240 → 336; ≥ 65 rows: 0052's two K-halves) + up (320 → 10,240) | 33.1 | 35.4 | 35.4 | 36.1 | 60.1 | 76.3 | 221.6 | 592.8 |
+| FP8 W8A16 down + up | 46.9 | 47.1 | 47.3 | 68.7 | 72.9 | 99.3 | 295.7 | 1,049.8 |
+
+- **HC mixers in FP8: not built.** The weight-only FP8 kernel is slower than the BF16 GEMMs at every width for these
+  skinny shapes (it saves VRAM, not time, as round 7 found for the dense layers): +1.3 ms per step at 1–8 rows,
+  +3.1 ms at 16 rows (96 sites), and +77 % on these GEMMs in prefill, for 0.63 GiB per card (~5 hot experts).
+  Error rel L2 2.4–2.7·10⁻² per GEMM; deterministic at every width, also graph-replayed. Only a dedicated skinny
+  FP8 kernel (floor ~11 µs per site at 595 GB/s; `kernels/b70-hc` has a BF16 one) would change the verdict.
+- **Target head in FP8 (0053, `B70_HEAD_FP8=1`).** The lm_head shard is a pure weight stream at decode: 1.07 →
+  0.55 ms per call at 1–4 rows, 1.10 → 0.94 ms at 16 (no extra memory at any width). 0053 lets the target compute its
+  logits on 0048's FP8 copy (one copy, shared with the draft through the shared head module) and releases the BF16
+  shard at the first forward of the memory-profile run. Released inside `compute_logits` instead (Q1), the shard
+  still sat in the profile's torch peak and the KV did not grow; at the first forward it does.
+
+| run | KV tokens | bench_det #1 ms/step (4 prompts; 4 streams) | bench_det #2 after the agents | agents tok/s (generated tokens) | card 0 free at peak, MiB | prefill 3K / 12K / 30K tok/s |
+|---|---|---|---|---|---|---|
+| Q0: default image (0052), BF16 target head | 379,356 | 34.0 / 31.5 / 33.6 / 31.3; 62.8 | 37.0 / 32.1 / 37.6 / 31.8; 61.6 | 119.3 / 136.3 (20.6K / 22.6K) | 518 | (S7: 4,072 / 4,105 / 3,954) |
+| Q1: 0053, released in compute_logits (dev tree) | 378,790 | 34.9 / 32.1 / 34.3 / 31.7; 64.3 | 37.6 / 30.7 / 38.1 / 31.7; 62.9 | 107.0 / 134.8 (15.3K / 22.3K) | 1,158 | – |
+| Q3: 0053, released at the first forward (dev tree) | 400,513 | 33.5 / 31.7 / 33.0 / 30.5; 61.2 | 36.5 / 29.8 / 37.8 / 31.5; 60.1 | 119.7 / 128.9 (18.4K / 19.4K) | 815 | 4,044 / 4,105 / 3,957 |
+| **Q4: the built image with 0053, default settings** | **400,513** | **33.5 / 31.6 / 31.9 / 30.3; 61.2** | **34.7 / 30.0 / 35.7 / 30.5; 60.7** | **109.0 / 120.4 (15.1K / 16.0K)** | **778** | **4,097 / 4,098 / 3,952** |
+
+Quality gate (`engine-data/ab/quality_gate.sh`: MMLU 3,000 sampled + HumanEval 164 at temperature 0, `run_eval.py`,
+`he_exec.py`, `compare.py`; paired perplexity on 4 fixed texts, `ppl_pair.py`), Q0 vs Q1 (same numerics as Q3/Q4):
+
+| | BF16 target head (Q0) | FP8 target head (Q1) |
+|---|---|---|
+| MMLU, 3,000 paired | 87.50 % | 87.70 % (18 vs 24 discordant, exact McNemar p = 0.44) |
+| HumanEval pass@1 | 158 / 164 | 158 / 164 (the same tasks pass) |
+| perplexity README / switches / two-cards / decode-op source | 5.298 / 3.956 / 7.285 / 5.375 | 5.350 / 3.940 / 7.294 / 5.365 |
+
+KV +21.2K tokens (+5.6 %; +47.6 % over this morning's 271,308), and ~0.26 GiB more real headroom on card 0 at peak
+(518 → 778 MiB): before 0053 the draft's FP8 copy was allocated after the profile's activation peak, so vLLM
+counted 0.3 GiB less activation memory than it used; now the estimate is exact (peak activation 0.76 → 1.06 GiB in
+the boot log). Step time −0.4 ms at 1 stream (the verify head, ~1.3 %, within noise), 4 streams 176–177 →
+181–187 tok/s. agent_load tok/s follows the length of the generated answers (temperature 0, but 2 concurrent
+requests and the hot/cold swap make them vary from run to run: 15–22K tokens in the same configuration); bursts and
+stress_mixed clean. Off: `B70_HEAD_FP8=0` (KV back to ~379K).
 
 ### Paiton's W3A8 experts: does all-resident 3-bit pay on a B70? (spike, `kernels/b70-w3-spike`)
 
