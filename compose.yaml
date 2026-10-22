@@ -22,11 +22,16 @@
 
 name: b70-flash-next
 
-x-engine-base: &engine-base
+# image and build definition, shared by the services that need the engine's vLLM (does not pull in devices, env or
+# the engine's volumes: the warm-up service is happy with network, the args file and a python)
+x-image: &image
   image: ${IMAGE:-b70-flash-next:tp2}
   build:
     context: .
     dockerfile: image/Dockerfile.tp2
+
+x-engine-base: &engine-base
+  <<: *image
   network_mode: host
   working_dir: /opt/venv
   volumes:
@@ -68,18 +73,25 @@ services:
     restart: "unless-stopped"         # start by hand after a crash or reboot (`docker compose up -d`)
 
   # Known issue 13: with MTP, the first request after start must be short. This runs one, then exits.
+  # A service of its own: no depends_on and nothing of the engine's runtime (no devices, no /work, no residency shim),
+  # so `up -d` and `restart engine warmup` never race the engine — the request waits for /health and retries itself
+  # (compose-serve.sh warmup, WARMUP_TIMEOUT seconds, 1200 by default). The env files are read for the serve flags only
+  # (port, served-model-name) and EXTRA_ARGS.
   warmup:
-    <<: *engine-base
+    <<: *image
+    network_mode: host
+    working_dir: /opt/venv
+    volumes:
+      - ./engines:/b70-engines:ro
     env_file:
       - path: ${ENGINE_ENV:-engines/two-cards/env/tp2-hotcold.env}
       - path: ${ENGINE_LOCAL_ENV:-engines/two-cards/env/tp2-local.env}
         required: false
     environment:
       LD_PRELOAD: ""   # the residency shim needs the GPUs; this container only sends an HTTP request
+      # seconds it waits for the engine before exiting 1 (from the shell or .env: `WARMUP_TIMEOUT=3600 docker compose up -d warmup`)
+      WARMUP_TIMEOUT: ${WARMUP_TIMEOUT:-1200}
     entrypoint: ["/bin/bash", "/b70-engines/two-cards/scripts/compose-serve.sh", "warmup"]
-    depends_on:
-      engine:
-        condition: service_healthy
     restart: "no"
 
   # One-time setup, not started by `up`: `docker compose run --rm prepare` downloads the checkpoint and makes the

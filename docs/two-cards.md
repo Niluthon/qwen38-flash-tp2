@@ -69,7 +69,7 @@ KV tier. It listens on 0.0.0.0:8000. The env switches are in `engines/two-cards/
 ```bash
 docker compose build                  # the image (image/Dockerfile.tp2)
 docker compose run --rm prepare       # once: the weights steps above (scripts/prepare-models-tp2.sh)
-docker compose up -d                  # compose.yaml: engine + one-shot warm-up; or: MODELS=~/models engines/two-cards/scripts/run-tp2.sh
+docker compose up -d                  # compose.yaml: engine + one-shot warmup (its own service, waits for /health); or: MODELS=~/models engines/two-cards/scripts/run-tp2.sh
 cp engines/two-cards/env/tp2-local.env.example engines/two-cards/env/tp2-local.env   # optional: local overrides (B70_* switches, EXTRA_ARGS)
 ```
 

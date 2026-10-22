@@ -19,7 +19,7 @@ cp .env.example .env               # optional: MODELS=/path/on/nvme (default ~/m
 docker compose build               # the image: vLLM release 0.30.0-b70.2 + two-card patches 0040-0050, 0052, 0053 + kernels + shim
 docker compose run --rm prepare    # once: download (~129 GB) and prepare the weights
 docker compose up -d               # serving on port 8000 after ~5 min
-docker compose logs warmup         # wait for "warm-up request OK" before sending long prompts
+docker compose logs warmup         # waits for the engine, one short request, then exits ("warm-up request OK")
 ```
 
 ```bash
@@ -185,7 +185,7 @@ Every switch with its default and measurements: [docs/switches.md](docs/switches
 | path | what |
 |---|---|
 | `HOW-TO-RUN.md` | step-by-step guide |
-| `compose.yaml`, `.env.example` | the engine with Docker Compose (engine, warm-up, `prepare`) |
+| `compose.yaml`, `.env.example` | the engine with Docker Compose (`engine`, a separate one-shot `warmup`, `prepare`) |
 | `engines/two-cards/` | `env/tp2-hotcold.env` (defaults), `env/tp2-local.env.example` (your overrides), `args/serve-tp2.args` (`vllm serve` flags), `scripts/` (compose entrypoint, `run-tp2.sh`, `restart-tp2.sh`) |
 | `engines/serve-configs/` | the snapshots' `config.json` (`serve-config-intel-autoround.json` is the one the engine uses) |
 | `image/` | `Dockerfile.tp2` (the image), `verify-overlay.sh` and `verify-tree.py` (hash checks of every patched file) |

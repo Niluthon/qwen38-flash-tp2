@@ -176,7 +176,8 @@ snapshot `tools/awq_snapshot.py` writes was compared with ours by index only (sa
   stream never reports capturing and the request succeeds. Any short request first prevents it: after one, long first
   chunks run normally.
 - **Workaround.** `engines/two-cards/scripts/run-tp2.sh` sends one short chat request as soon as `/health` answers (`WARMUP=1`, the
-  default). Clients that connect in the few seconds before it finishes can still hit the bug.
+  default); the compose `warmup` service sends the same request (its own service: it polls `/health` itself and exits 0
+  after it, so it cannot race the engine). Clients that connect in the few seconds before it finishes can still hit the bug.
 - **Not done.** The root cause (which compiled-path component flips the stream's capture state) is not identified;
   the next step is a compiled run without graphs (`cudagraph_mode: NONE`) with the capture-state probes.
 

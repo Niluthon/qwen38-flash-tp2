@@ -19,9 +19,11 @@ engines/
 
 ## Compose
 
-`compose.yaml` at the repository root runs `tp2-hotcold`: `docker compose up -d` starts it detached, a one-shot
-`warmup` service sends the short first request once `/health` answers, `docker compose logs -f engine` follows the log
-(also in `engine-data/engine.log`), `docker compose down` stops it. Defaults come from `tp2-hotcold.env` and `serve-tp2.args`
+`compose.yaml` at the repository root runs `tp2-hotcold`: `docker compose up -d` starts it detached, and the separate
+`warmup` service sends the short first request (it waits for `/health` itself, then exits 0 — no `depends_on`, none of
+the engine's devices or volumes, so `up -d` and `restart engine warmup` never race the engine; `WARMUP_TIMEOUT`,
+1200 s by default). `docker compose logs -f engine` follows the log (also in `engine-data/engine.log`),
+`docker compose down` stops it. Defaults come from `tp2-hotcold.env` and `serve-tp2.args`
 (shared with `run-tp2.sh`); put local changes in `tp2-local.env` (git-ignored; template `tp2-local.env.example`):
 environment switches override the defaults, and `EXTRA_ARGS` appends `vllm serve` flags (the last value of a flag wins).
 Host paths (`MODELS`, `ENGINE_DATA`) and the image go in a root `.env` (template `.env.example`). `compose-serve.sh` is the

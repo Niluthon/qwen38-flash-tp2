@@ -11,7 +11,7 @@ git clone https://github.com/Niluthon/qwen38-flash-tp2 && cd qwen38-flash-tp2
 docker compose build                 # ~20 GB image, builds everything itself
 docker compose run --rm prepare      # once: ~129 GB download to ~/models (set MODELS in .env to change)
 docker compose up -d                 # ~5 min until it serves on port 8000
-docker compose logs -f warmup        # done when it prints "warm-up request OK"
+docker compose logs -f warmup        # waits for the engine, one short request, then exits: "warm-up request OK"
 ```
 
 **Contents:** [1. Check the machine](#1-check-the-machine) · [2. First start](#2-first-start) ·
@@ -56,7 +56,7 @@ docker compose build
 docker compose run --rm prepare
 
 # e. start the engine (~5 minutes until it serves)
-docker compose up -d
+docker compose up -d                       # engine, plus the warmup service (its own service: it waits for the engine)
 docker compose logs -f engine              # wait for "Application startup complete"; Ctrl-C only stops following
 ```
 
@@ -65,6 +65,9 @@ interrupted download.
 
 **f. Check it.** `docker compose ps` lists `engine` as `healthy`, and `docker compose logs warmup` ends with
 `warm-up request OK`. Wait for that line before sending long prompts (see [Troubleshooting](#8-troubleshooting)).
+`warmup` is independent of `engine` (no `depends_on`, none of the engine's devices or volumes): it starts with the
+engine, polls `/health` itself and exits 0 after that one request — so `docker compose up -d` and
+`docker compose restart engine warmup` cannot fail it. It gives up after `WARMUP_TIMEOUT` seconds (1200 by default).
 
 ## 3. Use it
 
@@ -251,6 +254,7 @@ Intel's checkpoint is described in [docs/weights.md](docs/weights.md).
 | `prepare` says `/models is not writable` | `MODELS` in `.env` must be a directory Docker can write to |
 | `prepare` stops in the download | run it again; it resumes. Rate-limited by Hugging Face: set `HF_TOKEN` in `.env` |
 | the engine stops right after the first request | the first request after a start was long (known issue 13). The `warmup` service sends a short one first; wait for `warm-up request OK` |
+| `warmup` exits 1 with `warm-up: /health did not answer within 1200s` | the engine never became healthy in that window: read `docker compose logs engine` (section above). Give it longer with `WARMUP_TIMEOUT=3600 docker compose up -d warmup` |
 | engine stays `starting` for over 15 min, or exits | read `docker compose logs engine`; check that nothing else uses the cards (the engine takes 95 % of their memory) and that `prepare` finished |
 | `No such file` for a path under `/models` | the weights are not where the engine looks: section 6 |
 | no `/dev/dri`, or `group render not found` | the GPU driver is not loaded on the host; check `ls /dev/dri` and the kernel log |

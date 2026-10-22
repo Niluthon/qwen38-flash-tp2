@@ -4,6 +4,12 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 ## Unreleased — two cards
 
+- **Compose: `warmup` is a service of its own.** It no longer inherits the engine's block (`depends_on: engine
+  healthy`, devices, `/work`, the env files' runtime switches) and no longer fires once and dies if the engine is not
+  listening yet (it exited 1 on connection refused after `docker compose restart`). It now starts with the engine,
+  polls `/health` itself, sends the one short request (known issue 13), prints `warm-up request OK` and exits 0 —
+  `WARMUP_TIMEOUT` seconds of patience, 1200 by default. `docker compose up -d` and `docker compose restart engine
+  warmup` can no longer fail it.
 - **Two cards only.** Removed the one-card and four-card setups: `engines/one-card/`, `engines/four-cards/`,
   `image/Dockerfile` with `image/files/` and `image/derive-serve-config.py` (the four-card b70.1 image),
   `tools/awq_snapshot.py`, `docs/measurements/` (four-card release measurements). They remain in
